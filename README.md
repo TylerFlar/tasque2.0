@@ -45,17 +45,51 @@ uv run pytest
 uv run ruff check .
 ```
 
-## Local Files
+## Example Worker And Workflow
 
-The `data/` directory is intentionally ignored. It may contain private workflow
-templates, local SQLite databases, artifacts, memory mirrors, and analysis
-workspaces.
+Queue a one-shot model-backed work item:
 
-The `mcps/` directory is also ignored because it is used for local MCP checkouts
-and builds.
+```powershell
+uv run tasque2 queue "Morning check" "Review today's priorities and return three next actions." --worker-kind provider.default
+uv run tasque2 run-next
+```
 
-Alembic files are committed because the application imports them for database
-migrations.
+Or create a small workflow file at `data/workflows/morning-check.workflow.json`:
+
+```json
+{
+  "name": "morning-check",
+  "version": "1",
+  "definition": {
+    "nodes": [
+      {
+        "key": "review",
+        "kind": "work",
+        "title": "Review priorities",
+        "task_instruction": "Review today's priorities and list the top three.",
+        "worker_kind": "provider.default"
+      },
+      {
+        "key": "plan",
+        "kind": "work",
+        "title": "Make a plan",
+        "task_instruction": "Use the review context to write a short action plan.",
+        "worker_kind": "provider.default",
+        "depends_on": ["review"]
+      }
+    ]
+  }
+}
+```
+
+Validate and start it:
+
+```powershell
+uv run tasque2 workflow-validate-file .\data\workflows\morning-check.workflow.json
+uv run tasque2 workflow-start-file .\data\workflows\morning-check.workflow.json --name "Morning check"
+```
+
+Keep personal workflow files under `data/`; that directory is ignored by git.
 
 ## Project Layout
 
