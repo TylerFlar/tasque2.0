@@ -1,0 +1,42 @@
+[project]
+name = "tasque2"
+version = "0.1.0"
+description = "Local-first work, workflow, schedule, memory, artifact, and Discord orchestration."
+requires-python = ">=3.12"
+dependencies = [
+    "alembic>=1.17.0",
+    "croniter>=6.0.0",
+    "discord.py>=2.6.0",
+    "mcp>=1.2",
+    "pydantic>=2.12.0",
+    "pydantic-settings>=2.11.0",
+    "rich>=14.0.0",
+    "sqlalchemy>=2.0.44",
+    "structlog>=25.0.0",
+    "tzdata>=2025.2",
+    "typer>=0.20.0",
+]
+
+[project.scripts]
+tasque2 = "tasque2.cli:app"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.0",
+    "ruff>=0.14.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
