@@ -70,20 +70,23 @@ class MemoryService:
         query: str | None = None,
         namespace: str | None = None,
         tags: list[str] | None = None,
-        limit: int = 10,
+        limit: int | None = 10,
     ) -> Sequence[Memory]:
         self.ensure_fts()
+        expanded_limit = None if limit is None else max(0, limit) * 4
         if query:
-            rows = self.session.execute(
-                text(
-                    """
+            sql = """
                     SELECT memory_id
                     FROM memory_fts
                     WHERE memory_fts MATCH :query
-                    LIMIT :limit
                     """
-                ),
-                {"query": query, "limit": limit * 4},
+            params: dict[str, Any] = {"query": query}
+            if expanded_limit is not None:
+                sql += "\n                    LIMIT :limit"
+                params["limit"] = expanded_limit
+            rows = self.session.execute(
+                text(sql),
+                params,
             ).all()
             ids = [row[0] for row in rows]
             if not ids:
@@ -98,8 +101,9 @@ class MemoryService:
                 select(Memory)
                 .where(Memory.archived_at.is_(None))
                 .order_by(Memory.pinned.desc(), Memory.created_at.desc())
-                .limit(limit * 4)
             )
+            if expanded_limit is not None:
+                statement = statement.limit(expanded_limit)
             ordered = list(self.session.scalars(statement).all())
 
         if namespace is not None:
@@ -107,7 +111,9 @@ class MemoryService:
         if tags:
             wanted = set(tags)
             ordered = [memory for memory in ordered if wanted.issubset(set(memory.tags or []))]
-        return ordered[:limit]
+        if limit is None:
+            return ordered
+        return ordered[: max(0, limit)]
 
     def get_canonical(self, *, namespace: str, canonical_key: str) -> Memory | None:
         return self.session.scalar(

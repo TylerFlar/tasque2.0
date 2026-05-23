@@ -17,13 +17,6 @@ from tasque2.models import (
     WorkItem,
 )
 
-DEFAULT_CONTEXT_LIMITS = {
-    "artifacts": 12,
-    "events": 20,
-    "memories": 8,
-    "workflow_nodes": 20,
-}
-
 
 class WorkerContextBuilder:
     def __init__(self, session: Session) -> None:
@@ -33,9 +26,9 @@ class WorkerContextBuilder:
         self,
         work_item: WorkItem,
         *,
-        limits: dict[str, int] | None = None,
+        limits: dict[str, int | None] | None = None,
     ) -> dict[str, Any]:
-        limits = {**DEFAULT_CONTEXT_LIMITS, **(limits or {})}
+        limits = limits or {}
         parent_work = self._parent_work(work_item)
         workflow_run = (
             self.session.get(WorkflowRun, work_item.workflow_run_id) if work_item.workflow_run_id else None
@@ -45,13 +38,13 @@ class WorkerContextBuilder:
         memories = self._memories(
             query=query,
             work_item=work_item,
-            limit=limits["memories"],
+            limit=limits.get("memories"),
         )
         artifacts = self._artifacts_for_work(
             work_item,
             parent_work=parent_work,
             workflow_run=workflow_run,
-            limit=limits["artifacts"],
+            limit=limits.get("artifacts"),
         )
 
         return {
@@ -60,13 +53,13 @@ class WorkerContextBuilder:
             "task_context": work_item.context or {},
             "parent_work": self._parent_work_data(
                 parent_work,
-                event_limit=limits["events"],
-                artifact_limit=limits["artifacts"],
+                event_limit=limits.get("events"),
+                artifact_limit=limits.get("artifacts"),
             ),
             "workflow": self._workflow_data(
                 workflow_run,
                 work_item=work_item,
-                limit=limits["workflow_nodes"],
+                limit=limits.get("workflow_nodes"),
             ),
             "memories": [_memory_data(memory) for memory in memories],
             "artifacts": [_artifact_data(artifact) for artifact in artifacts],
@@ -74,7 +67,7 @@ class WorkerContextBuilder:
                 _event_data(event)
                 for event in self._events_for_work(
                     work_item,
-                    limit=limits["events"],
+                    limit=limits.get("events"),
                 )
             ],
         }
@@ -84,8 +77,11 @@ class WorkerContextBuilder:
         *,
         query: str,
         work_item: WorkItem,
-        limit: int,
+        limit: int | None,
     ) -> list[Memory]:
+        if limit is not None and limit <= 0:
+            return []
+
         service = MemoryService(self.session)
         context = work_item.context or {}
         memories: list[Memory] = []
@@ -107,30 +103,39 @@ class WorkerContextBuilder:
                     canonical_key=spec["canonical_key"],
                 )
             )
-            if len(memories) >= limit:
-                return memories[:limit]
+            if _limit_reached(memories, limit):
+                return _trim_to_limit(memories, limit)
 
         for spec in _memory_query_specs(context, default_namespaces):
+            search_limit = _smaller_limit(spec["limit"], _remaining_limit(limit, len(memories)))
             for memory in service.search(
                 query=spec["query"],
                 namespace=spec["namespace"],
                 tags=spec["tags"],
-                limit=spec["limit"],
+                limit=search_limit,
             ):
                 add(memory)
-                if len(memories) >= limit:
-                    return memories[:limit]
+                if _limit_reached(memories, limit):
+                    return _trim_to_limit(memories, limit)
 
         for namespace in explicit_namespaces:
-            for memory in service.search(query=query, namespace=namespace, limit=limit):
+            for memory in service.search(
+                query=query,
+                namespace=namespace,
+                limit=_remaining_limit(limit, len(memories)),
+            ):
                 add(memory)
-                if len(memories) >= limit:
-                    return memories[:limit]
+                if _limit_reached(memories, limit):
+                    return _trim_to_limit(memories, limit)
 
-        if len(memories) < limit:
-            for memory in service.search(query=query, namespace="global", limit=limit):
+        if not _limit_reached(memories, limit):
+            for memory in service.search(
+                query=query,
+                namespace="global",
+                limit=_remaining_limit(limit, len(memories)),
+            ):
                 add(memory)
-        return memories[:limit]
+        return _trim_to_limit(memories, limit)
 
     def _artifacts_for_work(
         self,
@@ -138,20 +143,20 @@ class WorkerContextBuilder:
         *,
         parent_work: WorkItem | None,
         workflow_run: WorkflowRun | None,
-        limit: int,
+        limit: int | None,
     ) -> list[Artifact]:
         clauses = [Artifact.work_item_id == work_item.id]
         if parent_work is not None:
             clauses.append(Artifact.work_item_id == parent_work.id)
         if workflow_run is not None:
             clauses.append(Artifact.workflow_run_id == workflow_run.id)
-        queried_artifacts = self.session.scalars(
+        artifact_statement = (
             select(Artifact)
             .where(Artifact.archived_at.is_(None))
             .where(_or_many(clauses))
             .order_by(Artifact.created_at.desc())
-            .limit(limit)
-        ).all()
+        )
+        queried_artifacts = self.session.scalars(_apply_limit(artifact_statement, limit)).all()
 
         explicit_artifact_ids = _context_artifact_ids(work_item.context or {})
         if parent_work is not None:
@@ -174,7 +179,7 @@ class WorkerContextBuilder:
         for artifact in queried_artifacts:
             add_artifact(artifact)
 
-        return ordered[:limit]
+        return _trim_to_limit(ordered, limit)
 
     def _parent_work(self, work_item: WorkItem) -> WorkItem | None:
         parent_work_item_id = _parent_work_item_id(work_item.context or {})
@@ -186,24 +191,24 @@ class WorkerContextBuilder:
         self,
         parent_work: WorkItem | None,
         *,
-        event_limit: int,
-        artifact_limit: int,
+        event_limit: int | None,
+        artifact_limit: int | None,
     ) -> dict[str, Any] | None:
         if parent_work is None:
             return None
         latest_attempt = self._latest_attempt(parent_work.id)
-        artifacts = self.session.scalars(
+        artifact_statement = (
             select(Artifact)
             .where(Artifact.work_item_id == parent_work.id, Artifact.archived_at.is_(None))
             .order_by(Artifact.created_at.desc())
-            .limit(artifact_limit)
-        ).all()
-        events = self.session.scalars(
+        )
+        artifacts = self.session.scalars(_apply_limit(artifact_statement, artifact_limit)).all()
+        event_statement = (
             select(WorkEvent)
             .where(WorkEvent.work_item_id == parent_work.id)
             .order_by(WorkEvent.created_at.desc(), WorkEvent.id.desc())
-            .limit(event_limit)
-        ).all()
+        )
+        events = self.session.scalars(_apply_limit(event_statement, event_limit)).all()
         return {
             "work_item": _work_item_data(parent_work, full=True),
             "latest_attempt": _attempt_data(latest_attempt),
@@ -222,15 +227,17 @@ class WorkerContextBuilder:
         self,
         work_item: WorkItem,
         *,
-        limit: int,
+        limit: int | None,
     ) -> list[WorkEvent]:
         clauses = [WorkEvent.work_item_id == work_item.id]
+        event_statement = (
+            select(WorkEvent)
+            .where(_or_many(clauses))
+            .order_by(WorkEvent.created_at.desc(), WorkEvent.id.desc())
+        )
         return list(
             self.session.scalars(
-                select(WorkEvent)
-                .where(_or_many(clauses))
-                .order_by(WorkEvent.created_at.desc(), WorkEvent.id.desc())
-                .limit(limit)
+                _apply_limit(event_statement, limit)
             ).all()
         )
 
@@ -239,16 +246,16 @@ class WorkerContextBuilder:
         workflow_run: WorkflowRun | None,
         *,
         work_item: WorkItem,
-        limit: int,
+        limit: int | None,
     ) -> dict[str, Any] | None:
         if workflow_run is None:
             return None
-        nodes = self.session.scalars(
+        node_statement = (
             select(WorkflowNode)
             .where(WorkflowNode.workflow_run_id == workflow_run.id)
             .order_by(WorkflowNode.created_at)
-            .limit(limit)
-        ).all()
+        )
+        nodes = self.session.scalars(_apply_limit(node_statement, limit)).all()
         current_node = next(
             (node for node in nodes if node.id == work_item.workflow_node_id),
             None,
@@ -471,6 +478,7 @@ def _memory_query_specs(
     specs: list[dict[str, Any]] = []
     default_namespaces = default_namespaces or ["global"]
     context_tags = _string_list(context.get("memory_tags"))
+    context_limit = _optional_limit(context.get("memory_query_limit"))
     for item in [*_as_list(context.get("memory_queries")), *_as_list(context.get("memory_searches"))]:
         if isinstance(item, str):
             query = item.strip()
@@ -480,7 +488,7 @@ def _memory_query_specs(
                         "query": query,
                         "namespace": namespace,
                         "tags": context_tags,
-                        "limit": int(context.get("memory_query_limit") or 10),
+                        "limit": context_limit,
                     }
                     for namespace in default_namespaces
                 )
@@ -495,17 +503,14 @@ def _memory_query_specs(
             continue
         namespaces = _query_namespaces(item, default_namespaces)
         tags = _string_list(item.get("tags")) or context_tags
-        try:
-            spec_limit = int(item.get("limit") or context.get("memory_query_limit") or 10)
-        except (TypeError, ValueError):
-            spec_limit = 10
+        spec_limit = _optional_limit(item.get("limit", context_limit))
         for namespace in namespaces:
             specs.append(
                 {
                     "query": query,
                     "namespace": namespace,
                     "tags": tags,
-                    "limit": max(1, spec_limit),
+                    "limit": spec_limit,
                 }
             )
     return specs
@@ -549,6 +554,45 @@ def _string_list(value: Any) -> list[str]:
         if text:
             result.append(text)
     return result
+
+
+def _optional_limit(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _apply_limit(statement: Any, limit: int | None) -> Any:
+    if limit is None:
+        return statement
+    return statement.limit(max(0, limit))
+
+
+def _trim_to_limit[T](items: list[T], limit: int | None) -> list[T]:
+    if limit is None:
+        return items
+    return items[: max(0, limit)]
+
+
+def _limit_reached(items: list[Any], limit: int | None) -> bool:
+    return limit is not None and len(items) >= max(0, limit)
+
+
+def _remaining_limit(limit: int | None, count: int) -> int | None:
+    if limit is None:
+        return None
+    return max(0, limit - count)
+
+
+def _smaller_limit(left: int | None, right: int | None) -> int | None:
+    if left is None:
+        return right
+    if right is None:
+        return left
+    return min(left, right)
 
 
 def _work_item_data(work_item: WorkItem, *, full: bool = False) -> dict[str, Any]:

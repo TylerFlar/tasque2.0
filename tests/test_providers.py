@@ -470,12 +470,11 @@ def test_tier_contract_aliases_to_model_profile(
         reset_settings()
 
 
-def test_semantic_model_profile_hints_resolve_to_standard_profiles(
+def test_semantic_model_profile_hints_are_rejected(
     fresh_db: Path,
     monkeypatch,
 ) -> None:
     monkeypatch.setenv("TASQUE2_CODEX_MODEL_HIGH", "codex-high-test")
-    monkeypatch.setenv("TASQUE2_CODEX_MODEL_LOW", "codex-low-test")
     reset_settings()
     captured: list[ProviderRequest] = []
     adapter = FakeProvider(capture_requests=captured)
@@ -497,9 +496,12 @@ def test_semantic_model_profile_hints_resolve_to_standard_profiles(
             ).run_next()
 
             assert outcome is not None
-            assert captured[0].model == "codex-high-test"
-            assert '"model": "codex-low-test"' in captured[0].prompt
-            assert '"model_profile": "low"' in captured[0].prompt
+            assert outcome.status == "dead_letter"
+            assert captured == []
+            failed = session.scalar(select(FailedWork).where(FailedWork.work_item_id == outcome.work_item_id))
+            assert failed is not None
+            assert failed.error_type == "ValueError"
+            assert failed.error_message == "model_profile must be one of: high, low, medium."
     finally:
         reset_settings()
 

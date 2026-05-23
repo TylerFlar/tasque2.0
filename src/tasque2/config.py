@@ -9,19 +9,6 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 DEFAULT_MODEL_PROVIDERS = {"codex", "claude"}
 TEST_MODEL_PROVIDERS = {"fake", "subprocess"}
 MODEL_PROFILES = {"low", "medium", "high"}
-MODEL_PROFILE_ALIASES = {
-    "cheap": "low",
-    "code": "high",
-    "coding": "high",
-    "routine": "medium",
-    "deep": "high",
-    "fast": "low",
-    "reasoning": "high",
-    "summarize": "medium",
-    "summary": "medium",
-    "vision": "high",
-    "browser": "medium",
-}
 
 
 class Settings(BaseSettings):
@@ -118,7 +105,6 @@ class Settings(BaseSettings):
             return None
         if normalized.startswith("hint:"):
             normalized = normalized.removeprefix("hint:").strip()
-        normalized = MODEL_PROFILE_ALIASES.get(normalized, normalized)
         if normalized not in MODEL_PROFILES:
             allowed = ", ".join(sorted(MODEL_PROFILES))
             raise ValueError(f"model_profile must be one of: {allowed}.")
