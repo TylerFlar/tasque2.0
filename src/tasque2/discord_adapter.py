@@ -18,6 +18,7 @@ from tasque2.models import (
     Memory,
     WorkAttempt,
     WorkEvent,
+    WorkflowEdge,
     WorkflowNode,
     WorkflowRun,
     WorkItem,
@@ -331,6 +332,8 @@ class DiscordService:
             return self._handle_workflow_reply(
                 workflow_run_id=binding.workflow_run_id,
                 discord_message_id=discord_message_id,
+                discord_channel_id=discord_channel_id,
+                discord_thread_id=discord_thread_id,
                 author=author,
                 content=routed_content,
                 artifact_refs=artifact_refs,
@@ -426,6 +429,8 @@ class DiscordService:
             return self._handle_workflow_reply(
                 workflow_run_id=referenced.workflow_run_id,
                 discord_message_id=discord_message_id,
+                discord_channel_id=discord_channel_id,
+                discord_thread_id=discord_thread_id,
                 author=author,
                 content=routed_content,
                 artifact_refs=artifact_refs,
@@ -482,6 +487,8 @@ class DiscordService:
         *,
         workflow_run_id: str,
         discord_message_id: str,
+        discord_channel_id: str,
+        discord_thread_id: str | None,
         author: str,
         content: str,
         artifact_refs: list[dict[str, Any]],
@@ -507,6 +514,27 @@ class DiscordService:
                 summary=f"Answered workflow gate {node.node_key}.",
             )
 
+        parent_work = self._workflow_reply_parent_work(run.id)
+        memory_id = None
+        followup_work_id = None
+        if parent_work is not None:
+            memory_id = self._record_reply_memory(
+                parent_work,
+                discord_message_id=discord_message_id,
+                author=author,
+                content=content,
+            )
+            followup_work_id = self._enqueue_reply_followup(
+                parent_work,
+                discord_message_id=discord_message_id,
+                author=author,
+                content=content,
+                artifact_refs=artifact_refs,
+                discord_channel_id=discord_channel_id,
+                discord_thread_id=discord_thread_id,
+                referenced_discord_message_id=None,
+            )
+
         self._emit_event(
             event_type=f"discord.workflow_{source}_reply",
             entity_kind="workflow_run",
@@ -516,13 +544,51 @@ class DiscordService:
             payload={
                 "discord_message_id": discord_message_id,
                 "attachment_artifact_ids": [ref["artifact_id"] for ref in artifact_refs],
+                "memory_id": memory_id,
+                "followup_work_item_id": followup_work_id,
+                "parent_work_item_id": parent_work.id if parent_work is not None else None,
             },
         )
+        if followup_work_id is not None:
+            return DiscordRouteResult(
+                action="workflow_reply_followup_recorded",
+                entity_id=followup_work_id,
+                summary="Recorded workflow reply and queued follow-up work.",
+            )
         return DiscordRouteResult(
             action="workflow_reply_recorded",
             entity_id=run.id,
             summary="Recorded workflow reply.",
         )
+
+    def _workflow_reply_parent_work(self, workflow_run_id: str) -> WorkItem | None:
+        nodes = list(
+            self.session.scalars(
+                select(WorkflowNode)
+                .where(
+                    WorkflowNode.workflow_run_id == workflow_run_id,
+                    WorkflowNode.work_item_id.is_not(None),
+                    WorkflowNode.kind.in_(["work", "native", "model"]),
+                )
+                .order_by(WorkflowNode.created_at, WorkflowNode.node_key)
+            ).all()
+        )
+        if not nodes:
+            return None
+        upstream_node_ids = {
+            str(edge.from_node_id)
+            for edge in self.session.scalars(
+                select(WorkflowEdge).where(WorkflowEdge.workflow_run_id == workflow_run_id)
+            ).all()
+        }
+        leaves = [node for node in nodes if node.id not in upstream_node_ids] or nodes
+        for node in reversed(leaves):
+            if node.work_item_id is None:
+                continue
+            work_item = self.session.get(WorkItem, node.work_item_id)
+            if work_item is not None and _reply_followup_config(work_item.context or {}) is not None:
+                return work_item
+        return None
 
     def _awaiting_workflow_gates(self, workflow_run_id: str) -> list[WorkflowNode]:
         return list(
@@ -763,7 +829,9 @@ class DiscordService:
             idempotency_key=f"discord:reply-followup:{discord_message_id}",
             source_kind="discord_reply_followup",
             source_id=discord_message_id,
-            workflow_run_id=work_item.workflow_run_id,
+            workflow_run_id=None
+            if bool(config.get("detach_from_workflow"))
+            else work_item.workflow_run_id,
             discord_thread_id=output_thread_id,
         )
         return child.id

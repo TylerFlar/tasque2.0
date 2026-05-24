@@ -16,6 +16,7 @@ from tasque2.models import (
 )
 from tasque2.queue import WorkQueue
 from tasque2.repo import WorkRepository
+from tasque2.workflows import WorkflowService
 
 
 def test_discord_intake_queues_work_item_once(fresh_db: Path) -> None:
@@ -362,6 +363,72 @@ def test_discord_channel_reply_to_referenced_work_message_routes_followup(fresh_
             "out-channel-workout",
             "reply-channel-workout",
         ]
+
+
+def test_discord_workflow_thread_reply_routes_to_final_work_followup(fresh_db: Path) -> None:
+    definition = {
+        "nodes": [
+            {
+                "key": "course_picker",
+                "kind": "work",
+                "title": "Art course picker",
+                "task_instruction": "Pick a course.",
+                "worker_kind": "function.echo",
+                "context": {
+                    "memory_namespace": "creative",
+                    "reply_followup_work": {
+                        "enabled": True,
+                        "detach_from_workflow": True,
+                        "title": "Critique art submission",
+                        "worker_kind": "provider.default",
+                        "task_instruction": "Critique this submitted art.",
+                    },
+                },
+            }
+        ]
+    }
+    with session_scope() as session:
+        workflow = WorkflowService(session).create_definition(
+            name="art-course-chain",
+            version="1",
+            definition=definition,
+        )
+        run = WorkflowService(session).start_run(workflow_definition_id=workflow.id)
+        WorkflowService(session).tick_runs()
+        work = session.scalar(select(WorkItem).where(WorkItem.workflow_run_id == run.id))
+        assert work is not None
+        claimed = WorkQueue(session).claim_next_ready_work(lease_owner="test")
+        assert claimed is not None
+        WorkQueue(session).complete_attempt(
+            claimed.attempt.id,
+            summary="Picked course.",
+            produces={"selected_course_url": "https://example.com/course"},
+        )
+        WorkflowService(session).tick_runs()
+        DiscordService(session).bind_thread(
+            purpose="workflow",
+            discord_channel_id="jobs",
+            discord_thread_id="thread-art-workflow",
+            workflow_run_id=run.id,
+        )
+
+        result = DiscordService(session).handle_thread_reply(
+            discord_message_id="reply-art-workflow",
+            discord_channel_id="thread-art-workflow",
+            discord_thread_id="thread-art-workflow",
+            author="user",
+            content="Here is my finished piece.",
+        )
+
+        assert result.action == "workflow_reply_followup_recorded"
+        followup = session.scalar(select(WorkItem).where(WorkItem.source_id == "reply-art-workflow"))
+        assert followup is not None
+        assert followup.workflow_run_id is None
+        assert followup.context["parent_work_item_id"] == work.id
+        assert followup.context["parent_work"]["latest_attempt"]["produces"] == {
+            "selected_course_url": "https://example.com/course"
+        }
+        assert "Here is my finished piece." in followup.task_instruction
 
 
 def test_discord_work_thread_reply_memory_is_idempotent(fresh_db: Path) -> None:

@@ -150,6 +150,30 @@ def test_mcp_work_tools_enqueue_and_report_status(fresh_db: Path) -> None:
     assert status["status"]["ready_work"] == 1
 
 
+def test_mcp_work_enqueue_can_load_template_file(fresh_db: Path, tmp_path: Path) -> None:
+    template = tmp_path / "followup.template.md"
+    template.write_text("# Follow-up Template\n\nUse the maintained template.", encoding="utf-8")
+
+    queued = _ok(
+        tools.work_enqueue(
+            title="Templated follow-up",
+            task_template_path="followup.template.md",
+            template_base_dir=str(tmp_path),
+            worker_kind="manual",
+        )
+    )
+
+    fetched = _ok(
+        tools.work_get(
+            intent="inspect templated follow-up",
+            work_item_id=queued["work_item"]["id"],
+        )
+    )
+    assert fetched["work_item"]["task_instruction"] == (
+        "# Follow-up Template\n\nUse the maintained template."
+    )
+
+
 def test_mcp_schedule_tools_create_and_list_work_schedule(fresh_db: Path) -> None:
     created = _ok(
         tools.schedule_create_work(
@@ -169,6 +193,31 @@ def test_mcp_schedule_tools_create_and_list_work_schedule(fresh_db: Path) -> Non
 
     listed = _ok(tools.schedule_list(intent="inspect schedules", enabled=True))
     assert [item["id"] for item in listed["items"]] == [schedule["id"]]
+
+
+def test_mcp_schedule_create_work_can_reference_template_file(
+    fresh_db: Path,
+    tmp_path: Path,
+) -> None:
+    template = tmp_path / "scheduled.template.md"
+    template.write_text("# Scheduled Template\n\nRun from Markdown.", encoding="utf-8")
+
+    created = _ok(
+        tools.schedule_create_work(
+            name="Templated daily check",
+            schedule_type="cron",
+            expression="0 9 * * *",
+            task_template_path="scheduled.template.md",
+            template_base_dir=str(tmp_path),
+            worker_kind="provider.default",
+            context={"memory_namespace": "personal"},
+        )
+    )
+
+    schedule = created["schedule"]
+    assert schedule["payload"]["task_template_path"] == "scheduled.template.md"
+    assert schedule["payload"]["template_base_dir"] == str(tmp_path)
+    assert schedule["payload"]["context"]["memory_namespace"] == "personal"
 
 
 def test_mcp_workflow_tools_list_and_start_workflow(fresh_db: Path) -> None:

@@ -27,6 +27,7 @@ from tasque2.queue import WorkQueue
 from tasque2.repo import WorkRepository
 from tasque2.scheduler import ScheduleService
 from tasque2.status import get_system_status
+from tasque2.templates import read_template_file
 from tasque2.workflows import WorkflowService
 
 
@@ -327,7 +328,7 @@ def artifact_archive(artifact_id: str) -> str:
 
 def work_enqueue(
     title: str,
-    task_instruction: str,
+    task_instruction: str | None = None,
     worker_kind: str = "provider.default",
     runtime_contract: dict[str, Any] | None = None,
     context: dict[str, Any] | None = None,
@@ -336,8 +337,10 @@ def work_enqueue(
     idempotency_key: str | None = None,
     workflow_run_id: str | None = None,
     discord_thread_id: str | None = None,
+    task_template_path: str | None = None,
+    template_base_dir: str | None = None,
 ) -> str:
-    """Queue a normal Tasque WorkItem."""
+    """Queue a normal Tasque WorkItem from direct instructions or a Markdown template file."""
     return _run_json(
         lambda: _work_enqueue(
             title=title,
@@ -350,6 +353,8 @@ def work_enqueue(
             idempotency_key=idempotency_key,
             workflow_run_id=workflow_run_id,
             discord_thread_id=discord_thread_id,
+            task_template_path=task_template_path,
+            template_base_dir=template_base_dir,
         )
     )
 
@@ -401,7 +406,7 @@ def schedule_create_work(
     name: str,
     schedule_type: str,
     expression: str,
-    task_instruction: str,
+    task_instruction: str | None = None,
     worker_kind: str = "provider.default",
     timezone_name: str | None = None,
     runtime_contract: dict[str, Any] | None = None,
@@ -409,6 +414,8 @@ def schedule_create_work(
     catchup_policy: str = "coalesce",
     max_backfill: int = 10,
     enabled: bool = True,
+    task_template_path: str | None = None,
+    template_base_dir: str | None = None,
 ) -> str:
     """Create a recurring or future schedule that enqueues a normal WorkItem."""
     return _run_json(
@@ -424,6 +431,8 @@ def schedule_create_work(
             catchup_policy=catchup_policy,
             max_backfill=max_backfill,
             enabled=enabled,
+            task_template_path=task_template_path,
+            template_base_dir=template_base_dir,
         )
     )
 
@@ -890,7 +899,7 @@ def _artifact_archive(*, artifact_id: str) -> dict[str, Any]:
 def _work_enqueue(
     *,
     title: str,
-    task_instruction: str,
+    task_instruction: str | None,
     worker_kind: str,
     runtime_contract: dict[str, Any] | None,
     context: dict[str, Any] | None,
@@ -899,11 +908,18 @@ def _work_enqueue(
     idempotency_key: str | None,
     workflow_run_id: str | None,
     discord_thread_id: str | None,
+    task_template_path: str | None,
+    template_base_dir: str | None,
 ) -> dict[str, Any]:
+    resolved_task_instruction = _resolve_task_instruction(
+        task_instruction=task_instruction,
+        task_template_path=task_template_path,
+        template_base_dir=template_base_dir,
+    )
     with session_scope() as session:
         work = WorkRepository(session).create_work_item(
             title=_required(title, "title"),
-            task_instruction=_required(task_instruction, "task_instruction"),
+            task_instruction=resolved_task_instruction,
             worker_kind=_required(worker_kind, "worker_kind"),
             runtime_contract=dict(runtime_contract or {}),
             context=dict(context or {}),
@@ -974,7 +990,7 @@ def _schedule_create_work(
     name: str,
     schedule_type: str,
     expression: str,
-    task_instruction: str,
+    task_instruction: str | None,
     worker_kind: str,
     timezone_name: str | None,
     runtime_contract: dict[str, Any] | None,
@@ -982,22 +998,27 @@ def _schedule_create_work(
     catchup_policy: str,
     max_backfill: int,
     enabled: bool,
+    task_template_path: str | None,
+    template_base_dir: str | None,
 ) -> dict[str, Any]:
     if runtime_contract is not None and not isinstance(runtime_contract, dict):
         raise ValueError("runtime_contract must be an object or omitted.")
     if context is not None and not isinstance(context, dict):
         raise ValueError("context must be an object or omitted.")
+    payload = _schedule_work_payload(
+        name=name,
+        task_instruction=task_instruction,
+        task_template_path=task_template_path,
+        template_base_dir=template_base_dir,
+        context=context,
+    )
     with session_scope() as session:
         schedule = ScheduleService(session).create_schedule(
             name=_required(name, "name"),
             schedule_type=_required(schedule_type, "schedule_type"),
             expression=_required(expression, "expression"),
             worker_kind=_required(worker_kind, "worker_kind"),
-            payload={
-                "title": _required(name, "name"),
-                "task_instruction": _required(task_instruction, "task_instruction"),
-                "context": dict(context or {}),
-            },
+            payload=payload,
             timezone_name=_optional_string(timezone_name),
             runtime_contract=dict(runtime_contract or {}),
             catchup_policy=_required(catchup_policy, "catchup_policy"),
@@ -1339,6 +1360,51 @@ def _string_list(value: Any) -> list[str]:
         if text:
             result.append(text)
     return result
+
+
+def _resolve_task_instruction(
+    *,
+    task_instruction: str | None,
+    task_template_path: str | None,
+    template_base_dir: str | None,
+) -> str:
+    instruction = _optional_string(task_instruction)
+    template_path = _optional_string(task_template_path)
+    if bool(instruction) == bool(template_path):
+        raise ValueError("Provide exactly one of task_instruction or task_template_path.")
+    if template_path:
+        base_dir = _optional_string(template_base_dir)
+        return read_template_file(
+            template_path,
+            base_dir=Path(base_dir) if base_dir else None,
+        )
+    return _required(instruction, "task_instruction")
+
+
+def _schedule_work_payload(
+    *,
+    name: str,
+    task_instruction: str | None,
+    task_template_path: str | None,
+    template_base_dir: str | None,
+    context: dict[str, Any] | None,
+) -> dict[str, Any]:
+    instruction = _optional_string(task_instruction)
+    template_path = _optional_string(task_template_path)
+    if bool(instruction) == bool(template_path):
+        raise ValueError("Provide exactly one of task_instruction or task_template_path.")
+    payload: dict[str, Any] = {
+        "title": _required(name, "name"),
+        "context": dict(context or {}),
+    }
+    if template_path:
+        payload["task_template_path"] = template_path
+        base_dir = _optional_string(template_base_dir)
+        if base_dir:
+            payload["template_base_dir"] = base_dir
+    else:
+        payload["task_instruction"] = _required(instruction, "task_instruction")
+    return payload
 
 
 def _required(value: Any, field_name: str) -> str:
