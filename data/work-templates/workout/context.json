@@ -1,0 +1,55 @@
+{
+  "memory_namespace": "health",
+  "memory_canonical_keys": [
+    "current_workout_state",
+    "workout_generator_programming_controls",
+    "workout_strength_baselines",
+    "workout_cardio_baselines",
+    "workout_equipment_preferences"
+  ],
+  "memory_queries": [
+    "completed workout actual loads reps RPE substitutions partial skipped",
+    "latest unconfirmed workout prescription current workout state",
+    "cardio treadmill elliptical bike rower stair climber duration settings RPE",
+    "strength baselines equipment preferences constraints programming notes"
+  ],
+  "memory_tags": ["workout"],
+  "memory_query_limit": 12,
+  "workout_generator_template_path": "data/work-templates/workout/generator.template.md",
+  "workout_context_path": "data/work-templates/workout/context.json",
+  "reply_memory": {
+    "enabled": true,
+    "namespace": "health",
+    "kind": "working",
+    "tags": ["workout", "completion", "discord-reply"],
+    "ttl_days": 180,
+    "content_template": "Workout reply from {author}:\n{content}"
+  },
+  "reply_followup_work": {
+    "enabled": true,
+    "title": "Process workout reply",
+    "worker_kind": "provider.default",
+    "task_template_path": "reply-processor.template.md",
+    "template_base_dir": "data/work-templates/workout",
+    "context": {
+      "memory_namespace": "health",
+      "memory_canonical_keys": [
+        "current_workout_state",
+        "workout_generator_programming_controls",
+        "workout_strength_baselines",
+        "workout_cardio_baselines",
+        "workout_equipment_preferences"
+      ],
+      "memory_queries": [
+        "parent workout prescription completed actual loads reps RPE",
+        "cardio treadmill elliptical bike rower stair climber duration settings RPE",
+        "recent workout completion skipped partial substitutions next focus",
+        "latest unconfirmed workout prescription current workout state"
+      ],
+      "memory_tags": ["workout"],
+      "memory_query_limit": 12,
+      "workout_generator_template_path": "data/work-templates/workout/generator.template.md",
+      "workout_context_path": "data/work-templates/workout/context.json"
+    }
+  }
+}
