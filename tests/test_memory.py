@@ -37,6 +37,31 @@ def test_memory_create_and_search_by_text_namespace_and_tag(fresh_db: Path) -> N
         assert results[0].kind == "preference"
 
 
+def test_memory_search_escapes_date_like_free_text_for_fts(fresh_db: Path) -> None:
+    with session_scope() as session:
+        service = MemoryService(session)
+        memory = service.create_memory(
+            namespace="health",
+            kind="workout_completion",
+            content=(
+                "Latest confirmed 2026-05-31 pull completion. "
+                "2026-06-01 completed as prescribed; next focus legs."
+            ),
+            tags=["workout", "completion"],
+        )
+
+        results = service.search(
+            query=(
+                "latest confirmed 2026-05-31 pull completion "
+                "2026-06-01 completed as prescribed next focus legs"
+            ),
+            namespace="health",
+            limit=48,
+        )
+
+        assert [item.id for item in results] == [memory.id]
+
+
 def test_memory_create_mirrors_to_markdown_vault(fresh_db: Path) -> None:
     with session_scope() as session:
         memory = MemoryService(session).create_memory(

@@ -6,6 +6,7 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from tasque2.compression import compress_text
 from tasque2.memory import MemoryService
 from tasque2.models import (
     Artifact,
@@ -16,6 +17,9 @@ from tasque2.models import (
     WorkflowRun,
     WorkItem,
 )
+
+MEMORY_CONTEXT_CONTENT_CHARS = 1600
+MEMORY_CONTEXT_CONTENT_LINES = 40
 
 
 class WorkerContextBuilder:
@@ -653,11 +657,18 @@ def _artifact_data(artifact: Artifact) -> dict[str, Any]:
 
 
 def _memory_data(memory: Memory) -> dict[str, Any]:
+    content = compress_text(
+        memory.content,
+        max_chars=MEMORY_CONTEXT_CONTENT_CHARS,
+        preserve_lines=MEMORY_CONTEXT_CONTENT_LINES,
+    )
     return {
         "id": memory.id,
         "namespace": memory.namespace,
         "kind": memory.kind,
-        "content": memory.content,
+        "content": content,
+        "content_chars": len(memory.content),
+        "content_compacted": content != memory.content,
         "tags": memory.tags or [],
         "work_item_id": memory.work_item_id,
         "pinned": memory.pinned,

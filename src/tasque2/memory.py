@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from collections.abc import Sequence
 from typing import Any
 
@@ -8,6 +9,9 @@ from sqlalchemy.orm import Session
 
 from tasque2.memory_vault import mirror_memory
 from tasque2.models import Memory, WorkEvent, utc_now
+
+_FTS_TOKEN_RE = re.compile(r"[\w]+", re.UNICODE)
+_FTS_OPERATOR_WORDS = {"and", "or", "not", "near"}
 
 
 class MemoryService:
@@ -75,12 +79,15 @@ class MemoryService:
         self.ensure_fts()
         expanded_limit = None if limit is None else max(0, limit) * 4
         if query:
+            fts_query = _safe_fts_query(query)
+            if fts_query is None:
+                return []
             sql = """
                     SELECT memory_id
                     FROM memory_fts
                     WHERE memory_fts MATCH :query
                     """
-            params: dict[str, Any] = {"query": query}
+            params: dict[str, Any] = {"query": fts_query}
             if expanded_limit is not None:
                 sql += "\n                    LIMIT :limit"
                 params["limit"] = expanded_limit
@@ -256,3 +263,28 @@ class MemoryService:
         self.session.add(event)
         self.session.flush()
         return event
+
+
+def _safe_fts_query(value: str | None) -> str | None:
+    """Convert user/provider free text into a SQLite FTS5-safe OR query.
+
+    SQLite FTS query syntax treats characters such as '-' and ':' as operators
+    or column syntax. Workout/status queries often contain ISO dates like
+    2026-05-31, so raw MATCH input can raise OperationalError instead of simply
+    returning memories. Keep this function intentionally conservative: search
+    by quoted tokens and ignore incoming FTS syntax.
+    """
+
+    if not value:
+        return None
+    tokens: list[str] = []
+    for raw in _FTS_TOKEN_RE.findall(str(value).lower()):
+        token = raw.strip("_")
+        if len(token) < 2 or token in _FTS_OPERATOR_WORDS or token in tokens:
+            continue
+        tokens.append(token)
+        if len(tokens) >= 24:
+            break
+    if not tokens:
+        return None
+    return " OR ".join(f'"{token}"' for token in tokens)

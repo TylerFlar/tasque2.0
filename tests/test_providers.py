@@ -198,6 +198,38 @@ def test_provider_prompt_includes_context_and_can_spawn_child_work(fresh_db: Pat
         assert children[0].context["parent_work_item_id"] == work.id
 
 
+def test_provider_prompt_context_uses_default_memory_budget(fresh_db: Path) -> None:
+    captured: list[ProviderRequest] = []
+    registry = ProviderRegistry()
+    registry.register(FakeProvider(capture_requests=captured))
+
+    with session_scope() as session:
+        memory = MemoryService(session)
+        for index in range(40):
+            memory.create_memory(
+                namespace="global",
+                kind="note",
+                content=f"Budgeted memory {index} " + ("detail " * 500),
+            )
+        work = WorkRepository(session).create_work_item(
+            title="Budgeted memory",
+            task_instruction="Use budgeted memory details.",
+            worker_kind="provider.fake",
+        )
+
+        WorkRunner(
+            session,
+            provider_runtime=ProviderRuntime(registry=registry),
+        ).run_next()
+
+        packet = captured[0].context["tasque_context_packet"]
+        assert len(packet["memories"]) == 24
+        assert packet["context_budget"]["limits"]["memories"] == 24
+        assert any(memory["content_compacted"] for memory in packet["memories"])
+        assert len(captured[0].prompt) < 120_000
+        assert session.get(WorkItem, work.id).status == "succeeded"
+
+
 def test_provider_prompt_uses_explicit_memory_queries_and_canonical_state(fresh_db: Path) -> None:
     captured: list[ProviderRequest] = []
     registry = ProviderRegistry()
@@ -906,6 +938,31 @@ def test_codex_provider_builds_schema_arg_and_parses_jsonl(tmp_path: Path) -> No
     assert response.status == "succeeded"
     assert response.provider_session_id == "codex-session"
     assert response.structured_output == {"ok": True, "provider": "codex"}
+
+
+def test_codex_provider_failure_summary_uses_stream_error_message() -> None:
+    def runner(argv, **kwargs):
+        stream = "\n".join(
+            [
+                '{"type":"thread.started","thread_id":"t-1"}',
+                (
+                    "{\"type\":\"error\",\"message\":\"Codex ran out of room in the model's "
+                    'context window. Start a new thread."}'
+                ),
+                (
+                    "{\"type\":\"turn.failed\",\"error\":{\"message\":\"Codex ran out of room "
+                    'in the model\'s context window. Start a new thread."}}'
+                ),
+            ]
+        )
+        return subprocess.CompletedProcess(argv, 1, stdout=stream, stderr="")
+
+    response = CodexCliProvider(runner=runner).run(
+        ProviderRequest(provider="codex", prompt="too much context")
+    )
+
+    assert response.status == "failed"
+    assert response.summary == "Codex ran out of room in the model's context window. Start a new thread."
 
 
 def test_claude_provider_passes_json_schema_and_parses_result(tmp_path: Path) -> None:

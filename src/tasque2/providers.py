@@ -37,6 +37,13 @@ CLAUDE_MCP_STARTUP_TIMEOUT_MS = 24 * 60 * 60 * 1000
 CLAUDE_MCP_TOOL_TIMEOUT_MS = 100_000_000
 SUBPROCESS_RESULT_POLL_SECONDS = 0.5
 SUBPROCESS_TERMINATION_GRACE_SECONDS = 5.0
+DEFAULT_PROVIDER_CONTEXT_LIMITS: dict[str, int | None] = {
+    "memories": 24,
+    "artifacts": 48,
+    "events": 48,
+    "workflow_nodes": None,
+}
+PROVIDER_CONTEXT_LIMIT_KEYS = frozenset(DEFAULT_PROVIDER_CONTEXT_LIMITS)
 
 
 @dataclass(frozen=True)
@@ -464,7 +471,16 @@ class ProviderRuntime:
         provider_name = provider_name_for_worker_kind(work_item.worker_kind)
         adapter = self.registry.get(provider_name)
         result_token = result_inbox.mint_token()
-        context_packet = WorkerContextBuilder(session).build_for_work(work_item)
+        context_limits = _provider_context_limits(work_item)
+        context_packet = WorkerContextBuilder(session).build_for_work(work_item, limits=context_limits)
+        context_packet["context_budget"] = {
+            "limits": context_limits,
+            "note": (
+                "The initial provider context is size-budgeted. Use Tasque MCP "
+                "read/search tools for additional full memory, artifact, work, or "
+                "workflow context when needed."
+            ),
+        }
         context_packet["result_submission"] = {
             "tool": "submit_worker_result",
             "result_token": result_token,
@@ -1115,6 +1131,26 @@ def _work_memory_namespace(work_item: WorkItem) -> str:
     return "global"
 
 
+def _provider_context_limits(work_item: WorkItem) -> dict[str, int | None]:
+    limits = dict(DEFAULT_PROVIDER_CONTEXT_LIMITS)
+    for source in (work_item.runtime_contract or {}, work_item.context or {}):
+        configured = source.get("context_limits")
+        if not isinstance(configured, dict):
+            continue
+        for key in PROVIDER_CONTEXT_LIMIT_KEYS:
+            if key not in configured:
+                continue
+            value = configured[key]
+            if value is None:
+                limits[key] = None
+                continue
+            try:
+                limits[key] = max(0, int(value))
+            except (TypeError, ValueError):
+                raise ProviderExecutionError(f"context_limits.{key} must be an integer or null.") from None
+    return limits
+
+
 def _contract_string(contract: Mapping[str, Any], *keys: str) -> str | None:
     for key in keys:
         value = contract.get(key)
@@ -1395,12 +1431,24 @@ def extract_usage_from_stream(text: str) -> dict[str, Any]:
 
 
 def _normalize_stream_response(response: ProviderResponse, *, provider: str) -> ProviderResponse:
-    if response.status != "succeeded":
-        return response
     output_text = extract_text_from_stream(response.stdout) or response.output_text
     session_id = response.provider_session_id or extract_session_id_from_stream(response.stdout)
     usage = dict(response.usage)
     usage.update(extract_usage_from_stream(response.stdout))
+    if response.status != "succeeded":
+        error_summary = _stream_error_summary(response.stdout, response.raw_stream, response.stderr)
+        return ProviderResponse(
+            status=response.status,
+            summary=error_summary or response.summary,
+            output_text=output_text,
+            structured_output=response.structured_output,
+            stdout=response.stdout,
+            stderr=response.stderr,
+            raw_stream=response.raw_stream,
+            provider_session_id=session_id,
+            usage=usage,
+            exit_code=response.exit_code,
+        )
     structured = response.structured_output or extract_structured_output(output_text)
     summary = _first_line(output_text) or response.summary or f"{provider} completed."
     return ProviderResponse(
@@ -1415,6 +1463,22 @@ def _normalize_stream_response(response: ProviderResponse, *, provider: str) -> 
         usage=usage,
         exit_code=response.exit_code,
     )
+
+
+def _stream_error_summary(*texts: str) -> str | None:
+    for text in texts:
+        for obj in reversed(_iter_json_objects(text)):
+            message = obj.get("message")
+            if isinstance(message, str) and message.strip():
+                return message.strip()
+            error = obj.get("error")
+            if isinstance(error, dict):
+                nested = error.get("message")
+                if isinstance(nested, str) and nested.strip():
+                    return nested.strip()
+            elif isinstance(error, str) and error.strip():
+                return error.strip()
+    return None
 
 
 def _iter_json_objects(text: str) -> list[dict[str, Any]]:
