@@ -411,6 +411,8 @@ class ClaudeCodeProvider(SubprocessProvider):
             "--print",
             "--output-format",
             "stream-json",
+            # stream-json output in --print mode is only accepted alongside --verbose.
+            "--verbose",
             "--permission-mode",
             "bypassPermissions",
         ]

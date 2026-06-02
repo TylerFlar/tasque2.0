@@ -993,6 +993,8 @@ def test_claude_provider_passes_json_schema_and_parses_result(tmp_path: Path) ->
     argv = captured["argv"]
     assert "--permission-mode" in argv
     assert argv[argv.index("--permission-mode") + 1] == "bypassPermissions"
+    # stream-json output in --print mode is rejected by the CLI without --verbose.
+    assert "--verbose" in argv
     assert "--json-schema" in argv
     assert "--mcp-config" in argv
     # The prompt is delivered over stdin, never as an argv element, so large
