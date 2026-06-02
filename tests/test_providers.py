@@ -971,6 +971,7 @@ def test_claude_provider_passes_json_schema_and_parses_result(tmp_path: Path) ->
     def runner(argv, **kwargs):
         captured["argv"] = argv
         captured["env"] = kwargs["env"]
+        captured["input"] = kwargs["input"]
         return subprocess.CompletedProcess(
             argv,
             0,
@@ -994,6 +995,10 @@ def test_claude_provider_passes_json_schema_and_parses_result(tmp_path: Path) ->
     assert argv[argv.index("--permission-mode") + 1] == "bypassPermissions"
     assert "--json-schema" in argv
     assert "--mcp-config" in argv
+    # The prompt is delivered over stdin, never as an argv element, so large
+    # context packets cannot blow past the OS command line limit.
+    assert "Return JSON." not in argv
+    assert captured["input"] == "Return JSON."
     mcp_config = json.loads(argv[argv.index("--mcp-config") + 1])
     assert mcp_config["mcpServers"]["tasque2"]["args"] == ["-m", "tasque2.mcp"]
     assert captured["env"]["MCP_TIMEOUT"] == "86400000"

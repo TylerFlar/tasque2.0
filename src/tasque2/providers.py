@@ -419,7 +419,9 @@ class ClaudeCodeProvider(SubprocessProvider):
             argv.extend(["--model", request.model])
         if request.output_schema:
             argv.extend(["--json-schema", json.dumps(request.output_schema)])
-        argv.append(request.prompt)
+        # The prompt is delivered over stdin (written by SubprocessProvider), not as
+        # an argv element. Large context packets would otherwise exceed the OS command
+        # line limit (Windows caps it near 32 KB), which surfaces as WinError 206.
         env = dict(request.env)
         env.setdefault("MCP_TIMEOUT", str(CLAUDE_MCP_STARTUP_TIMEOUT_MS))
         env.setdefault("MCP_TOOL_TIMEOUT", str(CLAUDE_MCP_TOOL_TIMEOUT_MS))
