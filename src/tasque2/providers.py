@@ -1074,7 +1074,7 @@ def model_routing_for_provider_request(
     native_worker_profile = None
 
     if provider_name in DEFAULT_MODEL_PROVIDERS:
-        orchestrator_profile = "high"
+        orchestrator_profile = settings.normalize_model_profile(settings.orchestrator_model_profile)
         orchestrator_model = settings.model_for_profile(provider_name, orchestrator_profile)
 
         if native_worker_model is None:

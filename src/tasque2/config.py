@@ -34,6 +34,7 @@ class Settings(BaseSettings):
     discord_allowed_user_ids: str | None = Field(default=None)
     discord_max_attachment_bytes: int = Field(default=25 * 1024 * 1024)
     default_provider: str = Field(default="codex")
+    orchestrator_model_profile: str = Field(default="high")
     native_worker_model_profile: str | None = Field(default=None)
     codex_model_low: str | None = Field(default=None)
     codex_model_medium: str | None = Field(default=None)
