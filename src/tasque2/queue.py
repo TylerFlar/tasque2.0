@@ -19,6 +19,15 @@ from tasque2.models import (
 
 TERMINAL_WORK_STATUSES = {"succeeded", "dead_letter", "canceled"}
 
+# Attempt error_type values that represent infrastructure/transient failures
+# rather than a genuine agent-reported task outcome. These get a retry floor
+# (TRANSIENT_RETRY_FLOOR total attempts) independent of the work item's
+# max_attempts, so a single dropped socket or crashed provider no longer
+# permanently dead-letters work that was never actually attempted to completion.
+TRANSIENT_ERROR_TYPES = frozenset({"TransientProviderError"})
+TRANSIENT_RETRY_FLOOR = 3
+TRANSIENT_RETRY_DELAY_SECONDS = 30
+
 
 @dataclass(frozen=True)
 class ClaimedWork:
@@ -412,6 +421,19 @@ class WorkQueue:
         )
         return work_item
 
+    def _effective_max_attempts(self, attempt: WorkAttempt, work_item: WorkItem) -> int:
+        """Attempt budget for this failure.
+
+        Genuine agent-reported failures use the work item's configured
+        max_attempts. Transient/infra failures (TRANSIENT_ERROR_TYPES) are
+        guaranteed at least TRANSIENT_RETRY_FLOOR attempts regardless, so a
+        single dropped socket cannot permanently dead-letter a max_attempts=1
+        work item that never ran to completion.
+        """
+        if (attempt.error_type or "") in TRANSIENT_ERROR_TYPES:
+            return max(work_item.max_attempts, TRANSIENT_RETRY_FLOOR)
+        return work_item.max_attempts
+
     def _transition_after_failure(
         self,
         attempt: WorkAttempt,
@@ -448,8 +470,12 @@ class WorkQueue:
                 source="queue",
                 summary="Work canceled after attempt ended",
             )
-        elif attempt.attempt_number < work_item.max_attempts:
-            retry_delay = int((work_item.retry_policy or {}).get("delay_seconds", 0))
+        elif attempt.attempt_number < self._effective_max_attempts(attempt, work_item):
+            is_transient = (attempt.error_type or "") in TRANSIENT_ERROR_TYPES
+            base_delay = int((work_item.retry_policy or {}).get("delay_seconds", 0))
+            retry_delay = (
+                max(base_delay, TRANSIENT_RETRY_DELAY_SECONDS) if is_transient else base_delay
+            )
             work_item.status = "ready"
             work_item.not_before = now + timedelta(seconds=retry_delay)
             self._emit_event(
@@ -460,7 +486,7 @@ class WorkQueue:
                 attempt_id=attempt.id,
                 source="queue",
                 summary="Work returned to ready state for retry",
-                payload={"delay_seconds": retry_delay},
+                payload={"delay_seconds": retry_delay, "transient": is_transient},
             )
         else:
             work_item.status = "dead_letter"

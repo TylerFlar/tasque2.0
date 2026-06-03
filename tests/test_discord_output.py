@@ -399,13 +399,20 @@ def test_discord_output_attaches_provider_logs_for_dead_letter(fresh_db: Path) -
         FakeProvider(
             response=ProviderResponse(
                 status="succeeded",
-                summary="No submitted result.",
+                summary="Reported failure.",
                 output_text="plain text",
                 stdout="stdout log",
                 stderr="stderr log",
                 raw_stream='{"type":"item.completed","item":{"type":"mcp_tool_call","tool":"workflow_start","status":"completed"}}',
+                # A genuine agent-reported failure (vs. a transient infra error):
+                # this dead-letters on the first attempt rather than being retried.
+                structured_output={
+                    "status": "failed",
+                    "summary": "Could not finish.",
+                    "report": "Tried and failed after writing logs.",
+                    "error": "Could not finish.",
+                },
             ),
-            deposit_structured_result=False,
         )
     )
 
@@ -414,6 +421,7 @@ def test_discord_output_attaches_provider_logs_for_dead_letter(fresh_db: Path) -
             title="Provider log failure",
             task_instruction="Fail after writing logs.",
             worker_kind="provider.fake",
+            max_attempts=1,
         )
         WorkRunner(
             session,

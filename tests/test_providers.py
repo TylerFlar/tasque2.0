@@ -275,6 +275,38 @@ def test_provider_prompt_uses_explicit_memory_queries_and_canonical_state(fresh_
         assert "Completed workout actual loads: bench 95x10 RPE 8." in captured[0].prompt
 
 
+def test_provider_prompt_includes_workout_exercise_ledger(fresh_db: Path) -> None:
+    captured: list[ProviderRequest] = []
+    registry = ProviderRegistry()
+    registry.register(FakeProvider(capture_requests=captured))
+
+    with session_scope() as session:
+        memory = MemoryService(session)
+        memory.upsert_canonical(
+            namespace="health",
+            canonical_key="workout_exercise_ledger",
+            kind="summary",
+            content="Leg press [Tier A, 6-10, +5]: 2026-06-01 3x10 @ 95 lb clean.",
+            tags=["workout", "ledger", "progression"],
+        )
+        WorkRepository(session).create_work_item(
+            title="Workout generator",
+            task_instruction="Generate today's workout.",
+            worker_kind="provider.fake",
+            context={
+                "memory_namespace": "health",
+                "memory_canonical_keys": ["workout_exercise_ledger"],
+            },
+        )
+        outcome = WorkRunner(
+            session,
+            provider_runtime=ProviderRuntime(registry=registry),
+        ).run_next()
+
+        assert outcome is not None
+        assert "Leg press [Tier A, 6-10, +5]: 2026-06-01 3x10 @ 95 lb clean." in captured[0].prompt
+
+
 def test_provider_prompt_includes_parent_work_for_reply_processors(fresh_db: Path) -> None:
     captured: list[ProviderRequest] = []
     registry = ProviderRegistry()
@@ -622,7 +654,11 @@ def test_default_provider_rejects_test_provider_without_test_flag(monkeypatch) -
         reset_settings()
 
 
-def test_fake_provider_failure_dead_letters_work(fresh_db: Path) -> None:
+def test_fake_provider_failure_is_transient_and_retried(fresh_db: Path) -> None:
+    # A provider that fails without depositing a worker result is an infra
+    # failure (crash / dropped socket), not the agent's reported task outcome.
+    # It is classified transient and retried up to the floor before dead-lettering,
+    # even though this work item only allows a single configured attempt.
     registry = ProviderRegistry()
     registry.register(
         FakeProvider(
@@ -642,6 +678,7 @@ def test_fake_provider_failure_dead_letters_work(fresh_db: Path) -> None:
             title="Provider failure",
             task_instruction="Fail.",
             worker_kind="provider.fake",
+            max_attempts=1,
         )
         outcome = WorkRunner(
             session,
@@ -649,13 +686,13 @@ def test_fake_provider_failure_dead_letters_work(fresh_db: Path) -> None:
         ).run_next()
 
         assert outcome is not None
-        assert outcome.status == "dead_letter"
-        assert session.get(WorkItem, work.id).status == "dead_letter"
+        assert outcome.status == "ready"  # retried rather than dead-lettered on first blip
+        assert session.get(WorkItem, work.id).status == "ready"
 
-        failed = session.scalar(select(FailedWork).where(FailedWork.work_item_id == work.id))
-        assert failed is not None
-        assert failed.error_type == "ProviderExecutionError"
-        assert failed.error_message == "Fake failure."
+        attempt = session.scalar(select(WorkAttempt).where(WorkAttempt.work_item_id == work.id))
+        assert attempt is not None
+        assert attempt.error_type == "TransientProviderError"
+        assert attempt.error_message == "Fake failure."
 
         provider_run = session.scalar(select(ProviderRun))
         assert provider_run is not None
@@ -663,7 +700,10 @@ def test_fake_provider_failure_dead_letters_work(fresh_db: Path) -> None:
         assert provider_run.stderr_artifact_id is not None
 
 
-def test_provider_missing_submit_result_dead_letters_work(fresh_db: Path) -> None:
+def test_provider_missing_submit_result_is_transient_and_retried(fresh_db: Path) -> None:
+    # Finishing without depositing a worker result is also treated as transient:
+    # the agent never completed the submit protocol, so a retry is warranted
+    # before giving up.
     registry = ProviderRegistry()
     registry.register(
         FakeProvider(
@@ -683,6 +723,7 @@ def test_provider_missing_submit_result_dead_letters_work(fresh_db: Path) -> Non
             title="Need JSON",
             task_instruction="Submit a result.",
             worker_kind="provider.fake",
+            max_attempts=1,
         )
         outcome = WorkRunner(
             session,
@@ -690,12 +731,13 @@ def test_provider_missing_submit_result_dead_letters_work(fresh_db: Path) -> Non
         ).run_next()
 
         assert outcome is not None
-        assert outcome.status == "dead_letter"
-        assert session.get(WorkItem, work.id).status == "dead_letter"
+        assert outcome.status == "ready"  # retried, not dead-lettered on first miss
+        assert session.get(WorkItem, work.id).status == "ready"
 
-        failed = session.scalar(select(FailedWork).where(FailedWork.work_item_id == work.id))
-        assert failed is not None
-        assert "did not call submit_worker_result" in failed.error_message
+        attempt = session.scalar(select(WorkAttempt).where(WorkAttempt.work_item_id == work.id))
+        assert attempt is not None
+        assert attempt.error_type == "TransientProviderError"
+        assert "did not call submit_worker_result" in attempt.error_message
 
 
 def test_provider_blocked_result_with_error_completes_work(fresh_db: Path) -> None:
@@ -775,13 +817,14 @@ def test_provider_missing_result_reports_failed_submit_tool(fresh_db: Path) -> N
         ).run_next()
 
         assert outcome is not None
-        assert outcome.status == "dead_letter"
-        assert session.get(WorkItem, work.id).status == "dead_letter"
+        assert outcome.status == "ready"  # transient: no result deposited, so retried
+        assert session.get(WorkItem, work.id).status == "ready"
 
-        failed = session.scalar(select(FailedWork).where(FailedWork.work_item_id == work.id))
-        assert failed is not None
-        assert "attempted submit_worker_result" in failed.error_message
-        assert "user cancelled MCP tool call" in failed.error_message
+        attempt = session.scalar(select(WorkAttempt).where(WorkAttempt.work_item_id == work.id))
+        assert attempt is not None
+        assert attempt.error_type == "TransientProviderError"
+        assert "attempted submit_worker_result" in attempt.error_message
+        assert "user cancelled MCP tool call" in attempt.error_message
 
 
 def test_subprocess_provider_does_not_pass_timeout_to_runner() -> None:

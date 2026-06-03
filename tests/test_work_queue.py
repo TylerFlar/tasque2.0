@@ -7,7 +7,11 @@ from sqlalchemy import select
 
 from tasque2.db import session_scope
 from tasque2.models import FailedWork, ProviderRun, WorkAttempt, WorkEvent, WorkItem, utc_now
-from tasque2.queue import WorkQueue
+from tasque2.queue import (
+    TRANSIENT_RETRY_DELAY_SECONDS,
+    TRANSIENT_RETRY_FLOOR,
+    WorkQueue,
+)
 from tasque2.repo import WorkRepository
 from tasque2.runtime import FunctionWorkerRegistry, WorkerResult, WorkRunner
 
@@ -120,6 +124,76 @@ def test_worker_failure_retries_until_dead_letter(fresh_db: Path) -> None:
         assert failed is not None
         assert failed.error_type == "RuntimeError"
         assert failed.error_message == "boom"
+
+
+def test_transient_provider_error_retries_past_max_attempts(fresh_db: Path) -> None:
+    # A single-attempt work item should still be retried when it fails for a
+    # transient/infra reason (e.g. a dropped API socket), up to the transient
+    # retry floor, rather than dead-lettering on the first blip.
+    with session_scope() as session:
+        work = WorkRepository(session).create_work_item(
+            title="Transient blip",
+            task_instruction="Provider socket dropped before submit.",
+            worker_kind="provider.default",
+            max_attempts=1,
+        )
+        queue = WorkQueue(session)
+
+        # Advance the clock each round so the transient backoff (not_before) has
+        # elapsed and the requeued item is claimable again.
+        base = utc_now()
+        statuses = []
+        for i in range(TRANSIENT_RETRY_FLOOR):
+            now = base + timedelta(minutes=i)
+            claimed = queue.claim_next_ready_work(lease_owner="daemon", now=now)
+            assert claimed is not None
+            queue.fail_attempt(
+                claimed.attempt.id,
+                error_type="TransientProviderError",
+                error_message="API Error: The socket connection was closed unexpectedly.",
+                now=now,
+            )
+            statuses.append(session.get(WorkItem, work.id).status)
+
+        # First (FLOOR - 1) failures requeue; the last exhausts the floor.
+        assert statuses[:-1] == ["ready"] * (TRANSIENT_RETRY_FLOOR - 1)
+        assert statuses[-1] == "dead_letter"
+
+        retry_events = session.scalars(
+            select(WorkEvent).where(
+                WorkEvent.work_item_id == work.id,
+                WorkEvent.event_type == "work.retry_scheduled",
+            )
+        ).all()
+        assert len(retry_events) == TRANSIENT_RETRY_FLOOR - 1
+        assert all(event.payload.get("transient") is True for event in retry_events)
+        assert all(
+            event.payload.get("delay_seconds") >= TRANSIENT_RETRY_DELAY_SECONDS
+            for event in retry_events
+        )
+
+
+def test_agent_reported_failure_dead_letters_on_first_attempt(fresh_db: Path) -> None:
+    # A genuine agent-reported failure is NOT transient: a max_attempts=1 item
+    # dead-letters immediately and is not retried by the transient floor.
+    with session_scope() as session:
+        work = WorkRepository(session).create_work_item(
+            title="Genuine failure",
+            task_instruction="Agent reported it could not complete the task.",
+            worker_kind="provider.default",
+            max_attempts=1,
+        )
+        queue = WorkQueue(session)
+        claimed = queue.claim_next_ready_work(lease_owner="daemon")
+        assert claimed is not None
+        queue.fail_attempt(
+            claimed.attempt.id,
+            error_type="ProviderExecutionError",
+            error_message="Task is impossible as specified.",
+        )
+
+        assert session.get(WorkItem, work.id).status == "dead_letter"
+        assert session.get(WorkItem, work.id).attempt_count == 1
 
 
 def test_expired_lease_requeues_retryable_work(fresh_db: Path) -> None:

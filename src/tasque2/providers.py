@@ -92,6 +92,20 @@ class ProviderExecutionError(RuntimeError):
     pass
 
 
+class TransientProviderError(ProviderExecutionError):
+    """A provider failure that is not the agent's reported task outcome.
+
+    These are infrastructure errors -- the provider process crashed, the API
+    socket dropped, the run timed out, or it finished without ever depositing a
+    worker result. Unlike an agent that explicitly submits ``status: failed``,
+    a retry of the same work has a good chance of succeeding, so the queue gives
+    these a retry floor independent of ``max_attempts`` (see
+    ``tasque2.queue.TRANSIENT_ERROR_TYPES``).
+    """
+
+    pass
+
+
 class ProviderRegistry:
     def __init__(self) -> None:
         self._providers: dict[str, ProviderAdapter] = {}
@@ -568,9 +582,14 @@ class ProviderRuntime:
 
         payload = result_inbox.read_and_consume(result_token, agent_kind="worker")
         if payload is None:
+            # No worker result was deposited. The agent never reached
+            # submit_worker_result -- the provider crashed, the API socket
+            # dropped, it timed out, or it exited without submitting. None of
+            # these is the agent's reported task outcome, so treat them as
+            # transient/infra failures that are worth retrying.
             if response.status != "succeeded":
-                raise ProviderExecutionError(response.summary)
-            raise ProviderExecutionError(_missing_result_error_message(response))
+                raise TransientProviderError(response.summary)
+            raise TransientProviderError(_missing_result_error_message(response))
 
         worker_status, summary, report, produces = _normalize_submitted_result(payload)
         if worker_status in {"failed", "error"}:
@@ -1472,6 +1491,14 @@ def _normalize_stream_response(response: ProviderResponse, *, provider: str) -> 
 def _stream_error_summary(*texts: str) -> str | None:
     for text in texts:
         for obj in reversed(_iter_json_objects(text)):
+            # The terminal result event carries the human-readable failure
+            # (e.g. "API Error: The socket connection was closed unexpectedly.")
+            # in its `result` field; prefer it over the generic per-event
+            # `error` marker (often the unhelpful literal "unknown").
+            if obj.get("type") == "result" and obj.get("is_error"):
+                result_text = obj.get("result")
+                if isinstance(result_text, str) and result_text.strip():
+                    return result_text.strip()
             message = obj.get("message")
             if isinstance(message, str) and message.strip():
                 return message.strip()
@@ -1480,7 +1507,7 @@ def _stream_error_summary(*texts: str) -> str | None:
                 nested = error.get("message")
                 if isinstance(nested, str) and nested.strip():
                     return nested.strip()
-            elif isinstance(error, str) and error.strip():
+            elif isinstance(error, str) and error.strip() and error.strip() != "unknown":
                 return error.strip()
     return None
 
