@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
@@ -28,6 +29,7 @@ from tasque2.repo import WorkRepository
 from tasque2.scheduler import ScheduleService
 from tasque2.status import get_system_status
 from tasque2.templates import read_template_file
+from tasque2.weather import fetch_local_weather
 from tasque2.workflows import WorkflowService
 
 
@@ -165,6 +167,54 @@ def memory_supersede(memory_id: str, content: str, tags: list[str] | None = None
 def memory_archive(memory_id: str) -> str:
     """Archive a memory without deleting it."""
     return _run_json(lambda: _memory_archive(memory_id=memory_id))
+
+
+def memory_recall(
+    intent: str,
+    query: str,
+    namespace: str | None = None,
+    tags: list[str] | None = None,
+    limit: int = 8,
+) -> str:
+    """Recall the most relevant memories via hybrid (semantic + keyword) search.
+
+    Prefer this over memory_search when you want the best items to reason with:
+    it fuses vector similarity, keyword match, recency, and importance, and
+    returns items already ranked with a relevance ``score``. Pass the namespace
+    to scope the recall to one domain (e.g. ``local``, ``finance``, ``health``).
+    """
+    return _run_json(
+        lambda: _memory_recall(query=query, namespace=namespace, tags=tags, limit=limit),
+        intent=intent,
+    )
+
+
+def memory_update(
+    memory_id: str,
+    content: str | None = None,
+    tags: list[str] | None = None,
+    importance: int | None = None,
+) -> str:
+    """Edit ONE memory item in place — the fact-level update primitive.
+
+    Use this to change a single discrete fact instead of rewriting a whole
+    canonical document: no new row, no archived copy. ``importance`` is an
+    optional 1-5 salience that boosts the item in future recall.
+    """
+    return _run_json(
+        lambda: _memory_update(
+            memory_id=memory_id, content=content, tags=tags, importance=importance
+        )
+    )
+
+
+def memory_delete(memory_id: str) -> str:
+    """Permanently delete ONE memory item — fact-level unlearning.
+
+    Use for a stale or contradicted fact. Unlike memory_archive this removes the
+    row and its search/embedding index entirely (real forgetting).
+    """
+    return _run_json(lambda: _memory_delete(memory_id=memory_id))
 
 
 def memory_ingest_text(
@@ -416,8 +466,14 @@ def schedule_create_work(
     enabled: bool = True,
     task_template_path: str | None = None,
     template_base_dir: str | None = None,
+    discord_thread_id: str | None = None,
 ) -> str:
-    """Create a recurring or future schedule that enqueues a normal WorkItem."""
+    """Create a recurring or one-time schedule ("watch") that enqueues a WorkItem.
+
+    schedule_type is "cron" (expression e.g. "0 9 * * FRI"), "interval"
+    (e.g. "hours=6"), or "date" (one-time; expression an ISO datetime). Pass
+    discord_thread_id to deliver each firing's result back into that thread.
+    """
     return _run_json(
         lambda: _schedule_create_work(
             name=name,
@@ -433,13 +489,67 @@ def schedule_create_work(
             enabled=enabled,
             task_template_path=task_template_path,
             template_base_dir=template_base_dir,
+            discord_thread_id=discord_thread_id,
         )
     )
 
 
 def schedule_list(intent: str, enabled: bool | None = None, limit: int = 20) -> str:
-    """List recent schedules."""
+    """List recent schedules ("watches")."""
     return _run_json(lambda: _schedule_list(enabled=enabled, limit=limit), intent=intent)
+
+
+def schedule_get(schedule_id: str) -> str:
+    """Get one schedule ("watch") by id, including its full payload."""
+    return _run_json(lambda: _schedule_get(schedule_id=schedule_id))
+
+
+def schedule_update(
+    schedule_id: str,
+    name: str | None = None,
+    schedule_type: str | None = None,
+    expression: str | None = None,
+    timezone_name: str | None = None,
+    context: dict[str, Any] | None = None,
+    catchup_policy: str | None = None,
+    max_backfill: int | None = None,
+    enabled: bool | None = None,
+    discord_thread_id: str | None = None,
+) -> str:
+    """Update a schedule ("watch"): cadence (schedule_type/expression), context,
+    enabled, etc. Only the fields you pass change; context/discord_thread_id are
+    merged into the existing payload."""
+    return _run_json(
+        lambda: _schedule_update(
+            schedule_id=schedule_id,
+            name=name,
+            schedule_type=schedule_type,
+            expression=expression,
+            timezone_name=timezone_name,
+            context=context,
+            catchup_policy=catchup_policy,
+            max_backfill=max_backfill,
+            enabled=enabled,
+            discord_thread_id=discord_thread_id,
+        )
+    )
+
+
+def schedule_set_enabled(schedule_id: str, enabled: bool) -> str:
+    """Enable (resume) or disable (pause) a schedule ("watch") without deleting it."""
+    return _run_json(
+        lambda: _schedule_set_enabled(schedule_id=schedule_id, enabled=enabled)
+    )
+
+
+def schedule_delete(schedule_id: str) -> str:
+    """Delete a schedule ("watch") permanently."""
+    return _run_json(lambda: _schedule_delete(schedule_id=schedule_id))
+
+
+def schedule_fire_now(schedule_id: str) -> str:
+    """Fire a schedule ("watch") immediately, in addition to its normal cadence."""
+    return _run_json(lambda: _schedule_fire_now(schedule_id=schedule_id))
 
 
 def workflow_list(intent: str, enabled: bool | None = None, limit: int = 20) -> str:
@@ -466,6 +576,17 @@ def workflow_start(
             discord_thread_id=discord_thread_id,
         )
     )
+
+
+def weather_now(intent: str, days: int = 3) -> str:
+    """Read the local weather: current conditions + daily forecast.
+
+    Returns current temp/feels-like/wind/conditions and per-day high/low,
+    feels-like range, rain chance, and sunset for the configured home location
+    — for dressing to the actual day (fabric weight, layers, rain) rather than
+    the season. days = how many forecast days to include (1-7).
+    """
+    return _run_json(lambda: {"ok": True, "weather": fetch_local_weather(days=days)}, intent=intent)
 
 
 def system_status(intent: str) -> str:
@@ -528,12 +649,25 @@ def _memory_search(
     limit: int,
 ) -> dict[str, Any]:
     with session_scope() as session:
-        memories = MemoryService(session).search(
-            query=_fts_query(query),
-            namespace=_optional_string(namespace),
-            tags=_string_list(tags),
-            limit=_limit(limit),
-        )
+        service = MemoryService(session)
+        text_query = _optional_string(query)
+        if text_query:
+            scored = service.search_hybrid(
+                query=text_query,
+                namespace=_optional_string(namespace),
+                tags=_string_list(tags),
+                limit=_limit(limit),
+            )
+            memories = [entry.memory for entry in scored]
+        else:
+            memories = list(
+                service.search(
+                    query=None,
+                    namespace=_optional_string(namespace),
+                    tags=_string_list(tags),
+                    limit=_limit(limit),
+                )
+            )
         return {"ok": True, "items": [_memory_data(memory) for memory in memories]}
 
 
@@ -671,6 +805,52 @@ def _memory_archive(*, memory_id: str) -> dict[str, Any]:
     with session_scope() as session:
         memory = MemoryService(session).archive_memory(_required(memory_id, "memory_id"))
         return {"ok": True, "memory": _memory_data(memory, full=True)}
+
+
+def _memory_recall(
+    *,
+    query: str | None,
+    namespace: str | None,
+    tags: list[str] | None,
+    limit: int,
+) -> dict[str, Any]:
+    with session_scope() as session:
+        scored = MemoryService(session).search_hybrid(
+            query=_optional_string(query),
+            namespace=_optional_string(namespace),
+            tags=_string_list(tags),
+            limit=_limit(limit),
+        )
+        items: list[dict[str, Any]] = []
+        for entry in scored:
+            data = _memory_data(entry.memory)
+            if data is not None:
+                data["score"] = round(entry.score, 4)
+                items.append(data)
+        return {"ok": True, "items": items}
+
+
+def _memory_update(
+    *,
+    memory_id: str,
+    content: str | None,
+    tags: list[str] | None,
+    importance: int | None,
+) -> dict[str, Any]:
+    with session_scope() as session:
+        memory = MemoryService(session).update_memory(
+            _required(memory_id, "memory_id"),
+            content=_optional_string(content),
+            tags=_string_list(tags) if tags is not None else None,
+            importance=_optional_int(importance),
+        )
+        return {"ok": True, "memory": _memory_data(memory, full=True)}
+
+
+def _memory_delete(*, memory_id: str) -> dict[str, Any]:
+    with session_scope() as session:
+        MemoryService(session).delete_memory(_required(memory_id, "memory_id"))
+        return {"ok": True, "deleted_memory_id": memory_id}
 
 
 def _memory_ingest_text(
@@ -896,6 +1076,45 @@ def _artifact_archive(*, artifact_id: str) -> dict[str, Any]:
         return {"ok": True, "artifact": _artifact_data(artifact, full=True)}
 
 
+_INHERITED_REPLY_FOLLOWUP_KEYS = ("reply_followup_work", "reply_processor")
+
+
+def _calling_work_item(session: Any) -> WorkItem | None:
+    """The work item whose provider run is invoking this MCP server, when known."""
+    work_item_id = (os.environ.get("TASQUE2_WORK_ITEM_ID") or "").strip()
+    if not work_item_id:
+        return None
+    return session.get(WorkItem, work_item_id)
+
+
+def _context_with_inherited_reply_config(
+    context: dict[str, Any],
+    caller: WorkItem | None,
+    *,
+    inherit_parent_pointer: bool = False,
+) -> dict[str, Any]:
+    """Carry the caller's Discord reply handling onto work it spawns.
+
+    Workers that enqueue child work rarely think to re-attach reply processing, which
+    leaves the child's Discord thread deaf to user replies. Unless the child context
+    already takes a position, inherit the caller's reply follow-up/memory config.
+    """
+    if caller is None:
+        return context
+    caller_context = caller.context or {}
+    updated = dict(context)
+    if not any(key in updated for key in (*_INHERITED_REPLY_FOLLOWUP_KEYS, "reply_followup_disabled")):
+        for key in _INHERITED_REPLY_FOLLOWUP_KEYS:
+            if isinstance(caller_context.get(key), dict):
+                updated[key] = caller_context[key]
+                break
+    if "reply_memory" not in updated and isinstance(caller_context.get("reply_memory"), dict):
+        updated["reply_memory"] = caller_context["reply_memory"]
+    if inherit_parent_pointer:
+        updated.setdefault("parent_work_item_id", caller.id)
+    return updated
+
+
 def _work_enqueue(
     *,
     title: str,
@@ -917,16 +1136,22 @@ def _work_enqueue(
         template_base_dir=template_base_dir,
     )
     with session_scope() as session:
+        caller = _calling_work_item(session)
         work = WorkRepository(session).create_work_item(
             title=_required(title, "title"),
             task_instruction=resolved_task_instruction,
             worker_kind=_required(worker_kind, "worker_kind"),
             runtime_contract=dict(runtime_contract or {}),
-            context=dict(context or {}),
+            context=_context_with_inherited_reply_config(
+                dict(context or {}),
+                caller,
+                inherit_parent_pointer=True,
+            ),
             priority=int(priority),
             max_attempts=max(1, int(max_attempts)),
             idempotency_key=_optional_string(idempotency_key),
             source_kind="mcp",
+            source_id=caller.id if caller is not None else None,
             workflow_run_id=_optional_string(workflow_run_id),
             discord_thread_id=_optional_string(discord_thread_id),
         )
@@ -1000,6 +1225,7 @@ def _schedule_create_work(
     enabled: bool,
     task_template_path: str | None,
     template_base_dir: str | None,
+    discord_thread_id: str | None = None,
 ) -> dict[str, Any]:
     if runtime_contract is not None and not isinstance(runtime_contract, dict):
         raise ValueError("runtime_contract must be an object or omitted.")
@@ -1011,8 +1237,13 @@ def _schedule_create_work(
         task_template_path=task_template_path,
         template_base_dir=template_base_dir,
         context=context,
+        discord_thread_id=discord_thread_id,
     )
     with session_scope() as session:
+        payload["context"] = _context_with_inherited_reply_config(
+            payload.get("context") or {},
+            _calling_work_item(session),
+        )
         schedule = ScheduleService(session).create_schedule(
             name=_required(name, "name"),
             schedule_type=_required(schedule_type, "schedule_type"),
@@ -1026,6 +1257,92 @@ def _schedule_create_work(
             enabled=bool(enabled),
         )
         return {"ok": True, "schedule": _schedule_data(schedule, full=True)}
+
+
+def _schedule_get(*, schedule_id: str) -> dict[str, Any]:
+    with session_scope() as session:
+        schedule = session.get(Schedule, _required(schedule_id, "schedule_id"))
+        if schedule is None:
+            raise ValueError(f"Unknown schedule: {schedule_id}")
+        return {"ok": True, "schedule": _schedule_data(schedule, full=True)}
+
+
+def _schedule_update(
+    *,
+    schedule_id: str,
+    name: str | None,
+    schedule_type: str | None,
+    expression: str | None,
+    timezone_name: str | None,
+    context: dict[str, Any] | None,
+    catchup_policy: str | None,
+    max_backfill: int | None,
+    enabled: bool | None,
+    discord_thread_id: str | None,
+) -> dict[str, Any]:
+    if context is not None and not isinstance(context, dict):
+        raise ValueError("context must be an object or omitted.")
+    schedule_id = _required(schedule_id, "schedule_id")
+    with session_scope() as session:
+        service = ScheduleService(session)
+        new_payload: dict[str, Any] | None = None
+        if context is not None or discord_thread_id is not None:
+            existing = session.get(Schedule, schedule_id)
+            if existing is None:
+                raise ValueError(f"Unknown schedule: {schedule_id}")
+            new_payload = dict(existing.payload or {})
+            if context is not None:
+                new_payload["context"] = dict(context)
+            if discord_thread_id is not None:
+                thread_id = _optional_string(discord_thread_id)
+                if thread_id:
+                    new_payload["discord_thread_id"] = thread_id
+                else:
+                    new_payload.pop("discord_thread_id", None)
+        schedule = service.update_schedule(
+            schedule_id,
+            name=_optional_string(name),
+            schedule_type=_optional_string(schedule_type),
+            expression=_optional_string(expression),
+            payload=new_payload,
+            timezone_name=_optional_string(timezone_name),
+            catchup_policy=_optional_string(catchup_policy),
+            max_backfill=None if max_backfill is None else max(1, int(max_backfill)),
+            enabled=enabled,
+        )
+        return {"ok": True, "schedule": _schedule_data(schedule, full=True)}
+
+
+def _schedule_set_enabled(*, schedule_id: str, enabled: bool) -> dict[str, Any]:
+    schedule_id = _required(schedule_id, "schedule_id")
+    with session_scope() as session:
+        service = ScheduleService(session)
+        schedule = (
+            service.enable_schedule(schedule_id)
+            if enabled
+            else service.disable_schedule(schedule_id)
+        )
+        return {"ok": True, "schedule": _schedule_data(schedule, full=True)}
+
+
+def _schedule_delete(*, schedule_id: str) -> dict[str, Any]:
+    schedule_id = _required(schedule_id, "schedule_id")
+    with session_scope() as session:
+        ScheduleService(session).delete_schedule(schedule_id)
+        return {"ok": True, "deleted_schedule_id": schedule_id}
+
+
+def _schedule_fire_now(*, schedule_id: str) -> dict[str, Any]:
+    schedule_id = _required(schedule_id, "schedule_id")
+    with session_scope() as session:
+        occurrence = ScheduleService(session).fire_schedule_now(schedule_id)
+        return {
+            "ok": True,
+            "schedule_id": schedule_id,
+            "occurrence_id": occurrence.id,
+            "work_item_id": occurrence.work_item_id,
+            "workflow_run_id": occurrence.workflow_run_id,
+        }
 
 
 def _schedule_list(*, enabled: bool | None, limit: int) -> dict[str, Any]:
@@ -1388,6 +1705,7 @@ def _schedule_work_payload(
     task_template_path: str | None,
     template_base_dir: str | None,
     context: dict[str, Any] | None,
+    discord_thread_id: str | None = None,
 ) -> dict[str, Any]:
     instruction = _optional_string(task_instruction)
     template_path = _optional_string(task_template_path)
@@ -1397,6 +1715,9 @@ def _schedule_work_payload(
         "title": _required(name, "name"),
         "context": dict(context or {}),
     }
+    thread_id = _optional_string(discord_thread_id)
+    if thread_id:
+        payload["discord_thread_id"] = thread_id
     if template_path:
         payload["task_template_path"] = template_path
         base_dir = _optional_string(template_base_dir)
@@ -1445,6 +1766,517 @@ def _limit_chars(value: int | None) -> int:
 
 def _limit_bytes(value: int | None) -> int:
     return _limit(value, default=2_000_000, max_value=20_000_000)
+
+
+# --- Image tools ------------------------------------------------------------------------------
+# Vision itself is handled by the worker's built-in Read tool: it can open an image artifact's
+# local_path and actually see it. These tools cover what Read cannot -- cropping a region out of an
+# image, pulling a web image in to look at, and storing / finding / sending images as tagged
+# artifacts. They return artifact ids + local paths (JSON), which the worker then Reads (to view) or
+# adds to produces.discord_upload_artifact_ids (to send). Grouping (e.g. a wardrobe) is done purely
+# with tags the caller chooses -- nothing here is domain-specific.
+
+
+def _slug(value: str) -> str:
+    cleaned = "".join(ch.lower() if ch.isalnum() else "-" for ch in str(value).strip())
+    while "--" in cleaned:
+        cleaned = cleaned.replace("--", "-")
+    return cleaned.strip("-")[:60] or "item"
+
+
+def _resolve_image_source(session: Any, source: str) -> tuple[Path, str | None]:
+    """Resolve an image source given as either an artifact id or a local file path."""
+    text = _required(source, "source")
+    artifact = session.get(Artifact, text)
+    if artifact is not None:
+        path = Path(artifact.local_path)
+        if not path.is_file():
+            raise FileNotFoundError(f"Artifact {text} has no file on disk: {path}")
+        return path, artifact.id
+    path = Path(text).expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"source is neither a known artifact id nor an existing file: {source}")
+    return path, None
+
+
+def _crop_to_png_bytes(path: Path, box: Any, *, normalized: bool) -> tuple[bytes, tuple[int, int]]:
+    from io import BytesIO
+
+    from PIL import Image
+
+    if not isinstance(box, (list, tuple)) or len(box) != 4:
+        raise ValueError("box must be [left, top, right, bottom].")
+    with Image.open(path) as image:
+        if image.mode not in ("RGB", "RGBA"):
+            image = image.convert("RGB")
+        width, height = image.size
+        left, top, right, bottom = (float(value) for value in box)
+        if normalized:
+            left, right = left * width, right * width
+            top, bottom = top * height, bottom * height
+        crop = (
+            max(0, int(round(left))),
+            max(0, int(round(top))),
+            min(width, int(round(right))),
+            min(height, int(round(bottom))),
+        )
+        if crop[2] <= crop[0] or crop[3] <= crop[1]:
+            raise ValueError(f"empty crop box {crop} for a {width}x{height} image.")
+        cropped = image.crop(crop)
+        buffer = BytesIO()
+        cropped.save(buffer, format="PNG")
+        return buffer.getvalue(), cropped.size
+
+
+def image_crop(
+    source: str,
+    box: list[float],
+    normalized: bool = False,
+    label: str | None = None,
+    tags: list[str] | None = None,
+    work_item_id: str | None = None,
+    discord_upload: bool = False,
+) -> str:
+    """Crop a rectangle out of an image and store the crop as a new artifact.
+
+    ``source`` is a local file path or an existing artifact id (e.g. a closet photo the user sent).
+    ``box`` is ``[left, top, right, bottom]`` in pixels, or 0-1 fractions of width/height when
+    ``normalized`` is true. Returns the new artifact id + local_path; Read that path to view the
+    crop. Set ``discord_upload`` true to also queue it for sending to the user.
+    """
+    return _run_json(
+        lambda: _image_crop(
+            source=source,
+            box=box,
+            normalized=normalized,
+            label=label,
+            tags=tags,
+            work_item_id=work_item_id,
+            discord_upload=discord_upload,
+        )
+    )
+
+
+def _image_crop(
+    *,
+    source: str,
+    box: Any,
+    normalized: bool,
+    label: str | None,
+    tags: list[str] | None,
+    work_item_id: str | None,
+    discord_upload: bool,
+) -> dict[str, Any]:
+    clean_tags = _string_list(tags)
+    if discord_upload and "discord_upload" not in clean_tags:
+        clean_tags.append("discord_upload")
+    with session_scope() as session:
+        src_path, src_id = _resolve_image_source(session, source)
+        data, size = _crop_to_png_bytes(src_path, box, normalized=normalized)
+        title = f"{_slug(label or src_path.stem)}.png"
+        artifact = ArtifactStore().write_bytes(
+            session,
+            kind="image_crop",
+            title=title,
+            content=data,
+            suffix=".png",
+            content_type="image/png",
+            tags=clean_tags,
+            work_item_id=_optional_string(work_item_id),
+            source_kind="image_crop",
+            source_id=src_id,
+        )
+        return {
+            "ok": True,
+            "artifact_id": artifact.id,
+            "local_path": artifact.local_path,
+            "width": size[0],
+            "height": size[1],
+            "label": label,
+            "source_artifact_id": src_id,
+        }
+
+
+def image_fetch(
+    url: str,
+    label: str | None = None,
+    tags: list[str] | None = None,
+    work_item_id: str | None = None,
+) -> str:
+    """Download an image from a URL and store it as an artifact so you can SEE it.
+
+    Use this when researching what to buy: after WebSearch/WebFetch finds a product, fetch its
+    image here and Read the returned local_path to see what the item actually looks like before
+    recommending it. Returns the artifact id + local_path.
+    """
+    return _run_json(
+        lambda: _image_fetch(url=url, label=label, tags=tags, work_item_id=work_item_id)
+    )
+
+
+def _image_fetch(
+    *,
+    url: str,
+    label: str | None,
+    tags: list[str] | None,
+    work_item_id: str | None,
+) -> dict[str, Any]:
+    import mimetypes
+
+    import httpx
+
+    target = _required(url, "url")
+    with httpx.Client(follow_redirects=True, timeout=30.0) as client:
+        response = client.get(target, headers={"User-Agent": "Mozilla/5.0 (tasque2-stylist)"})
+        response.raise_for_status()
+        content_type = (response.headers.get("content-type") or "").split(";")[0].strip().lower()
+        data = response.content
+    if not content_type.startswith("image/"):
+        raise ValueError(f"URL did not return an image (content-type={content_type or 'unknown'}).")
+    if len(data) > 25 * 1024 * 1024:
+        raise ValueError("image is larger than 25MB.")
+    extension = mimetypes.guess_extension(content_type) or ".img"
+    with session_scope() as session:
+        artifact = ArtifactStore().write_bytes(
+            session,
+            kind="web_image",
+            title=f"{_slug(label or 'web-image')}{extension}",
+            content=data,
+            suffix=extension,
+            content_type=content_type,
+            tags=_string_list(tags),
+            work_item_id=_optional_string(work_item_id),
+            source_kind="image_fetch",
+            source_id=target[:240],
+        )
+        return {
+            "ok": True,
+            "artifact_id": artifact.id,
+            "local_path": artifact.local_path,
+            "content_type": content_type,
+            "size_bytes": len(data),
+            "url": target,
+        }
+
+
+def image_save(
+    source: str,
+    label: str | None = None,
+    tags: list[str] | None = None,
+    box: list[float] | None = None,
+    normalized: bool = False,
+    kind: str = "image",
+    notes: str | None = None,
+    work_item_id: str | None = None,
+    send: bool = False,
+) -> str:
+    """Store an image as a durable artifact you can find and send later.
+
+    ``source`` is a local file path or an existing artifact id (e.g. a photo the user sent, or a
+    fetched web image). Optionally crop to a region with ``box`` = ``[left, top, right, bottom]``
+    (``normalized`` true for 0-1 fractions of width/height). ``label`` sets a human title; ``tags``
+    make it findable later with ``image_find`` -- use any scheme you like to group related images.
+    Returns ``artifact_id`` + ``local_path`` + ``tags``. Set ``send`` true to also queue it to the
+    user's Discord thread.
+    """
+    return _run_json(
+        lambda: _image_save(
+            source=source,
+            label=label,
+            tags=tags,
+            box=box,
+            normalized=normalized,
+            kind=kind,
+            notes=notes,
+            work_item_id=work_item_id,
+            send=send,
+        )
+    )
+
+
+def _image_save(
+    *,
+    source: str,
+    label: str | None,
+    tags: list[str] | None,
+    box: Any,
+    normalized: bool,
+    kind: str,
+    notes: str | None,
+    work_item_id: str | None,
+    send: bool,
+) -> dict[str, Any]:
+    clean_tags = _string_list(tags)
+    if send and "discord_upload" not in clean_tags:
+        clean_tags.append("discord_upload")
+    resolved_kind = _optional_string(kind) or "image"
+    with session_scope() as session:
+        src_path, src_id = _resolve_image_source(session, source)
+        title_stem = _slug(label) if label else src_path.stem
+        if box is not None:
+            data, size = _crop_to_png_bytes(src_path, box, normalized=normalized)
+            artifact = ArtifactStore().write_bytes(
+                session,
+                kind=resolved_kind,
+                title=f"{title_stem}.png",
+                content=data,
+                suffix=".png",
+                content_type="image/png",
+                tags=clean_tags,
+                work_item_id=_optional_string(work_item_id),
+                source_kind="image_save",
+                source_id=src_id,
+            )
+            dimensions: list[int] | None = list(size)
+        else:
+            artifact = ArtifactStore().capture_file(
+                session,
+                path=src_path,
+                kind=resolved_kind,
+                title=f"{title_stem}{src_path.suffix}",
+                tags=clean_tags,
+                work_item_id=_optional_string(work_item_id),
+                source_kind="image_save",
+                source_id=src_id,
+            )
+            dimensions = None
+        return {
+            "ok": True,
+            "artifact_id": artifact.id,
+            "local_path": artifact.local_path,
+            "label": label,
+            "tags": clean_tags,
+            "dimensions": dimensions,
+            "notes": notes,
+            "queued_for_discord": bool(send),
+            "hint": (
+                "Find this later with image_find; to send it add artifact_id to "
+                "produces.discord_upload_artifact_ids."
+            ),
+        }
+
+
+def image_find(
+    query: str | None = None,
+    tags: list[str] | None = None,
+    kind: str | None = None,
+    limit: int = 20,
+) -> str:
+    """Find images you stored earlier with ``image_save``.
+
+    ``tags`` matches images carrying ALL of the given tags; ``query`` is a free-text substring over
+    title / tags / path. Returns ``artifact_id``, ``label``, ``local_path``, ``tags`` and
+    ``content_type`` for each match -- Read a ``local_path`` to view it, or add an ``artifact_id`` to
+    ``produces.discord_upload_artifact_ids`` to send it.
+    """
+    return _run_json(lambda: _image_find(query=query, tags=tags, kind=kind, limit=limit))
+
+
+def _image_find(
+    *,
+    query: str | None,
+    tags: list[str] | None,
+    kind: str | None,
+    limit: int,
+) -> dict[str, Any]:
+    with session_scope() as session:
+        rows = ArtifactService(session).list_artifacts(
+            kind=_optional_string(kind),
+            tag=_string_list(tags) or None,
+            query=_optional_string(query),
+            limit=_limit(limit),
+        )
+        items = [
+            {
+                "artifact_id": artifact.id,
+                "local_path": artifact.local_path,
+                "label": artifact.title,
+                "content_type": artifact.content_type,
+                "tags": artifact.tags or [],
+            }
+            for artifact in rows
+        ]
+        return {"ok": True, "count": len(items), "items": items}
+
+
+def image_send(
+    artifact_id: str | None = None,
+    tags: list[str] | None = None,
+    query: str | None = None,
+    kind: str | None = None,
+    work_item_id: str | None = None,
+    limit: int = 10,
+) -> str:
+    """Queue stored image(s) to be sent to the user in the Discord thread.
+
+    Identify by an explicit ``artifact_id``, or by ``tags`` / ``query`` (same matching as
+    ``image_find``). Tags the artifact(s) for upload and returns their ids. IMPORTANT: also add the
+    returned ids to ``produces.discord_upload_artifact_ids`` when you submit -- that is what actually
+    delivers them.
+    """
+    return _run_json(
+        lambda: _image_send(
+            artifact_id=artifact_id,
+            tags=tags,
+            query=query,
+            kind=kind,
+            work_item_id=work_item_id,
+            limit=limit,
+        )
+    )
+
+
+def _image_send(
+    *,
+    artifact_id: str | None,
+    tags: list[str] | None,
+    query: str | None,
+    kind: str | None,
+    work_item_id: str | None,
+    limit: int,
+) -> dict[str, Any]:
+    clean_tags = _string_list(tags)
+    resolved_query = _optional_string(query)
+    with session_scope() as session:
+        service = ArtifactService(session)
+        if artifact_id:
+            targets = [service.get_artifact(_required(artifact_id, "artifact_id"))]
+        elif clean_tags or resolved_query:
+            targets = service.list_artifacts(
+                kind=_optional_string(kind),
+                tag=clean_tags or None,
+                query=resolved_query,
+                limit=_limit(limit),
+            )
+        else:
+            raise ValueError("provide artifact_id, tags, or query.")
+        if not targets:
+            return {"ok": False, "error": "no matching images.", "artifact_ids": []}
+        resolved_work_item = _optional_string(work_item_id)
+        artifact_ids: list[str] = []
+        for artifact in targets:
+            current = list(artifact.tags or [])
+            if "discord_upload" not in current:
+                current.append("discord_upload")
+                artifact.tags = current
+            if resolved_work_item and artifact.work_item_id is None:
+                artifact.work_item_id = resolved_work_item
+            artifact_ids.append(artifact.id)
+        session.flush()
+        return {
+            "ok": True,
+            "artifact_ids": artifact_ids,
+            "hint": "Add artifact_ids to produces.discord_upload_artifact_ids on submit to deliver them.",
+        }
+
+
+def image_compose(
+    sources: list[str],
+    labels: list[str] | None = None,
+    columns: int | None = None,
+    kind: str = "collage",
+    label: str | None = None,
+    tags: list[str] | None = None,
+    work_item_id: str | None = None,
+    send: bool = False,
+) -> str:
+    """Tile several images into one flat-lay collage (a grid on a white background) and store it.
+
+    ``sources`` is a list of image paths or artifact ids (e.g. product photos from ``image_fetch`` or
+    wardrobe shots); ``labels`` optionally captions each tile. Returns the new artifact id + local_path
+    -- Read that path to actually see and judge the composed look. Set ``send`` true to also queue it to
+    the user's Discord thread.
+    """
+    return _run_json(
+        lambda: _image_compose(
+            sources=sources,
+            labels=labels,
+            columns=columns,
+            kind=kind,
+            label=label,
+            tags=tags,
+            work_item_id=work_item_id,
+            send=send,
+        )
+    )
+
+
+def _image_compose(
+    *,
+    sources: Any,
+    labels: Any,
+    columns: Any,
+    kind: str,
+    label: str | None,
+    tags: list[str] | None,
+    work_item_id: str | None,
+    send: bool,
+) -> dict[str, Any]:
+    from io import BytesIO
+    from math import ceil, sqrt
+
+    from PIL import Image, ImageDraw, ImageFont
+
+    if not isinstance(sources, (list, tuple)) or not sources:
+        raise ValueError("sources must be a non-empty list of image paths or artifact ids.")
+    captions = [str(c) for c in labels] if isinstance(labels, (list, tuple)) else []
+    clean_tags = _string_list(tags)
+    if send and "discord_upload" not in clean_tags:
+        clean_tags.append("discord_upload")
+    cell, gap = 400, 20
+    caption_h = 30 if captions else 0
+    with session_scope() as session:
+        tiles = []
+        for source in sources:
+            path, _ = _resolve_image_source(session, str(source))
+            with Image.open(path) as image:
+                tile = image.convert("RGB")
+                tile.thumbnail((cell, cell))
+                tiles.append(tile.copy())
+        count = len(tiles)
+        cols = max(1, int(columns)) if columns else max(1, ceil(sqrt(count)))
+        rows = ceil(count / cols)
+        cell_w, cell_h = cell + gap, cell + caption_h + gap
+        canvas = Image.new("RGB", (gap + cols * cell_w, gap + rows * cell_h), (255, 255, 255))
+        draw = ImageDraw.Draw(canvas)
+        try:
+            font = ImageFont.load_default()
+        except Exception:
+            font = None
+        for index, tile in enumerate(tiles):
+            row, col = divmod(index, cols)
+            x = gap + col * cell_w + (cell - tile.width) // 2
+            y = gap + row * cell_h + (cell - tile.height) // 2
+            canvas.paste(tile, (x, y))
+            if captions and index < len(captions) and font is not None:
+                draw.text(
+                    (gap + col * cell_w, gap + row * cell_h + cell + 6),
+                    captions[index][:42],
+                    fill=(60, 60, 60),
+                    font=font,
+                )
+        buffer = BytesIO()
+        canvas.save(buffer, format="PNG")
+        artifact = ArtifactStore().write_bytes(
+            session,
+            kind=kind,
+            title=f"{_slug(label or 'collage')}.png",
+            content=buffer.getvalue(),
+            suffix=".png",
+            content_type="image/png",
+            tags=clean_tags,
+            work_item_id=_optional_string(work_item_id),
+            source_kind="image_compose",
+        )
+        return {
+            "ok": True,
+            "artifact_id": artifact.id,
+            "local_path": artifact.local_path,
+            "tiles": count,
+            "width": canvas.width,
+            "height": canvas.height,
+            "queued_for_discord": bool(send),
+        }
 
 
 def _content_source_id(content: str) -> str:

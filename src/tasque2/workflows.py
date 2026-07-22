@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -24,7 +25,12 @@ from tasque2.templates import read_template_file
 
 ACTIVE_RUN_STATUSES = {"active", "awaiting_input"}
 TERMINAL_RUN_STATUSES = {"completed", "failed", "canceled"}
-TERMINAL_NODE_STATUSES = {"succeeded", "failed", "canceled"}
+TERMINAL_NODE_STATUSES = {"succeeded", "failed", "failed_tolerated", "canceled"}
+# Node statuses that count as "done" for downstream edges with condition
+# "finished" and for run completion. A failed_tolerated node is a fan-out
+# child that dead-lettered under tolerate_child_failures: the failure is
+# recorded, but the run continues so aggregation/report nodes still run.
+COMPLETED_NODE_STATUSES = {"succeeded", "failed_tolerated"}
 _ITEM_KEY_RE = re.compile(r"\{item\[([^\]]+)\]\}")
 
 
@@ -200,7 +206,7 @@ class WorkflowService:
         run.ended_at = utc_now()
         canceled_work_item_ids = self._cancel_active_run_work(run.id)
         for node in self._run_nodes(run.id):
-            if node.status not in {"succeeded", "failed", "canceled"}:
+            if node.status not in TERMINAL_NODE_STATUSES:
                 node.status = "canceled"
                 node.failure_reason = "Workflow run canceled."
         self.session.flush()
@@ -340,6 +346,22 @@ class WorkflowService:
                     summary=f"Workflow node succeeded: {node.node_key}",
                 )
             elif work_item.status in {"dead_letter", "canceled"}:
+                tolerated = work_item.status == "dead_letter" and bool(
+                    (node.definition or {}).get("tolerate_failure")
+                )
+                if tolerated:
+                    node.status = "failed_tolerated"
+                    node.failure_reason = "Work item ended with status dead_letter (tolerated)."
+                    node.output = {"tolerated_failure": True}
+                    self._emit_event(
+                        event_type="workflow.node_failure_tolerated",
+                        entity_kind="workflow_node",
+                        entity_id=node.id,
+                        workflow_run_id=run.id,
+                        summary=f"Workflow node failed (tolerated): {node.node_key}",
+                        payload={"node_key": node.node_key, "work_item_id": work_item.id},
+                    )
+                    continue
                 node.status = "failed" if work_item.status == "dead_letter" else "canceled"
                 node.failure_reason = f"Work item ended with status {work_item.status}."
                 self._emit_event(
@@ -399,6 +421,7 @@ class WorkflowService:
             retry_policy=dict(node_def.get("retry_policy") or {}),
             priority=int(node_def.get("priority", 0)),
             max_attempts=int(node_def.get("max_attempts", 1)),
+            deadline_at=self._resolve_node_deadline(node_def),
             idempotency_key=f"workflow:{run.id}:{node.node_key}",
             source_kind="workflow",
             source_id=run.id,
@@ -418,8 +441,40 @@ class WorkflowService:
             summary=f"Workflow node enqueued: {node.node_key}",
         )
 
+    def _resolve_node_deadline(
+        self,
+        node_def: dict[str, Any],
+        *,
+        now: datetime | None = None,
+    ) -> datetime | None:
+        """Latest start time for this node's work, if the definition sets one.
+
+        Nodes may declare ``deadline_at`` (absolute ISO-8601) or
+        ``deadline_seconds`` (relative to enqueue time). The queue dead-letters
+        work that is still unclaimed past this deadline, so time-sensitive
+        chains do not resume stale after the daemon was down.
+        """
+        explicit = node_def.get("deadline_at")
+        if explicit:
+            value = datetime.fromisoformat(str(explicit).replace("Z", "+00:00"))
+            return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+        seconds = node_def.get("deadline_seconds")
+        if seconds is None:
+            return None
+        try:
+            seconds = int(seconds)
+        except (TypeError, ValueError):
+            raise ValueError("Workflow node deadline_seconds must be an integer.") from None
+        if seconds <= 0:
+            return None
+        return (now or utc_now()) + timedelta(seconds=seconds)
+
     def _expand_fan_out_node(self, run: WorkflowRun, node: WorkflowNode) -> None:
         node_def = node.definition
+        # With tolerate_child_failures, a dead-lettered child records its
+        # failure but neither fails the run nor blocks downstream nodes, so an
+        # aggregation/report node still runs and can account for the gap.
+        tolerate_child_failures = bool(node_def.get("tolerate_child_failures"))
         items = node_def.get("items")
         if items is None:
             items = self._fan_out_items_from_reference(run, node_def)
@@ -471,7 +526,7 @@ class WorkflowService:
                             workflow_run_id=run.id,
                             from_node_id=child.id,
                             to_node_id=edge.to_node_id,
-                            condition="succeeded",
+                            condition="finished" if tolerate_child_failures else "succeeded",
                         )
                     )
             child_ids.append(child.id)
@@ -527,6 +582,7 @@ class WorkflowService:
         context.update({"item": item, "index": index})
         return {
             "key": f"{node_def['key']}.{index}",
+            "tolerate_failure": bool(node_def.get("tolerate_child_failures")),
             "kind": "work",
             "title": _render_fan_out_template(title_template, item=item, index=index),
             "task_instruction": _render_fan_out_template(
@@ -601,7 +657,12 @@ class WorkflowService:
         ).all()
         for edge in edges:
             upstream = self.session.get(WorkflowNode, edge.from_node_id)
-            if upstream is None or upstream.status != edge.condition:
+            if upstream is None:
+                return False
+            if edge.condition == "finished":
+                if upstream.status not in COMPLETED_NODE_STATUSES:
+                    return False
+            elif upstream.status != edge.condition:
                 return False
         return True
 
@@ -620,7 +681,7 @@ class WorkflowService:
                 summary=f"Workflow run failed: {run.name}",
             )
             return
-        if all(node.status == "succeeded" for node in nodes):
+        if all(node.status in COMPLETED_NODE_STATUSES for node in nodes):
             run.status = "completed"
             run.ended_at = utc_now()
             run.state = {"outputs": {node.node_key: node.output for node in nodes}}

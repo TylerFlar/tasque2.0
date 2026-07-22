@@ -91,9 +91,23 @@ uv run tasque2 workflow-start-file .\data\workflows\morning-check.workflow.json 
 
 Keep personal workflow files under `data/`; that directory is ignored by git.
 
+## Extensions
+
+Personal domain modules (custom ledgers, MCP tools, context digests) live in
+`extensions/` — gitignored, so the core repo stays generic while your domains
+plug in locally. Each extension is a plain Python package exposing
+`register(registry)`; it can contribute SQLAlchemy models, Alembic migration
+directories, MCP tools, worker-context digests, and attempt ingestors. See
+[extensions/README.md](extensions/README.md) for the API and an example.
+
+Extension tests are not collected by default; run them explicitly
+(`uv run pytest extensions/<name>/tests`) or add a local gitignored
+`pytest.ini` listing both testpaths.
+
 ## Project Layout
 
 - `src/tasque2/` - application code
-- `alembic/` - database migrations
+- `alembic/` - database migrations (core; extensions bring their own)
 - `tests/` - test suite
+- `extensions/` - local extension packages (gitignored)
 - `.env.example` - local configuration template

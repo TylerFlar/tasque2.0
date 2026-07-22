@@ -23,6 +23,13 @@ data/
 *.sqlite3-shm
 *.sqlite3-wal
 
+# Local extension packages (personal domain modules; see extensions/README.md)
+extensions/*
+!extensions/README.md
+
+# Local pytest overrides (e.g. adding an extension's tests to testpaths)
+pytest.ini
+
 # Local MCP checkouts/builds
 mcps/
 node_modules/

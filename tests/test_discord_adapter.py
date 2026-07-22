@@ -485,3 +485,122 @@ def test_discord_thread_binding_reuses_existing_thread(fresh_db: Path) -> None:
 
         assert first.id == second.id
         assert len(session.scalars(select(DiscordThread)).all()) == 1
+
+
+def test_discord_work_thread_reply_without_config_queues_default_followup(fresh_db: Path) -> None:
+    with session_scope() as session:
+        work = WorkRepository(session).create_work_item(
+            title="Route the paycheck",
+            task_instruction="Route the paycheck across accounts.",
+            worker_kind="provider.fake",
+            runtime_contract={"model_profile": "medium"},
+            context={
+                "memory_namespace": "finance",
+                "memory_canonical_keys": ["finance_plan", "finance_direction"],
+                "memory_tags": ["finance"],
+            },
+            discord_thread_id="thread-paycheck",
+        )
+        DiscordService(session).bind_thread(
+            purpose="work",
+            discord_channel_id="jobs",
+            discord_thread_id="thread-paycheck",
+            work_item_id=work.id,
+        )
+
+        result = DiscordService(session).handle_thread_reply(
+            discord_message_id="reply-paycheck",
+            discord_channel_id="thread-paycheck",
+            discord_thread_id="thread-paycheck",
+            author="user",
+            content="No, you should still invest part of the money.",
+        )
+
+        assert result.action == "work_reply_recorded"
+        followup = session.scalar(
+            select(WorkItem).where(WorkItem.source_kind == "discord_reply_followup")
+        )
+        assert followup is not None
+        assert result.entity_id == followup.id
+        assert followup.title == "Reply: Route the paycheck"
+        assert followup.worker_kind == "provider.default"
+        assert "# Discord Reply Follow-up" in followup.task_instruction
+        assert "No, you should still invest part of the money." in followup.task_instruction
+        assert followup.runtime_contract == {"model_profile": "medium"}
+        assert followup.discord_thread_id == "thread-paycheck"
+        assert followup.context["memory_namespace"] == "finance"
+        assert followup.context["memory_canonical_keys"] == ["finance_plan", "finance_direction"]
+        assert followup.context["memory_tags"] == ["finance"]
+        assert followup.context["parent_work_item_id"] == work.id
+        assert followup.context["source_reply"]["discord_message_id"] == "reply-paycheck"
+
+
+def test_discord_work_thread_reply_with_disabled_config_queues_nothing(fresh_db: Path) -> None:
+    with session_scope() as session:
+        work = WorkRepository(session).create_work_item(
+            title="Silent job",
+            task_instruction="Do the silent job.",
+            worker_kind="provider.fake",
+            context={"reply_followup_work": {"enabled": False}},
+            discord_thread_id="thread-silent",
+        )
+        DiscordService(session).bind_thread(
+            purpose="work",
+            discord_channel_id="jobs",
+            discord_thread_id="thread-silent",
+            work_item_id=work.id,
+        )
+
+        result = DiscordService(session).handle_thread_reply(
+            discord_message_id="reply-silent",
+            discord_channel_id="thread-silent",
+            discord_thread_id="thread-silent",
+            author="user",
+            content="Any update?",
+        )
+
+        assert result.action == "work_reply_recorded"
+        followup = session.scalar(
+            select(WorkItem).where(WorkItem.source_kind == "discord_reply_followup")
+        )
+        assert followup is None
+
+
+def test_discord_reply_followup_carries_parent_reply_config_forward(fresh_db: Path) -> None:
+    with session_scope() as session:
+        work = WorkRepository(session).create_work_item(
+            title="Finance manager",
+            task_instruction="Manage money.",
+            worker_kind="provider.fake",
+            context={
+                "memory_namespace": "finance",
+                "reply_memory": {"enabled": True, "namespace": "finance", "kind": "working"},
+                "reply_followup_work": {
+                    "enabled": True,
+                    "title": "Finance manager reply",
+                    "task_instruction": "Process the finance reply.",
+                },
+            },
+            discord_thread_id="thread-finance",
+        )
+        DiscordService(session).bind_thread(
+            purpose="work",
+            discord_channel_id="jobs",
+            discord_thread_id="thread-finance",
+            work_item_id=work.id,
+        )
+
+        DiscordService(session).handle_thread_reply(
+            discord_message_id="reply-finance-propagate",
+            discord_channel_id="thread-finance",
+            discord_thread_id="thread-finance",
+            author="user",
+            content="Please re-route the money.",
+        )
+
+        followup = session.scalar(
+            select(WorkItem).where(WorkItem.source_id == "reply-finance-propagate")
+        )
+        assert followup is not None
+        assert followup.context["reply_followup_work"]["title"] == "Finance manager reply"
+        assert followup.context["reply_memory"]["namespace"] == "finance"

@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
+from tasque2.config import get_settings
 from tasque2.models import (
     FailedWork,
     ProviderRun,
@@ -27,6 +30,79 @@ TERMINAL_WORK_STATUSES = {"succeeded", "dead_letter", "canceled"}
 TRANSIENT_ERROR_TYPES = frozenset({"TransientProviderError"})
 TRANSIENT_RETRY_FLOOR = 3
 TRANSIENT_RETRY_DELAY_SECONDS = 30
+
+# Providers surface subscription usage/session-limit stops as transient errors
+# whose message states the reset time, e.g. "You've hit your session limit ·
+# resets 11:40am (America/Los_Angeles)". Retrying those on the normal
+# transient cadence burns the whole retry floor in ~a minute while the limit
+# is still in force (that is how a career-apply child dead-lettered on
+# 2026-07-08), so limit-shaped failures wait for the stated reset instead.
+LIMIT_RETRY_FALLBACK_SECONDS = 30 * 60
+LIMIT_RETRY_BUFFER_SECONDS = 5 * 60
+LIMIT_RETRY_MAX_SECONDS = 12 * 60 * 60
+
+_LIMIT_MESSAGE_RE = re.compile(
+    r"\b(?:session|usage|weekly|rate|hourly|5-hour)[\s-]*limit\b"
+    r"|hit\s+your\b[^.\n]{0,40}\blimit\b"
+    r"|limit\s+reached\b",
+    re.IGNORECASE,
+)
+_LIMIT_RESET_TIME_RE = re.compile(
+    r"\bresets?\b[^0-9\n]{0,15}(?P<hour>\d{1,2})(?::(?P<minute>\d{2}))?\s*(?P<ampm>am|pm)\b",
+    re.IGNORECASE,
+)
+_LIMIT_TZ_RE = re.compile(r"\(([A-Za-z]+(?:/[A-Za-z_+\-0-9]+)+)\)")
+
+
+def limit_retry_delay_seconds(
+    error_message: str | None,
+    *,
+    now: datetime | None = None,
+    default_timezone: str | None = None,
+) -> int | None:
+    """Retry delay for a provider usage/session-limit stop, if this is one.
+
+    Returns None when the message does not look like a limit stop. When it
+    does, prefer the reset time stated in the message (plus a small buffer);
+    without a parseable time, back off LIMIT_RETRY_FALLBACK_SECONDS instead of
+    the normal transient cadence.
+    """
+    message = (error_message or "").strip()
+    if not message or _LIMIT_MESSAGE_RE.search(message) is None:
+        return None
+    time_match = _LIMIT_RESET_TIME_RE.search(message)
+    if time_match is None:
+        return LIMIT_RETRY_FALLBACK_SECONDS
+    hour = int(time_match.group("hour"))
+    minute = int(time_match.group("minute") or 0)
+    ampm = time_match.group("ampm").lower()
+    if not (1 <= hour <= 12 and 0 <= minute <= 59):
+        return LIMIT_RETRY_FALLBACK_SECONDS
+    if ampm == "pm" and hour != 12:
+        hour += 12
+    elif ampm == "am" and hour == 12:
+        hour = 0
+
+    tzinfo = None
+    tz_match = _LIMIT_TZ_RE.search(message)
+    for tz_name in filter(None, (tz_match.group(1) if tz_match else None, default_timezone)):
+        try:
+            tzinfo = ZoneInfo(tz_name)
+            break
+        except (KeyError, ValueError):
+            continue
+    if tzinfo is None:
+        try:
+            tzinfo = ZoneInfo(get_settings().timezone)
+        except (KeyError, ValueError):
+            return LIMIT_RETRY_FALLBACK_SECONDS
+
+    local_now = (now or utc_now()).astimezone(tzinfo)
+    target = local_now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if target <= local_now:
+        target += timedelta(days=1)
+    delay = int((target - local_now).total_seconds()) + LIMIT_RETRY_BUFFER_SECONDS
+    return max(60, min(delay, LIMIT_RETRY_MAX_SECONDS))
 
 
 @dataclass(frozen=True)
@@ -58,6 +134,12 @@ class WorkQueue:
         ).all()
 
         for work_item in candidates:
+            if self._deadline_passed(work_item, now):
+                # Time-sensitive work whose window closed must not run late
+                # (e.g. a daily trading step resuming a day after the daemon was
+                # down). Abandon it instead of claiming it.
+                self._expire_overdue_work_item(work_item, now=now)
+                continue
             if self._has_unsatisfied_dependency(work_item):
                 continue
 
@@ -288,6 +370,62 @@ class WorkQueue:
         self.session.flush()
         return len(attempts)
 
+    def expire_overdue_work(self, *, now: datetime | None = None) -> int:
+        """Dead-letter ready/paused work whose ``deadline_at`` passed unrun.
+
+        ``deadline_at`` marks the latest time a work item may still *start*.
+        Once it passes, running the item would execute stale, time-sensitive
+        work -- e.g. a scheduled trading step resuming hours late after the
+        daemon was down -- so we abandon it to the dead-letter queue instead of
+        letting a worker claim it. Running attempts are left untouched: lease
+        and orphan recovery own in-flight work.
+        """
+        now = now or utc_now()
+        overdue = self.session.scalars(
+            select(WorkItem).where(
+                WorkItem.status.in_(("ready", "paused")),
+                WorkItem.deadline_at.is_not(None),
+                WorkItem.deadline_at < now,
+            )
+        ).all()
+        for work_item in overdue:
+            self._expire_overdue_work_item(work_item, now=now)
+        self.session.flush()
+        return len(overdue)
+
+    def _deadline_passed(self, work_item: WorkItem, now: datetime) -> bool:
+        return work_item.deadline_at is not None and work_item.deadline_at < now
+
+    def _expire_overdue_work_item(self, work_item: WorkItem, *, now: datetime) -> None:
+        deadline = work_item.deadline_at
+        work_item.status = "dead_letter"
+        failed = FailedWork(
+            work_item_id=work_item.id,
+            attempt_id=None,
+            status="unresolved",
+            error_type="DeadlineExceeded",
+            error_message=(
+                f"Work deadline {deadline.isoformat()} passed before it could run."
+                if deadline is not None
+                else "Work deadline passed before it could run."
+            ),
+            retry_count=work_item.attempt_count,
+        )
+        self.session.add(failed)
+        self.session.flush()
+        self._emit_event(
+            event_type="work.deadline_exceeded",
+            entity_kind="work_item",
+            entity_id=work_item.id,
+            work_item_id=work_item.id,
+            source="queue",
+            summary="Work expired: deadline passed before it could run",
+            payload={
+                "deadline_at": deadline.isoformat() if deadline is not None else None,
+                "failed_work_id": failed.id,
+            },
+        )
+
     def _close_sibling_running_attempts(
         self,
         attempt: WorkAttempt,
@@ -473,9 +611,14 @@ class WorkQueue:
         elif attempt.attempt_number < self._effective_max_attempts(attempt, work_item):
             is_transient = (attempt.error_type or "") in TRANSIENT_ERROR_TYPES
             base_delay = int((work_item.retry_policy or {}).get("delay_seconds", 0))
-            retry_delay = (
-                max(base_delay, TRANSIENT_RETRY_DELAY_SECONDS) if is_transient else base_delay
-            )
+            if is_transient:
+                limit_delay = limit_retry_delay_seconds(attempt.error_message, now=now)
+                transient_delay = (
+                    limit_delay if limit_delay is not None else TRANSIENT_RETRY_DELAY_SECONDS
+                )
+                retry_delay = max(base_delay, transient_delay)
+            else:
+                retry_delay = base_delay
             work_item.status = "ready"
             work_item.not_before = now + timedelta(seconds=retry_delay)
             self._emit_event(

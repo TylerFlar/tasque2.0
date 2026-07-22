@@ -7,6 +7,7 @@ from sqlalchemy import select
 
 from tasque2.artifacts import ArtifactStore
 from tasque2.db import session_scope
+from tasque2.discord_adapter import DiscordService
 from tasque2.discord_output import DiscordOutputService, FakeDiscordOutputGateway
 from tasque2.discord_ui import make_custom_id
 from tasque2.models import (
@@ -69,6 +70,75 @@ def test_discord_output_creates_work_thread_and_posts_once(fresh_db: Path) -> No
         )
         assert posted_event is not None
         assert posted_event.payload["status"] == "succeeded"
+
+
+def test_discord_output_reply_followup_reuses_thread_but_spawned_work_opens_new(
+    fresh_db: Path,
+) -> None:
+    """A reply-processor's own response (source_kind 'discord_reply_followup') stays
+    in the thread the user replied in. But a *new* worker the reply-processor then
+    spawns (e.g. the next generator, enqueued via MCP / produces.child_work) opens its
+    own fresh thread, even when it carries the same inherited discord_thread_id."""
+    gateway = FakeDiscordOutputGateway()
+    with session_scope() as session:
+        repo = WorkRepository(session)
+        generator = repo.create_work_item(
+            title="Calorie Tracker (daily)",
+            task_instruction="Open the day thread.",
+            worker_kind="function.echo",
+        )
+        WorkRunner(session).run_next()
+
+        service = DiscordOutputService(session)
+        assert _post_pending(service, gateway) == 1
+        assert len(gateway.created_threads) == 1
+
+        binding = session.scalar(
+            select(DiscordThread).where(DiscordThread.work_item_id == generator.id)
+        )
+        assert binding is not None
+        day_thread_id = binding.discord_thread_id
+
+        # 1) A reply-processor response inherits the day thread and stays in it.
+        reply = repo.create_work_item(
+            title="Process nutrition reply",
+            task_instruction="Logged: chicken burrito bowl ~1050 cal.",
+            worker_kind="function.echo",
+            discord_thread_id=day_thread_id,
+            source_kind="discord_reply_followup",
+        )
+        WorkRunner(session).run_next()
+        assert _post_pending(service, gateway) == 1
+
+        # No new thread; the ack posted into the existing day thread.
+        assert len(gateway.created_threads) == 1
+        assert gateway.sent_messages[-1][0] == day_thread_id
+        assert gateway.sent_messages[-1][1] == "Logged: chicken burrito bowl ~1050 cal."
+        # The reply did not get its own binding; the generator still owns the thread.
+        assert (
+            session.scalar(select(DiscordThread).where(DiscordThread.work_item_id == reply.id))
+            is None
+        )
+
+        # 2) A worker the reply-processor spawns (carrying the inherited thread) opens
+        #    a NEW thread instead of reusing the current one.
+        spawned = repo.create_work_item(
+            title="Workout Generator",
+            task_instruction="Next session prescription.",
+            worker_kind="function.echo",
+            discord_thread_id=day_thread_id,
+            source_kind="provider_child_work",
+        )
+        WorkRunner(session).run_next()
+        assert _post_pending(service, gateway) == 1
+
+        assert len(gateway.created_threads) == 2
+        new_thread = session.scalar(
+            select(DiscordThread).where(DiscordThread.work_item_id == spawned.id)
+        )
+        assert new_thread is not None
+        assert new_thread.discord_thread_id != day_thread_id
+        assert gateway.sent_messages[-1][0] == new_thread.discord_thread_id
 
 
 def test_discord_output_posts_only_final_workflow_thread_to_jobs(fresh_db: Path) -> None:
@@ -178,6 +248,242 @@ def test_discord_output_posts_chain_status_panel_in_chains_channel(fresh_db: Pat
         ]
         assert panel_edits[-1]["title"] == "Chain: panel-workflow - completed"
         assert gateway.created_threads[-1][0] == "jobs"
+
+
+def test_discord_output_thread_triggered_workflow_posts_panel_and_final_into_origin_thread(
+    fresh_db: Path,
+    tmp_path: Path,
+) -> None:
+    """A workflow started from an existing thread (e.g. the stylist build) still
+    posts its Chain status panel to the chains channel, and delivers its final
+    result -- including a discord_upload collage -- back INTO that origin thread
+    instead of opening a stray jobs thread."""
+    gateway = FakeDiscordOutputGateway()
+    definition = {
+        "nodes": [
+            {
+                "key": "step",
+                "kind": "work",
+                "title": "Workflow Step",
+                "task_instruction": "Run workflow step.",
+                "worker_kind": "function.echo",
+            },
+        ]
+    }
+    origin_thread_id = "origin-thread-1"
+    with session_scope() as session:
+        # Simulate the existing stylist thread that triggers the build: a bound
+        # thread carrying the discord_thread_id the run is started with.
+        DiscordService(session).bind_thread(
+            purpose="work",
+            discord_channel_id="intake",
+            discord_thread_id=origin_thread_id,
+        )
+
+        workflow_service = WorkflowService(session)
+        workflow = workflow_service.create_definition(
+            name="stylist-build",
+            version="1",
+            definition=definition,
+        )
+        run = workflow_service.start_run(
+            workflow_definition_id=workflow.id,
+            discord_thread_id=origin_thread_id,
+        )
+        workflow_service.tick_runs()
+
+        output = DiscordOutputService(session)
+
+        # While active: the Chain status panel posts to the chains channel even
+        # though this run was thread-triggered, not scheduled.
+        first = _post_pending(output, gateway)
+        assert first == 0
+        panel_posts = [
+            embed for channel, embed, _view in gateway.sent_embeds if channel == "chains"
+        ]
+        assert len(panel_posts) == 1
+        assert panel_posts[0]["title"] == "Chain: stylist-build - active"
+        # No thread was opened just to post status.
+        assert gateway.created_threads == []
+
+        # Complete the run. The assemble step produces a flat-lay collage tagged
+        # for upload (tied to the run), exactly like the real build.
+        WorkRunner(session).run_next()
+        workflow_service.tick_runs()
+        collage = ArtifactStore(tmp_path / "artifacts").write_text(
+            session,
+            kind="image_compose",
+            title="lookbook.png",
+            content="<collage bytes>",
+            suffix=".png",
+            workflow_run_id=run.id,
+            tags=["discord_upload"],
+        )
+        second = _post_pending(output, gateway)
+
+        # The final result posted exactly once, INTO the origin thread, with no
+        # new jobs-channel thread created for the run.
+        assert second == 1
+        assert gateway.created_threads == []
+        assert gateway.sent_messages[-1][0] == origin_thread_id
+        assert gateway.sent_messages[-1][1].startswith("Run workflow step.")
+
+        # The collage rode along as an attachment on that same origin-thread message.
+        assert gateway.sent_attachments[-1][0].artifact_id == collage.id
+        assert "Attached files: lookbook.png" in gateway.sent_messages[-1][1]
+
+        # The Chain panel was edited to completed in the chains channel.
+        panel_edits = [
+            embed
+            for channel, _mid, _content, embed, _view in gateway.edited_messages
+            if channel == "chains" and embed is not None and embed["title"].startswith("Chain:")
+        ]
+        assert panel_edits[-1]["title"] == "Chain: stylist-build - completed"
+
+        # No second DiscordThread was bound for the run; it reused the origin
+        # thread (the global uq_discord_thread_id holds).
+        workflow_thread = session.scalar(
+            select(DiscordThread).where(
+                DiscordThread.purpose == "workflow",
+                DiscordThread.workflow_run_id == run.id,
+            )
+        )
+        assert workflow_thread is None
+
+        # The final-status event was recorded against the run.
+        final_event = session.scalar(
+            select(WorkEvent).where(
+                WorkEvent.event_type == "discord.workflow_final_posted",
+                WorkEvent.workflow_run_id == run.id,
+            )
+        )
+        assert final_event is not None
+        assert final_event.payload["status"] == "completed"
+
+
+def test_discord_output_scheduled_work_posts_into_bound_thread(fresh_db: Path) -> None:
+    """A scheduled run (e.g. an agent-owned watch firing) bound to a thread via
+    discord_thread_id delivers its result INTO that thread, not a new jobs thread."""
+    gateway = FakeDiscordOutputGateway()
+    thread_id = "scout-thread-1"
+    with session_scope() as session:
+        DiscordService(session).bind_thread(
+            purpose="work",
+            discord_channel_id="intake",
+            discord_thread_id=thread_id,
+        )
+        WorkRepository(session).create_work_item(
+            title="watch fired: cooking classes",
+            task_instruction="New cooking classes this week.",
+            worker_kind="function.echo",
+            source_kind="schedule",
+            discord_thread_id=thread_id,
+        )
+        WorkRunner(session).run_next()
+
+        posted = _post_pending(DiscordOutputService(session), gateway)
+
+        assert posted == 1
+        assert gateway.created_threads == []
+        assert gateway.sent_messages[-1][0] == thread_id
+        assert gateway.sent_messages[-1][1] == "New cooking classes this week."
+
+
+def test_discord_output_silent_run_posts_nothing(fresh_db: Path) -> None:
+    """A successful run that marks produces.silent (e.g. a watch with nothing new)
+    posts no message, but is recorded as handled so it isn't reconsidered."""
+    gateway = FakeDiscordOutputGateway()
+    with session_scope() as session:
+        work = WorkRepository(session).create_work_item(
+            title="watch fired: nothing new",
+            task_instruction="Quiet week.",
+            worker_kind="function.echo",
+            source_kind="schedule",
+        )
+        WorkRunner(session).run_next()
+        attempt = session.scalars(
+            select(WorkAttempt).where(WorkAttempt.work_item_id == work.id)
+        ).one()
+        attempt.produces = {**(attempt.produces or {}), "silent": True}
+        session.flush()
+
+        posted = _post_pending(DiscordOutputService(session), gateway)
+
+        assert posted == 1  # counted as handled
+        assert gateway.sent_messages == []
+        assert gateway.created_threads == []
+        event = session.scalar(
+            select(WorkEvent).where(
+                WorkEvent.event_type == "discord.work_status_posted",
+                WorkEvent.work_item_id == work.id,
+            )
+        )
+        assert event is not None
+        assert event.payload.get("silent") is True
+
+
+def test_workflow_status_panel_posts_for_newest_active_run_beyond_window(
+    fresh_db: Path,
+) -> None:
+    """A currently-active run must get a status panel even when older finished
+    runs outnumber the candidate window. (Regression: the candidate query used
+    ASC + LIMIT, so once history grew past the limit, live runs were excluded and
+    never posted a panel -- only scheduled runs from before the cutoff had them.)"""
+    gateway = FakeDiscordOutputGateway()
+    definition = {
+        "nodes": [
+            {
+                "key": "step",
+                "kind": "work",
+                "title": "Workflow Step",
+                "task_instruction": "Run workflow step.",
+                "worker_kind": "function.echo",
+            },
+        ]
+    }
+    with session_scope() as session:
+        workflow_service = WorkflowService(session)
+        workflow = workflow_service.create_definition(
+            name="window-workflow",
+            version="1",
+            definition=definition,
+        )
+        # Three older runs driven to completion (older updated_at).
+        for _ in range(3):
+            workflow_service.start_run(workflow_definition_id=workflow.id)
+            workflow_service.tick_runs()
+            WorkRunner(session).run_next()
+            workflow_service.tick_runs()
+        # The newest run stays active.
+        active = workflow_service.start_run(workflow_definition_id=workflow.id)
+        workflow_service.tick_runs()
+
+        # A window smaller than the number of candidate runs: the active run is
+        # NOT among the oldest, but must still post a panel.
+        output = DiscordOutputService(session)
+        asyncio.run(
+            output.refresh_workflow_status_panels(
+                parent_channel_id="chains",
+                gateway=gateway,
+                limit=2,
+            )
+        )
+
+        posted_run_ids = {
+            event.workflow_run_id
+            for event in session.scalars(
+                select(WorkEvent).where(
+                    WorkEvent.event_type == "discord.workflow_status_panel_posted"
+                )
+            ).all()
+        }
+        assert active.id in posted_run_ids
+        active_panels = [
+            embed
+            for channel, embed, _view in gateway.sent_embeds
+            if channel == "chains" and embed["title"] == "Chain: window-workflow - active"
+        ]
+        assert active_panels
 
 
 def test_discord_output_routes_work_to_jobs_and_dead_letters_to_dlq(fresh_db: Path) -> None:

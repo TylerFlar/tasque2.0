@@ -173,6 +173,76 @@ def test_transient_provider_error_retries_past_max_attempts(fresh_db: Path) -> N
         )
 
 
+def test_claim_expires_overdue_work_instead_of_running_it(fresh_db: Path) -> None:
+    # A work item whose deadline_at has passed must not be claimed and run late
+    # (e.g. a daily trading step resuming after the daemon was down). It is
+    # dead-lettered, and the claim returns the next still-runnable item instead.
+    now = utc_now()
+    with session_scope() as session:
+        repo = WorkRepository(session)
+        overdue = repo.create_work_item(
+            title="Stale",
+            task_instruction="Should not run after its deadline.",
+            worker_kind="provider.default",
+            deadline_at=now - timedelta(hours=1),
+            priority=10,  # higher priority: it is considered first
+        )
+        fresh = repo.create_work_item(
+            title="Fresh",
+            task_instruction="Still runnable.",
+            worker_kind="manual",
+            priority=0,
+        )
+
+        claimed = WorkQueue(session).claim_next_ready_work(lease_owner="daemon", now=now)
+
+        assert claimed is not None
+        assert claimed.work_item.id == fresh.id
+
+        stale = session.get(WorkItem, overdue.id)
+        assert stale.status == "dead_letter"
+        failed = session.scalar(select(FailedWork).where(FailedWork.work_item_id == overdue.id))
+        assert failed is not None
+        assert failed.error_type == "DeadlineExceeded"
+        event = session.scalar(
+            select(WorkEvent).where(
+                WorkEvent.work_item_id == overdue.id,
+                WorkEvent.event_type == "work.deadline_exceeded",
+            )
+        )
+        assert event is not None
+
+
+def test_expire_overdue_work_sweep_only_touches_passed_deadlines(fresh_db: Path) -> None:
+    now = utc_now()
+    with session_scope() as session:
+        repo = WorkRepository(session)
+        overdue = repo.create_work_item(
+            title="Past deadline",
+            task_instruction="Deadline already passed.",
+            worker_kind="manual",
+            deadline_at=now - timedelta(minutes=1),
+        )
+        future = repo.create_work_item(
+            title="Future deadline",
+            task_instruction="Deadline still ahead.",
+            worker_kind="manual",
+            deadline_at=now + timedelta(hours=2),
+        )
+        no_deadline = repo.create_work_item(
+            title="No deadline",
+            task_instruction="Runs whenever.",
+            worker_kind="manual",
+        )
+
+        expired = WorkQueue(session).expire_overdue_work(now=now)
+
+        assert expired == 1
+        assert session.get(WorkItem, overdue.id).status == "dead_letter"
+        assert session.get(WorkItem, future.id).status == "ready"
+        assert session.get(WorkItem, no_deadline.id).status == "ready"
+
+
 def test_agent_reported_failure_dead_letters_on_first_attempt(fresh_db: Path) -> None:
     # A genuine agent-reported failure is NOT transient: a max_attempts=1 item
     # dead-letters immediately and is not retried by the transient floor.
@@ -385,3 +455,72 @@ def test_running_attempt_completion_honors_external_cancel(fresh_db: Path) -> No
 
         assert runner_session.get(WorkItem, work.id).status == "canceled"
         assert runner_session.get(WorkAttempt, claimed.attempt.id).status == "canceled"
+
+
+def test_limit_retry_delay_parses_reset_time() -> None:
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from tasque2.queue import (
+        LIMIT_RETRY_BUFFER_SECONDS,
+        LIMIT_RETRY_FALLBACK_SECONDS,
+        limit_retry_delay_seconds,
+    )
+
+    tz = ZoneInfo("America/Los_Angeles")
+    # The exact banner that dead-lettered a career-apply child on 2026-07-08.
+    delay = limit_retry_delay_seconds(
+        "You've hit your session limit · resets 11:40am (America/Los_Angeles)",
+        now=datetime(2026, 7, 8, 10, 7, tzinfo=tz),
+    )
+    assert delay == 93 * 60 + LIMIT_RETRY_BUFFER_SECONDS  # 10:07 -> 11:40
+
+    # A reset time already past today rolls over to tomorrow.
+    delay = limit_retry_delay_seconds(
+        "session limit reached - resets 3am",
+        now=datetime(2026, 7, 8, 23, 30, tzinfo=tz),
+        default_timezone="America/Los_Angeles",
+    )
+    assert delay == int(3.5 * 3600) + LIMIT_RETRY_BUFFER_SECONDS
+
+    # Limit-shaped message without a parseable clock time backs off the
+    # fallback instead of the 30-second transient cadence.
+    assert (
+        limit_retry_delay_seconds("You've hit your weekly limit - resets Jul 15, 2026")
+        == LIMIT_RETRY_FALLBACK_SECONDS
+    )
+
+    # Ordinary transient messages keep the normal cadence.
+    assert limit_retry_delay_seconds("API Error: socket closed unexpectedly") is None
+    assert limit_retry_delay_seconds(None) is None
+
+
+def test_session_limit_transient_failure_waits_for_reset(fresh_db: Path) -> None:
+    # A provider stopped by a subscription session limit must not burn the
+    # transient retry floor on the 30-second cadence while the limit is still
+    # in force: the retry is scheduled for the reset time in the message.
+    with session_scope() as session:
+        work = WorkRepository(session).create_work_item(
+            title="Limit-stopped apply",
+            task_instruction="Provider hit the session limit mid-run.",
+            worker_kind="provider.default",
+            max_attempts=1,
+        )
+        queue = WorkQueue(session)
+        now = utc_now()
+        claimed = queue.claim_next_ready_work(lease_owner="daemon", now=now)
+        assert claimed is not None
+        queue.fail_attempt(
+            claimed.attempt.id,
+            error_type="TransientProviderError",
+            error_message="You've hit your session limit · resets 11:40am (America/Los_Angeles)",
+            now=now,
+        )
+        refreshed = session.get(WorkItem, work.id)
+        assert refreshed.status == "ready"
+        delay = (refreshed.not_before - now).total_seconds()
+        # Reset-aware: at least the buffer, never the 30s cadence, and capped
+        # regardless of what wall-clock time the test runs at.
+        assert delay >= 300
+        assert delay > TRANSIENT_RETRY_DELAY_SECONDS
+        assert delay <= 12 * 3600 + 60

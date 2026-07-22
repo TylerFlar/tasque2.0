@@ -23,7 +23,13 @@ class Settings(BaseSettings):
     data_dir: Path = Field(default=Path("data"))
     db_path: Path | None = Field(default=None)
     memory_vault_dir: Path | None = Field(default=None)
+    # Local extension packages (personal domain modules); see tasque2.extensions.
+    extensions_dir: Path = Field(default=Path("extensions"))
     timezone: str = Field(default="America/Los_Angeles")
+    # Local weather (Open-Meteo) for outfit/context helpers; defaults to San Diego.
+    weather_latitude: float = Field(default=32.7157)
+    weather_longitude: float = Field(default=-117.1611)
+    weather_location_label: str = Field(default="San Diego, CA")
     discord_token: str | None = Field(default=None)
     discord_intake_channel_id: str | None = Field(default=None)
     discord_ops_channel_id: str | None = Field(default=None)
@@ -33,6 +39,7 @@ class Settings(BaseSettings):
     discord_output_poll_seconds: float = Field(default=5.0)
     discord_allowed_user_ids: str | None = Field(default=None)
     discord_max_attachment_bytes: int = Field(default=25 * 1024 * 1024)
+    daemon_concurrency: int = Field(default=1)
     default_provider: str = Field(default="codex")
     orchestrator_model_profile: str = Field(default="high")
     native_worker_model_profile: str | None = Field(default=None)
@@ -43,6 +50,16 @@ class Settings(BaseSettings):
     claude_model_medium: str | None = Field(default=None)
     claude_model_high: str | None = Field(default=None)
     allow_test_providers: bool = Field(default=False)
+    # Memory retrieval / embeddings.
+    embedding_provider: str = Field(default="auto")  # auto | hash | openai | none
+    embedding_model: str = Field(default="text-embedding-3-small")
+    embedding_dim: int = Field(default=256)  # used by the stdlib hashing embedder
+    openai_api_key: str | None = Field(default=None)
+    memory_hybrid_retrieval: bool = Field(default=True)
+    # Auto-ingesting every worker report / Discord message / attachment into searchable
+    # source memories created huge recall noise; off by default. Deliberate
+    # memory_ingest_* calls still work regardless of this flag.
+    memory_auto_ingest: bool = Field(default=False)
 
     @property
     def resolved_data_dir(self) -> Path:
@@ -59,6 +76,10 @@ class Settings(BaseSettings):
         if self.memory_vault_dir is not None:
             return self.memory_vault_dir.expanduser().resolve()
         return self.resolved_data_dir / "memory-vault"
+
+    @property
+    def resolved_extensions_dir(self) -> Path:
+        return self.extensions_dir.expanduser().resolve()
 
     @property
     def default_provider_name(self) -> str:

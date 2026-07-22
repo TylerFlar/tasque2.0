@@ -391,6 +391,7 @@ def _workflow_node_marker(status: str) -> str:
         "awaiting_input": "?",
         "succeeded": "ok",
         "failed": "x",
+        "failed_tolerated": "!",
         "canceled": "#",
     }.get(status, "?")
 
@@ -828,6 +829,8 @@ def _effective_workflow_node_status(node: WorkflowNode) -> str:
     if work.status == "succeeded":
         return "succeeded"
     if work.status == "dead_letter":
+        if (node.definition or {}).get("tolerate_failure"):
+            return "failed_tolerated"
         return "failed"
     if work.status == "canceled":
         return "canceled"

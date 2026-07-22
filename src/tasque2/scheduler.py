@@ -295,6 +295,7 @@ class ScheduleService:
             source_id=schedule.id,
             schedule_id=schedule.id,
             schedule_occurrence_id=occurrence.id,
+            discord_thread_id=_optional_str(payload.get("discord_thread_id")),
         )
         occurrence.work_item_id = work.id
         occurrence.status = "enqueued"

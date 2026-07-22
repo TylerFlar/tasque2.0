@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -12,6 +13,7 @@ from sqlalchemy.engine import Engine
 from alembic import command
 from tasque2.config import get_settings
 from tasque2.db import database_url_for_path, get_engine
+from tasque2.extensions import registry as extension_registry
 from tasque2.models import Base
 
 
@@ -44,11 +46,17 @@ def alembic_config() -> Config:
     config.set_main_option("script_location", str(root / "alembic"))
     config.set_main_option("prepend_sys_path", str(root))
     config.set_main_option("sqlalchemy.url", database_url_for_path(get_settings().database_path))
+    # Extension migration directories are scanned together with the core one;
+    # their revisions chain off core revisions, forming branches of a single
+    # history that upgrades to "heads".
+    locations = [str(root / "alembic" / "versions")]
+    locations.extend(str(location) for location in extension_registry().migration_locations)
+    config.set_main_option("version_locations", os.pathsep.join(locations))
     config.attributes["skip_logging_config"] = True
     return config
 
 
-def upgrade_database(revision: str = "head") -> MigrationStatus:
+def upgrade_database(revision: str = "heads") -> MigrationStatus:
     settings = get_settings()
     settings.database_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -88,7 +96,7 @@ def _adopt_current_unversioned_schema(config: Config) -> bool:
         )
 
     _ensure_manual_schema_objects(engine)
-    command.stamp(config, "head")
+    command.stamp(config, "heads")
     return True
 
 

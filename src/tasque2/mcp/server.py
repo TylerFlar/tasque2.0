@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from tasque2.extensions import registry as extension_registry
 from tasque2.mcp import tools
 
 
@@ -29,10 +30,13 @@ def build_server():
     mcp.tool()(tools.memory_list)
     mcp.tool()(tools.memory_get)
     mcp.tool()(tools.memory_get_canonical)
+    mcp.tool()(tools.memory_recall)
     mcp.tool()(tools.memory_create)
     mcp.tool()(tools.memory_upsert_canonical)
+    mcp.tool()(tools.memory_update)
     mcp.tool()(tools.memory_supersede)
     mcp.tool()(tools.memory_archive)
+    mcp.tool()(tools.memory_delete)
     mcp.tool()(tools.memory_ingest_text)
     mcp.tool()(tools.memory_ingest_artifact)
     mcp.tool()(tools.memory_ingest_pending)
@@ -45,6 +49,13 @@ def build_server():
     mcp.tool()(tools.artifact_capture_file)
     mcp.tool()(tools.artifact_archive)
 
+    mcp.tool()(tools.image_crop)
+    mcp.tool()(tools.image_fetch)
+    mcp.tool()(tools.image_save)
+    mcp.tool()(tools.image_find)
+    mcp.tool()(tools.image_send)
+    mcp.tool()(tools.image_compose)
+
     mcp.tool()(tools.work_enqueue)
     mcp.tool()(tools.work_list)
     mcp.tool()(tools.work_get)
@@ -56,13 +67,23 @@ def build_server():
 
     mcp.tool()(tools.schedule_create_work)
     mcp.tool()(tools.schedule_list)
+    mcp.tool()(tools.schedule_get)
+    mcp.tool()(tools.schedule_update)
+    mcp.tool()(tools.schedule_set_enabled)
+    mcp.tool()(tools.schedule_delete)
+    mcp.tool()(tools.schedule_fire_now)
 
     mcp.tool()(tools.workflow_list)
     mcp.tool()(tools.workflow_start)
 
+    mcp.tool()(tools.weather_now)
+
     mcp.tool()(tools.system_status)
     mcp.tool()(tools.submit_worker_result)
     mcp.tool()(tools.submit_result)
+
+    for tool in extension_registry().mcp_tools:
+        mcp.tool()(tool)
     return mcp
 
 

@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from tasque2.compression import compress_text
+from tasque2.extensions import registry as extension_registry
 from tasque2.memory import MemoryService
 from tasque2.models import (
     Artifact,
@@ -17,9 +18,16 @@ from tasque2.models import (
     WorkflowRun,
     WorkItem,
 )
+from tasque2.retrieval import select_relevant_excerpt
 
-MEMORY_CONTEXT_CONTENT_CHARS = 1600
-MEMORY_CONTEXT_CONTENT_LINES = 40
+logger = logging.getLogger(__name__)
+
+# Per-memory delivery budgets. Pinned/canonical ledgers (the durable source of
+# truth a worker ranks against) get a far larger budget than the old 1600 so
+# they no longer arrive as a head+tail fragment; the genuinely huge ones are
+# relevance-excerpted (see tasque2.retrieval) rather than sliced.
+MEMORY_CONTEXT_CONTENT_CHARS = 2000
+MEMORY_CONTEXT_PINNED_CHARS = 12000
 
 
 class WorkerContextBuilder:
@@ -51,7 +59,7 @@ class WorkerContextBuilder:
             limit=limits.get("artifacts"),
         )
 
-        return {
+        packet = {
             "version": 1,
             "work_item": _work_item_data(work_item),
             "task_context": work_item.context or {},
@@ -65,7 +73,7 @@ class WorkerContextBuilder:
                 work_item=work_item,
                 limit=limits.get("workflow_nodes"),
             ),
-            "memories": [_memory_data(memory) for memory in memories],
+            "memories": [_memory_data(memory, query=query) for memory in memories],
             "artifacts": [_artifact_data(artifact) for artifact in artifacts],
             "recent_events": [
                 _event_data(event)
@@ -75,6 +83,18 @@ class WorkerContextBuilder:
                 )
             ],
         }
+        # Code-computed domain digests (extension-registered) injected into
+        # matching context packets. Each is derived from an append-only ledger
+        # table the worker writes through a validated MCP tool — ground truth
+        # the worker reads but cannot rewrite, unlike its canonical memories.
+        for digest_key, wants, build in extension_registry().context_digests:
+            if not wants(work_item.context or {}):
+                continue
+            try:
+                packet[digest_key] = build(self.session)
+            except Exception:  # noqa: BLE001 - context assembly must not fail the run
+                logger.exception("Failed to compute %s for %s", digest_key, work_item.id)
+        return packet
 
     def _memories(
         self,
@@ -109,6 +129,15 @@ class WorkerContextBuilder:
             )
             if _limit_reached(memories, limit):
                 return _trim_to_limit(memories, limit)
+
+        # Force-load complete structured registers (e.g. every `interest` record) so the
+        # worker always checks the full set, not whatever a fuzzy search happens to return.
+        for namespace in default_namespaces or ["global"]:
+            for kind in _context_memory_kinds(context):
+                for memory in service.list_active_by_kind(namespace=namespace, kind=kind):
+                    add(memory)
+                    if _limit_reached(memories, limit):
+                        return _trim_to_limit(memories, limit)
 
         for spec in _memory_query_specs(context, default_namespaces):
             search_limit = _smaller_limit(spec["limit"], _remaining_limit(limit, len(memories)))
@@ -383,7 +412,11 @@ def render_provider_prompt(
                 "4. If the WorkItem is straightforward Tasque routing or operations, such as starting an "
                 "existing workflow, creating a schedule, saving a memory, reporting status, or queuing "
                 "follow-up work, perform the needed MCP actions directly in this coordinator turn. "
-                "Delegate only when there is actual domain reasoning or content work to do.\n"
+                "Delegate only when there is actual domain reasoning or content work to do. Treat "
+                "'run / trigger / fire my <job> now' as routing, not as the work itself: fire it as a "
+                "separate run (schedule_fire_now / workflow_start) and acknowledge — do not perform that "
+                "job's work inline in this turn, even when it is a single-worker job. The separate run "
+                "reports its own result.\n"
                 "5. For domain work, launch one or more provider-native workers/subagents/delegated "
                 "agents by natural-language request when the template benefits from parallel research, "
                 "critique, specialist roles, or a separate drafting pass. If a native-worker model/profile "
@@ -401,8 +434,19 @@ def render_provider_prompt(
             ),
             (
                 "## Durable State Rules\n"
-                "- Use memory_create for new observations, logs, or working notes.\n"
-                "- Use memory_upsert_canonical for current source-of-truth state.\n"
+                "- Use memory_recall (hybrid semantic + keyword search) to pull the most relevant "
+                "memories for this run before reasoning; prefer it over scanning whole documents. It "
+                "ranks by relevance, recency, and importance and returns small focused items. Memory "
+                "in the context packet may be excerpted (content_compacted=true) — recall or "
+                "memory_get_canonical for the full item when you need it.\n"
+                "- Use memory_create for a NEW discrete fact, observation, or log entry. Prefer many "
+                "small, atomic memories over one growing document.\n"
+                "- Use memory_update to change ONE existing fact in place, and memory_delete to forget "
+                "a stale or contradicted one. Do NOT rewrite a whole canonical document to edit a "
+                "single line — update or delete the specific item instead. Set a 1-5 importance on "
+                "facts that should rank highly in future recall.\n"
+                "- Use memory_upsert_canonical only for genuinely single-state summaries that stay "
+                "small (a short pointer or profile), never as an ever-growing ledger.\n"
                 "- Use memory_ingest_text or memory_ingest_artifact when a text source, report, "
                 "uploaded file, or useful local document should become searchable context.\n"
                 "- Use todo_write for lightweight multi-step coordination state when a worker needs "
@@ -414,9 +458,37 @@ def render_provider_prompt(
                 "- Use schedule_create_work when the user asks for recurring or future work.\n"
                 "- Use workflow_start when the user asks to run an existing workflow or chain once. "
                 "Use workflow_list first when the exact workflow name is unclear.\n"
+                "- Use schedule_fire_now to run an EXISTING scheduled job/watch once now (use "
+                "schedule_list to find its id). When the user asks to trigger / run / fire an existing "
+                "job, watch, schedule, or workflow immediately, enqueue it as its own SEPARATE run "
+                "(schedule_fire_now for a schedule/watch, workflow_start for a workflow) and just "
+                "confirm you queued it — do NOT reproduce that job's work inline in this reply, even "
+                "when the job is a single worker. The queued run executes on its own and posts its own "
+                "result, so the user gets two messages: your acknowledgement now, then the run's output "
+                "when it finishes. Only inline the work when the user asks you directly to do a one-off "
+                "task that is not an existing job.\n"
                 "- Use work_enqueue for follow-up or child work that should run as a normal Tasque "
                 "WorkItem.\n"
-                "- Prefer direct MCP mutations over returning `memory_writes` or hand-shaped database JSON."
+                "- Persist memory with the memory MCP tools (memory_create / memory_update / "
+                "memory_delete / memory_upsert_canonical), not by returning a `memory_writes` array or "
+                "hand-shaped database JSON in produces. `memory_writes` is a legacy path; a malformed one "
+                "is skipped, not applied, so use the tools to be sure your writes land."
+            ),
+            (
+                "## Working With Images\n"
+                "- You can SEE images: Read an image file's local_path (uploaded attachments and "
+                "stored artifacts expose one) and you view the actual pixels -- do this before "
+                "reasoning about a photo.\n"
+                "- `image_crop` crops a region of an image (a path or artifact id) to a new artifact; "
+                "`image_fetch` downloads an image URL to an artifact so you can Read it (e.g. to see "
+                "what a product looks like).\n"
+                "- `image_save` stores/labels an image as a durable artifact you can recall later; "
+                "group related images with tags you choose (there is no fixed scheme). `image_find` "
+                "retrieves them by tag or free-text query.\n"
+                "- `image_send` -- or adding artifact ids to `produces.discord_upload_artifact_ids` -- "
+                "delivers stored images back to the user in Discord.\n"
+                "- These are general-purpose; a work template may define a convention (which tags to "
+                "use, when to catalog or send) for its own domain."
             ),
             (
                 "## Result Payload Rules\n"
@@ -433,6 +505,11 @@ def render_provider_prompt(
             "## Context Packet JSON\n" + render_worker_context_packet(context_packet),
         ]
     )
+
+
+def _context_memory_kinds(context: dict[str, Any]) -> list[str]:
+    """Memory kinds to force-load in full (e.g. ``["interest"]`` for the register)."""
+    return _string_list(context.get("memory_kinds"))
 
 
 def _context_memory_namespaces(context: dict[str, Any]) -> list[str]:
@@ -656,11 +733,16 @@ def _artifact_data(artifact: Artifact) -> dict[str, Any]:
     }
 
 
-def _memory_data(memory: Memory) -> dict[str, Any]:
-    content = compress_text(
+def _memory_data(memory: Memory, *, query: str = "") -> dict[str, Any]:
+    is_durable = memory.pinned or bool(memory.canonical_key)
+    budget = MEMORY_CONTEXT_PINNED_CHARS if is_durable else MEMORY_CONTEXT_CONTENT_CHARS
+    # Logs/state accrete newest-last, so bias durable docs toward recent sections.
+    position_bias = 0.5 if is_durable else 0.0
+    content, trimmed = select_relevant_excerpt(
         memory.content,
-        max_chars=MEMORY_CONTEXT_CONTENT_CHARS,
-        preserve_lines=MEMORY_CONTEXT_CONTENT_LINES,
+        query,
+        budget_chars=budget,
+        position_bias=position_bias,
     )
     return {
         "id": memory.id,
@@ -668,7 +750,7 @@ def _memory_data(memory: Memory) -> dict[str, Any]:
         "kind": memory.kind,
         "content": content,
         "content_chars": len(memory.content),
-        "content_compacted": content != memory.content,
+        "content_compacted": trimmed,
         "tags": memory.tags or [],
         "work_item_id": memory.work_item_id,
         "pinned": memory.pinned,

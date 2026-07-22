@@ -6,7 +6,7 @@ from pathlib import Path
 from tasque2 import result_inbox
 from tasque2.db import session_scope
 from tasque2.mcp import tools
-from tasque2.models import WorkflowRun
+from tasque2.models import WorkflowRun, WorkItem
 from tasque2.workflows import WorkflowService
 
 
@@ -195,6 +195,63 @@ def test_mcp_schedule_tools_create_and_list_work_schedule(fresh_db: Path) -> Non
     assert [item["id"] for item in listed["items"]] == [schedule["id"]]
 
 
+def test_mcp_watch_tools_full_crud_lifecycle(fresh_db: Path) -> None:
+    # CREATE a thread-bound recurring "watch".
+    created = _ok(
+        tools.schedule_create_work(
+            name="watch: cooking classes",
+            schedule_type="cron",
+            expression="0 9 * * FRI",
+            task_instruction="Check for new cooking classes and post any to the thread.",
+            worker_kind="provider.default",
+            context={"memory_namespace": "local", "watch": {"query": "cooking classes"}},
+            discord_thread_id="scout-thread-1",
+        )
+    )
+    schedule_id = created["schedule"]["id"]
+    assert created["schedule"]["enabled"] is True
+    assert created["schedule"]["payload"]["discord_thread_id"] == "scout-thread-1"
+
+    # GET by id returns the full payload.
+    got = _ok(tools.schedule_get(schedule_id=schedule_id))
+    assert got["schedule"]["payload"]["context"]["watch"]["query"] == "cooking classes"
+
+    # UPDATE cadence + merge context; the bound thread in the payload survives.
+    updated = _ok(
+        tools.schedule_update(
+            schedule_id=schedule_id,
+            expression="0 18 * * SAT",
+            context={
+                "memory_namespace": "local",
+                "watch": {"query": "cooking classes", "level": "beginner"},
+            },
+        )
+    )
+    assert updated["schedule"]["expression"] == "0 18 * * SAT"
+    assert updated["schedule"]["payload"]["context"]["watch"]["level"] == "beginner"
+    assert updated["schedule"]["payload"]["discord_thread_id"] == "scout-thread-1"
+
+    # DISABLE (pause) then ENABLE (resume).
+    disabled = _ok(tools.schedule_set_enabled(schedule_id=schedule_id, enabled=False))
+    assert disabled["schedule"]["enabled"] is False
+    re_enabled = _ok(tools.schedule_set_enabled(schedule_id=schedule_id, enabled=True))
+    assert re_enabled["schedule"]["enabled"] is True
+
+    # FIRE NOW enqueues a work item that carries the bound thread + schedule source.
+    fired = _ok(tools.schedule_fire_now(schedule_id=schedule_id))
+    assert fired["work_item_id"]
+    with session_scope() as session:
+        work = session.get(WorkItem, fired["work_item_id"])
+        assert work is not None
+        assert work.source_kind == "schedule"
+        assert work.discord_thread_id == "scout-thread-1"
+
+    # DELETE removes it.
+    deleted = _ok(tools.schedule_delete(schedule_id=schedule_id))
+    assert deleted["deleted_schedule_id"] == schedule_id
+    assert json.loads(tools.schedule_get(schedule_id=schedule_id))["ok"] is False
+
+
 def test_mcp_schedule_create_work_can_reference_template_file(
     fresh_db: Path,
     tmp_path: Path,
@@ -277,3 +334,113 @@ def test_mcp_submit_worker_result_deposits_in_inbox(fresh_db: Path) -> None:
         "produces": {"focus": "push"},
         "error": None,
     }
+
+
+def test_mcp_work_enqueue_inherits_reply_config_from_calling_work_item(
+    fresh_db: Path,
+    monkeypatch,
+) -> None:
+    from tasque2.repo import WorkRepository
+
+    with session_scope() as session:
+        caller = WorkRepository(session).create_work_item(
+            title="Finance manager",
+            task_instruction="Manage the money.",
+            worker_kind="provider.default",
+            context={
+                "memory_namespace": "finance",
+                "reply_memory": {"enabled": True, "namespace": "finance", "kind": "working"},
+                "reply_followup_work": {
+                    "enabled": True,
+                    "title": "Finance manager reply",
+                    "task_instruction": "Process the finance reply.",
+                },
+            },
+        )
+        caller_id = caller.id
+
+    monkeypatch.setenv("TASQUE2_WORK_ITEM_ID", caller_id)
+    queued = _ok(
+        tools.work_enqueue(
+            title="Route the paycheck",
+            task_instruction="Route it.",
+            worker_kind="provider.default",
+            context={"memory_namespace": "finance"},
+        )
+    )
+
+    with session_scope() as session:
+        child = session.get(WorkItem, queued["work_item"]["id"])
+        assert child is not None
+        assert child.source_id == caller_id
+        assert child.context["parent_work_item_id"] == caller_id
+        assert child.context["reply_followup_work"]["title"] == "Finance manager reply"
+        assert child.context["reply_memory"]["namespace"] == "finance"
+
+
+def test_mcp_work_enqueue_keeps_explicit_child_reply_config(
+    fresh_db: Path,
+    monkeypatch,
+) -> None:
+    from tasque2.repo import WorkRepository
+
+    with session_scope() as session:
+        caller = WorkRepository(session).create_work_item(
+            title="Finance manager",
+            task_instruction="Manage the money.",
+            worker_kind="provider.default",
+            context={
+                "reply_followup_work": {"enabled": True, "title": "Finance manager reply"},
+            },
+        )
+        caller_id = caller.id
+
+    monkeypatch.setenv("TASQUE2_WORK_ITEM_ID", caller_id)
+    queued = _ok(
+        tools.work_enqueue(
+            title="One-shot job",
+            task_instruction="Do it once.",
+            worker_kind="provider.default",
+            context={"reply_followup_work": {"enabled": False}},
+        )
+    )
+
+    with session_scope() as session:
+        child = session.get(WorkItem, queued["work_item"]["id"])
+        assert child is not None
+        assert child.context["reply_followup_work"] == {"enabled": False}
+
+
+def test_mcp_schedule_create_work_inherits_reply_config(
+    fresh_db: Path,
+    monkeypatch,
+) -> None:
+    from tasque2.repo import WorkRepository
+
+    with session_scope() as session:
+        caller = WorkRepository(session).create_work_item(
+            title="Finance manager",
+            task_instruction="Manage the money.",
+            worker_kind="provider.default",
+            context={
+                "reply_followup_work": {"enabled": True, "title": "Finance manager reply"},
+            },
+        )
+        caller_id = caller.id
+
+    monkeypatch.setenv("TASQUE2_WORK_ITEM_ID", caller_id)
+    created = _ok(
+        tools.schedule_create_work(
+            name="Settlement follow-up",
+            schedule_type="cron",
+            expression="0 9 * * *",
+            task_instruction="Check the settlement.",
+            worker_kind="provider.default",
+            context={"memory_namespace": "finance"},
+        )
+    )
+
+    payload = created["schedule"]["payload"]
+    assert payload["context"]["reply_followup_work"]["title"] == "Finance manager reply"
+    assert payload["context"]["memory_namespace"] == "finance"
+    assert "parent_work_item_id" not in payload["context"]

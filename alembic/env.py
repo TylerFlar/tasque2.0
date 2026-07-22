@@ -15,7 +15,13 @@ if str(SRC) not in sys.path:
 
 from tasque2.config import get_settings  # noqa: E402
 from tasque2.db import database_url_for_path  # noqa: E402
+from tasque2.extensions import registry as extension_registry  # noqa: E402
 from tasque2.models import Base  # noqa: E402
+
+# Load extensions so their models join Base.metadata before it is used as
+# target_metadata (tasque2.migrations puts their version dirs on
+# version_locations; raw `alembic` CLI users must set that in alembic.ini).
+extension_registry()
 
 config = context.config
 

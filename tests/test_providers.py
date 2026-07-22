@@ -34,7 +34,11 @@ from tasque2.repo import WorkRepository
 from tasque2.runtime import WorkRunner
 
 
-def test_fake_provider_success_records_run_and_artifacts(fresh_db: Path) -> None:
+def test_fake_provider_success_records_run_and_artifacts(fresh_db: Path, monkeypatch) -> None:
+    from tasque2.config import reset_settings
+
+    monkeypatch.setenv("TASQUE2_MEMORY_AUTO_INGEST", "true")  # exercise the opt-in report-ingest path
+    reset_settings()
     captured = []
     registry = ProviderRegistry()
     registry.register(
@@ -431,6 +435,70 @@ def test_provider_memory_writes_create_and_upsert_memories(fresh_db: Path) -> No
         assert current is not None
         assert current.content == "Current workout state: prescribed push, unconfirmed."
         assert session.get(Memory, old.id).archived_at is not None
+
+
+def test_provider_malformed_memory_writes_does_not_fail_run(fresh_db: Path) -> None:
+    # A malformed (non-list) memory_writes must NOT dead-letter an otherwise-good run.
+    registry = ProviderRegistry()
+    registry.register(
+        FakeProvider(
+            response=ProviderResponse(
+                status="succeeded",
+                summary="Posted digest.",
+                structured_output={
+                    "summary": "Posted digest.",
+                    "report": "Here is the digest.",
+                    "produces": {"memory_writes": "I updated the log and bumped last_seen."},
+                },
+            )
+        )
+    )
+    with session_scope() as session:
+        work = WorkRepository(session).create_work_item(
+            title="Watch run", task_instruction="Run the watch.", worker_kind="provider.fake"
+        )
+        outcome = WorkRunner(
+            session, provider_runtime=ProviderRuntime(registry=registry)
+        ).run_next()
+        assert outcome is not None
+        attempt = session.scalar(select(WorkAttempt).where(WorkAttempt.work_item_id == work.id))
+        assert attempt is not None
+        assert attempt.status == "succeeded"
+        assert attempt.produces.get("memory_writes_skipped")
+
+
+def test_provider_memory_writes_single_object_is_coerced_to_list(fresh_db: Path) -> None:
+    registry = ProviderRegistry()
+    registry.register(
+        FakeProvider(
+            response=ProviderResponse(
+                status="succeeded",
+                summary="ok",
+                structured_output={
+                    "summary": "ok",
+                    "report": "ok",
+                    "produces": {
+                        "memory_writes": {
+                            "operation": "create",
+                            "namespace": "local",
+                            "kind": "fact",
+                            "content": "single object write",
+                        }
+                    },
+                },
+            )
+        )
+    )
+    with session_scope() as session:
+        work = WorkRepository(session).create_work_item(
+            title="t", task_instruction="t", worker_kind="provider.fake"
+        )
+        WorkRunner(session, provider_runtime=ProviderRuntime(registry=registry)).run_next()
+        attempt = session.scalar(select(WorkAttempt).where(WorkAttempt.work_item_id == work.id))
+        assert attempt is not None
+        assert attempt.status == "succeeded"
+        assert len(attempt.produces["memory_ids"]) == 1
+        assert session.scalar(select(Memory).where(Memory.content == "single object write")) is not None
 
 
 def test_provider_default_worker_kind_uses_env_provider(

@@ -1,14 +1,18 @@
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
 from sqlalchemy.orm import Session
 
+from tasque2.extensions import registry as extension_registry
 from tasque2.models import WorkItem
 from tasque2.providers import ProviderRuntime
-from tasque2.queue import WorkQueue
+from tasque2.queue import ClaimedWork, WorkQueue
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -122,15 +126,23 @@ class WorkRunner:
         self.lease_owner = lease_owner
         self.lease_seconds = lease_seconds
 
-    def run_next(self) -> RunOutcome | None:
+    def claim(self) -> ClaimedWork | None:
+        """Claim the next ready work item for this runner's lease owner.
+
+        Split out from :meth:`run_next` so a concurrent daemon can serialize the
+        claim (the only writer-vs-writer step) while running the claimed work --
+        the long part -- in parallel. Callers that want to publish the claim
+        before doing anything slow should ``session.commit()`` after this returns.
+        """
         queue = WorkQueue(self.session)
-        claimed = queue.claim_next_ready_work(
+        return queue.claim_next_ready_work(
             lease_owner=self.lease_owner,
             lease_seconds=self.lease_seconds,
         )
-        if claimed is None:
-            return None
 
+    def execute(self, claimed: ClaimedWork) -> RunOutcome:
+        """Run an already-claimed work item and record its outcome."""
+        queue = WorkQueue(self.session)
         try:
             if self.provider_runtime.can_run(claimed.work_item.worker_kind):
                 result = self.provider_runtime.run(
@@ -159,9 +171,27 @@ class WorkRunner:
             produces=result.produces,
             report_artifact_id=result.report_artifact_id,
         )
+        # Fallback recorders (extension-registered): a run that emitted
+        # machine-readable produces but skipped its logging tool still leaves
+        # ledger rows, so the computed digests stay complete.
+        for ingestor_name, ingest_attempt in extension_registry().attempt_ingestors:
+            try:
+                ingest_attempt(self.session, claimed.work_item, claimed.attempt)
+            except Exception:  # noqa: BLE001 - history capture must never fail the run
+                logger.exception(
+                    "Attempt ingestor %s failed for attempt %s",
+                    ingestor_name,
+                    claimed.attempt.id,
+                )
         return RunOutcome(
             work_item_id=claimed.work_item.id,
             attempt_id=claimed.attempt.id,
             status=claimed.work_item.status,
             summary=result.summary,
         )
+
+    def run_next(self) -> RunOutcome | None:
+        claimed = self.claim()
+        if claimed is None:
+            return None
+        return self.execute(claimed)

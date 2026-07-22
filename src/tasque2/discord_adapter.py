@@ -9,6 +9,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from tasque2.artifacts import ArtifactStore
+from tasque2.config import get_settings
 from tasque2.memory import MemoryService
 from tasque2.memory_ingest import MemoryIngestService
 from tasque2.models import (
@@ -470,7 +471,7 @@ class DiscordService:
         )
         self.session.add(message)
         self.session.flush()
-        if direction == "inbound" and content_preview.strip():
+        if direction == "inbound" and content_preview.strip() and get_settings().memory_auto_ingest:
             MemoryIngestService(self.session).ingest_text(
                 namespace="discord",
                 title=f"Discord message from {author or 'unknown'}",
@@ -582,13 +583,20 @@ class DiscordService:
             ).all()
         }
         leaves = [node for node in nodes if node.id not in upstream_node_ids] or nodes
+        fallback: WorkItem | None = None
         for node in reversed(leaves):
             if node.work_item_id is None:
                 continue
             work_item = self.session.get(WorkItem, node.work_item_id)
-            if work_item is not None and _reply_followup_config(work_item.context or {}) is not None:
+            if work_item is None:
+                continue
+            if _reply_followup_config(work_item.context or {}) is not None:
                 return work_item
-        return None
+            if fallback is None and not _reply_followup_disabled(work_item.context or {}):
+                fallback = work_item
+        # No node opted in explicitly; the newest leaf still handles the reply via the
+        # default follow-up processor rather than letting the message die silently.
+        return fallback
 
     def _awaiting_workflow_gates(self, workflow_run_id: str) -> list[WorkflowNode]:
         return list(
@@ -635,11 +643,12 @@ class DiscordService:
                 source_kind="discord_attachment",
                 source_id=source_id,
             )
-            MemoryIngestService(self.session).ingest_artifact(
-                artifact.id,
-                namespace="discord",
-                tags=["discord", "attachment"],
-            )
+            if get_settings().memory_auto_ingest:
+                MemoryIngestService(self.session).ingest_artifact(
+                    artifact.id,
+                    namespace="discord",
+                    tags=["discord", "attachment"],
+                )
             refs.append(
                 {
                     "artifact_id": artifact.id,
@@ -764,7 +773,12 @@ class DiscordService:
             return None
         config = _reply_followup_config(work_item.context or {})
         if config is None:
-            return None
+            # A user reply in a bound thread must always produce follow-up work;
+            # a work item without its own reply config gets the generic processor
+            # instead of silently swallowing the message.
+            if _reply_followup_disabled(work_item.context or {}):
+                return None
+            config = _default_reply_followup_config(work_item)
 
         base_instruction = _reply_followup_instruction(config)
         reply_block = "\n\n".join(
@@ -781,6 +795,12 @@ class DiscordService:
             namespace = _context_memory_namespace(work_item.context)
             if namespace:
                 child_context["memory_namespace"] = namespace
+        # The reply processor is the parent's continuation: carry the reply handling
+        # forward so work it spawns (via MCP inheritance) stays reply-capable too.
+        parent_reply_context = work_item.context or {}
+        for key in ("reply_followup_work", "reply_processor", "reply_memory"):
+            if key not in child_context and isinstance(parent_reply_context.get(key), dict):
+                child_context[key] = parent_reply_context[key]
         child_context.setdefault("parent_work_item_id", work_item.id)
         parent_context = self._parent_reply_context(work_item)
         for key, value in parent_context.items():
@@ -1007,6 +1027,66 @@ def _reply_followup_config(context: dict[str, Any]) -> dict[str, Any] | None:
     if value.get("enabled", True) is False:
         return None
     return dict(value)
+
+
+def _reply_followup_disabled(context: dict[str, Any]) -> bool:
+    """True only when the work item explicitly opted out of reply follow-up."""
+    for key in ("reply_followup_work", "reply_processor"):
+        value = context.get(key)
+        if isinstance(value, dict) and value.get("enabled", True) is False:
+            return True
+    return context.get("reply_followup_disabled") is True
+
+
+_INHERITED_REPLY_CONTEXT_KEYS = (
+    "memory_namespace",
+    "memory_namespaces",
+    "memory_canonical_keys",
+    "memory_queries",
+    "memory_searches",
+    "memory_tags",
+    "memory_query_limit",
+    "memory_kinds",
+)
+
+_DEFAULT_REPLY_FOLLOWUP_INSTRUCTION = (
+    "# Discord Reply Follow-up\n\n"
+    "## Goal\n"
+    "The user replied in the Discord thread of a Tasque work item that has no dedicated "
+    "reply processor. Act as that work's continuation: understand what the user is asking "
+    "in the context of the parent work, carry it out, and answer them in the thread.\n\n"
+    "## Context\n"
+    "- `task_context.source_reply` — the reply (author, content, attachments) plus parent "
+    "work pointers.\n"
+    "- `task_context.conversation.recent_messages` — the durable thread transcript.\n"
+    "- `parent_work` in the context packet — the parent work item, its latest attempt, and "
+    "its report artifact. Read the parent report before interpreting the reply.\n"
+    "- Memory context inherited from the parent work item (namespace, canonical keys, "
+    "queries) — treat it as the domain's durable state and doctrine.\n\n"
+    "## Instructions\n"
+    "- Recover what the user is responding to, then carry out their request within the "
+    "parent work's domain, conventions, and standing authority. Use the same memories and "
+    "tools the parent work used.\n"
+    "- If the reply corrects a preference, plan, or doctrine, record the correction in the "
+    "domain's durable memory so future runs honor it.\n"
+    "- If the request is outside this work's scope or authority, say so in your reply and "
+    "route it (queue follow-up work, a schedule, or a workflow) instead of dropping it.\n\n"
+    "## Output\n"
+    "Submit a one-sentence summary and a Markdown report written as a direct answer to the "
+    "user's reply; the report is posted back to the same Discord thread."
+)
+
+
+def _default_reply_followup_config(work_item: WorkItem) -> dict[str, Any]:
+    parent_context = work_item.context or {}
+    child_context = {
+        key: parent_context[key] for key in _INHERITED_REPLY_CONTEXT_KEYS if key in parent_context
+    }
+    return {
+        "title": f"Reply: {work_item.title}",
+        "task_instruction": _DEFAULT_REPLY_FOLLOWUP_INSTRUCTION,
+        "context": child_context,
+    }
 
 
 def _reply_followup_instruction(config: dict[str, Any]) -> str:

@@ -385,7 +385,7 @@ class CodexCliProvider(SubprocessProvider):
 
     def run(self, request: ProviderRequest) -> ProviderResponse:
         argv = ["codex", "exec", "--json", "--dangerously-bypass-approvals-and-sandbox"]
-        argv.extend(_codex_tasque_mcp_args())
+        argv.extend(_codex_tasque_mcp_args(work_item_id=request.env.get("TASQUE2_WORK_ITEM_ID")))
         if request.cwd:
             argv.extend(["--cd", request.cwd])
         if request.model:
@@ -430,7 +430,9 @@ class ClaudeCodeProvider(SubprocessProvider):
             "--permission-mode",
             "bypassPermissions",
         ]
-        argv.extend(["--mcp-config", _claude_tasque_mcp_config()])
+        argv.extend(
+            ["--mcp-config", _claude_tasque_mcp_config(work_item_id=request.env.get("TASQUE2_WORK_ITEM_ID"))]
+        )
         if request.model:
             argv.extend(["--model", request.model])
         if request.output_schema:
@@ -604,7 +606,7 @@ class ProviderRuntime:
             attempt=attempt,
             provider_run=provider_run,
         )
-        if report_artifact_id is not None:
+        if report_artifact_id is not None and get_settings().memory_auto_ingest:
             ingest_result = MemoryIngestService(session).ingest_artifact(
                 report_artifact_id,
                 namespace=_work_memory_namespace(work_item),
@@ -662,60 +664,80 @@ class ProviderRuntime:
         writes = produces.get("memory_writes")
         if writes is None:
             return produces
+
+        # memory_writes is an OPTIONAL legacy convenience field — workers are encouraged
+        # to use the memory MCP tools directly. A malformed value must never fail an
+        # otherwise-successful run (that would discard a good report). Coerce common
+        # shapes, apply what is valid, and record what was skipped for observability.
+        if isinstance(writes, str):
+            try:
+                writes = json.loads(writes)
+            except (ValueError, TypeError):
+                writes = None
+        if isinstance(writes, dict):
+            writes = [writes]
         if not isinstance(writes, list):
-            raise ProviderExecutionError("memory_writes must be a list.")
+            produces["memory_writes_skipped"] = ["memory_writes was not a list"]
+            return produces
 
         service = MemoryService(session)
         memory_ids: list[str] = []
+        skipped: list[str] = []
         for index, write in enumerate(writes):
-            if not isinstance(write, dict):
-                raise ProviderExecutionError(f"memory_writes[{index}] must be an object.")
-            operation = str(write.get("operation") or "create").strip().lower()
-            namespace = _required_write_string(write, "namespace", index)
-            kind = _required_write_string(write, "kind", index)
-            content = _required_write_string(write, "content", index)
-            tags = _string_list(write.get("tags"))
-            ttl_days = _optional_int(write.get("ttl_days"))
-            pinned = bool(write.get("pinned", False))
+            try:
+                if not isinstance(write, dict):
+                    raise ProviderExecutionError(f"memory_writes[{index}] must be an object.")
+                operation = str(write.get("operation") or "create").strip().lower()
+                namespace = _required_write_string(write, "namespace", index)
+                kind = _required_write_string(write, "kind", index)
+                content = _required_write_string(write, "content", index)
+                tags = _string_list(write.get("tags"))
+                ttl_days = _optional_int(write.get("ttl_days"))
+                pinned = bool(write.get("pinned", False))
 
-            if operation in {"create", "append"}:
-                memory = service.create_memory(
-                    namespace=namespace,
-                    kind=kind,
-                    content=content,
-                    tags=tags,
-                    source_kind="provider_memory_write",
-                    source_id=provider_run.id,
-                    work_item_id=work_item.id,
-                    canonical_key=_optional_string(write.get("canonical_key")),
-                    pinned=pinned,
-                    ttl_days=ttl_days,
-                )
-            elif operation in {"upsert_canonical", "canonical_upsert"}:
-                canonical_key = _required_write_string(write, "canonical_key", index)
-                memory = service.upsert_canonical(
-                    namespace=namespace,
-                    canonical_key=canonical_key,
-                    kind=kind,
-                    content=content,
-                    tags=tags,
-                    source_kind="provider_memory_write",
-                    source_id=provider_run.id,
-                    work_item_id=work_item.id,
-                    pinned=pinned,
-                    ttl_days=ttl_days,
-                )
-            elif operation == "supersede":
-                memory_id = _required_write_string(write, "memory_id", index)
-                memory = service.supersede_memory(memory_id, content=content, tags=tags)
-            else:
-                raise ProviderExecutionError(
-                    f"Unsupported memory_writes[{index}].operation: {operation!r}."
-                )
-            memory_ids.append(memory.id)
+                if operation in {"create", "append"}:
+                    memory = service.create_memory(
+                        namespace=namespace,
+                        kind=kind,
+                        content=content,
+                        tags=tags,
+                        source_kind="provider_memory_write",
+                        source_id=provider_run.id,
+                        work_item_id=work_item.id,
+                        canonical_key=_optional_string(write.get("canonical_key")),
+                        pinned=pinned,
+                        ttl_days=ttl_days,
+                    )
+                elif operation in {"upsert_canonical", "canonical_upsert"}:
+                    canonical_key = _required_write_string(write, "canonical_key", index)
+                    memory = service.upsert_canonical(
+                        namespace=namespace,
+                        canonical_key=canonical_key,
+                        kind=kind,
+                        content=content,
+                        tags=tags,
+                        source_kind="provider_memory_write",
+                        source_id=provider_run.id,
+                        work_item_id=work_item.id,
+                        pinned=pinned,
+                        ttl_days=ttl_days,
+                    )
+                elif operation == "supersede":
+                    memory_id = _required_write_string(write, "memory_id", index)
+                    memory = service.supersede_memory(memory_id, content=content, tags=tags)
+                else:
+                    raise ProviderExecutionError(
+                        f"Unsupported memory_writes[{index}].operation: {operation!r}."
+                    )
+                memory_ids.append(memory.id)
+            except ProviderExecutionError as error:
+                skipped.append(str(error))
+                continue
 
         if memory_ids:
             produces["memory_ids"] = [*_string_list(produces.get("memory_ids")), *memory_ids]
+        if skipped:
+            produces["memory_writes_skipped"] = skipped
         return produces
 
     def _build_request(
@@ -755,6 +777,7 @@ class ProviderRuntime:
         )
         request_env = {str(key): str(value) for key, value in env.items()}
         request_env.setdefault("TASQUE2_RESULT_TOKEN", result_token)
+        request_env.setdefault("TASQUE2_WORK_ITEM_ID", work_item.id)
         return ProviderRequest(
             provider=provider_name,
             prompt=prompt,
@@ -1342,13 +1365,17 @@ def _coerce_process_text(value: Any) -> str:
     return str(value)
 
 
-def tasque_mcp_server_config() -> dict[str, Any]:
+def tasque_mcp_server_config(*, work_item_id: str | None = None) -> dict[str, Any]:
     settings = get_settings()
     env = {
         "TASQUE2_DATA_DIR": str(settings.resolved_data_dir),
         "TASQUE2_DB_PATH": str(settings.database_path),
         "TASQUE2_TIMEZONE": settings.timezone,
     }
+    if work_item_id:
+        # Lets MCP tools (work_enqueue/schedule_create_work) know which work item is
+        # calling, so children inherit reply handling without ambient env inheritance.
+        env["TASQUE2_WORK_ITEM_ID"] = work_item_id
     python_path = os.environ.get("PYTHONPATH")
     if python_path:
         env["PYTHONPATH"] = python_path
@@ -1359,8 +1386,8 @@ def tasque_mcp_server_config() -> dict[str, Any]:
     }
 
 
-def _codex_tasque_mcp_args() -> list[str]:
-    config = tasque_mcp_server_config()
+def _codex_tasque_mcp_args(*, work_item_id: str | None = None) -> list[str]:
+    config = tasque_mcp_server_config(work_item_id=work_item_id)
     args = [
         ("mcp_servers.tasque2.command", config["command"]),
         ("mcp_servers.tasque2.args", config["args"]),
@@ -1375,8 +1402,10 @@ def _codex_tasque_mcp_args() -> list[str]:
     return result
 
 
-def _claude_tasque_mcp_config() -> str:
-    return json.dumps({"mcpServers": {"tasque2": tasque_mcp_server_config()}})
+def _claude_tasque_mcp_config(*, work_item_id: str | None = None) -> str:
+    return json.dumps(
+        {"mcpServers": {"tasque2": tasque_mcp_server_config(work_item_id=work_item_id)}}
+    )
 
 
 def _toml_value(value: Any) -> str:

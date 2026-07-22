@@ -119,6 +119,23 @@ def test_memory_ingest_artifact_skips_binary_and_ingests_text(fresh_db: Path) ->
         assert MemoryService(session).search(query="actionable report")
 
 
+def test_search_scopes_to_namespace_under_common_word_load(fresh_db: Path) -> None:
+    # A common word matches many rows in another namespace; the scoped search must
+    # not be starved by them (namespace filtering happens in SQL before LIMIT).
+    with session_scope() as session:
+        service = MemoryService(session)
+        for index in range(40):
+            service.create_memory(
+                namespace="bulk", kind="note", content=f"social club meetup number {index}"
+            )
+        target = service.create_memory(
+            namespace="scout", kind="fact", content="social club he would enjoy"
+        )
+
+        results = service.search(query="social club", namespace="scout", limit=5)
+        assert [memory.id for memory in results] == [target.id]
+
+
 def test_memory_archive_removes_from_search(fresh_db: Path) -> None:
     with session_scope() as session:
         service = MemoryService(session)

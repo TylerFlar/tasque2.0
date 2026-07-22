@@ -471,6 +471,20 @@ class DiscordOutputService:
             raise KeyError(f"Unknown work item: {work_item_id}")
         if self._has_status_post("discord.work_status_posted", work_item.id, work_item.status):
             return None
+        # A successful run can opt out of posting (produces.silent) -- e.g. a watch
+        # that found nothing worth surfacing. Mark it handled so it isn't reconsidered,
+        # but send no message.
+        if work_item.status == "succeeded" and self._latest_attempt_silent(work_item):
+            self._emit_event(
+                event_type="discord.work_status_posted",
+                entity_kind="work_item",
+                entity_id=work_item.id,
+                work_item_id=work_item.id,
+                workflow_run_id=work_item.workflow_run_id,
+                summary="Suppressed work output (silent run)",
+                payload={"status": work_item.status, "silent": True},
+            )
+            return None
         if self._is_discord_intake_work(work_item):
             return await self._post_intake_work_response(
                 work_item=work_item,
@@ -644,6 +658,31 @@ class DiscordOutputService:
         if existing is not None:
             return existing
 
+        # A reply-processor's own response stays in the thread the user replied in:
+        # it inherits that thread via work_item.discord_thread_id. Post into the
+        # existing thread instead of opening a new one — but do NOT re-bind it, so the
+        # generator stays the bound owner (handle_thread_reply keeps routing replies
+        # against its reply_followup_work context) and uq_discord_thread_work holds.
+        #
+        # This reuse is limited to direct reply responses (source_kind
+        # "discord_reply_followup") and scheduled runs explicitly bound to a thread
+        # (source_kind "schedule" with a discord_thread_id in the schedule payload --
+        # e.g. an agent-owned "watch" that fires into its own thread). Any *new*
+        # worker a reply-processor spawns (the next generator, via produces.child_work
+        # or the work_enqueue MCP tool) still gets its own fresh thread, even though it
+        # may carry an inherited discord_thread_id.
+        if work_item.discord_thread_id and work_item.source_kind in {
+            "discord_reply_followup",
+            "schedule",
+        }:
+            bound = self.session.scalar(
+                select(DiscordThread).where(
+                    DiscordThread.discord_thread_id == work_item.discord_thread_id,
+                )
+            )
+            if bound is not None:
+                return bound
+
         initial_message = ""
         initial_embed = self._build_work_status_embed(work_item)
         ref = await gateway.create_thread(
@@ -701,6 +740,21 @@ class DiscordOutputService:
             self.session.flush()
             return existing
 
+        # If this run was started from an existing Discord thread (e.g. a stylist work
+        # thread that triggered the build), deliver its result back INTO that thread
+        # instead of opening a separate workflow thread. We reuse the existing
+        # DiscordThread for posting only and do NOT create a second binding -- the global
+        # uq_discord_thread_id holds, and the thread's original owner keeps routing
+        # replies (handle_thread_reply is unaffected).
+        if run.discord_thread_id:
+            bound = self.session.scalar(
+                select(DiscordThread).where(
+                    DiscordThread.discord_thread_id == run.discord_thread_id,
+                )
+            )
+            if bound is not None:
+                return bound
+
         initial_message = ""
         initial_embed = self._build_workflow_status_embed(run)
         ref = await gateway.create_thread(
@@ -744,7 +798,10 @@ class DiscordOutputService:
             .where(
                 WorkflowRun.status.in_(TERMINAL_WORKFLOW_PANEL_STATUSES),
             )
-            .order_by(WorkflowRun.updated_at.asc())
+            # Newest first: a freshly-finished run must stay inside the candidate
+            # window even once thousands of older runs exist, or its final status
+            # would never post.
+            .order_by(WorkflowRun.updated_at.desc())
             .limit(limit * 4)
         ).all()
         return [
@@ -757,10 +814,13 @@ class DiscordOutputService:
         if limit <= 0:
             return []
         statuses = ACTIVE_WORKFLOW_PANEL_STATUSES | TERMINAL_WORKFLOW_PANEL_STATUSES
+        # Newest first. With ASC + LIMIT, once more than `limit` runs accumulated
+        # the window only ever held the oldest (long-finished) runs, so currently
+        # active runs never got a status panel. DESC keeps live runs in-window.
         return self.session.scalars(
             select(WorkflowRun)
             .where(WorkflowRun.status.in_(statuses))
-            .order_by(WorkflowRun.updated_at.asc())
+            .order_by(WorkflowRun.updated_at.desc())
             .limit(limit)
         ).all()
 
@@ -785,7 +845,9 @@ class DiscordOutputService:
                 WorkItem.visible.is_(True),
                 WorkItem.workflow_run_id.is_(None),
             )
-            .order_by(WorkItem.updated_at.asc())
+            # Newest first, same reason as the workflow-run candidates: keep
+            # just-finished work in-window regardless of history size.
+            .order_by(WorkItem.updated_at.desc())
             .limit(limit * 4)
         ).all()
         return [
@@ -854,6 +916,13 @@ class DiscordOutputService:
             ):
                 return event
         return None
+
+    def _latest_attempt_silent(self, work_item: WorkItem) -> bool:
+        attempt = self._latest_attempt(work_item.id)
+        if attempt is None:
+            return False
+        produces = attempt.produces or {}
+        return bool(produces.get("silent") or produces.get("suppress_output"))
 
     def _latest_attempt(self, work_item_id: str) -> WorkAttempt | None:
         return self.session.scalar(

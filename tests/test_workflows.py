@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import timedelta
 from pathlib import Path
 
 from sqlalchemy import select
@@ -8,7 +9,8 @@ from typer.testing import CliRunner
 
 from tasque2.cli import app
 from tasque2.db import session_scope
-from tasque2.models import WorkflowDefinition, WorkflowNode, WorkflowRun, WorkItem
+from tasque2.models import WorkflowDefinition, WorkflowNode, WorkflowRun, WorkItem, utc_now
+from tasque2.queue import WorkQueue
 from tasque2.runtime import WorkRunner
 from tasque2.workflows import WorkflowService
 
@@ -66,6 +68,48 @@ def test_sequential_workflow_runs_through_work_items(fresh_db: Path) -> None:
         ).all()
         assert [node.status for node in nodes] == ["succeeded", "succeeded"]
         assert nodes[0].output["task_instruction"] == "First output."
+
+
+def test_workflow_node_deadline_dead_letters_stale_work(fresh_db: Path) -> None:
+    # A node whose deadline_at has already passed must not run: the queue
+    # dead-letters its work item and the node (and run) fail, instead of
+    # executing stale, time-sensitive work after the daemon was down.
+    past = (utc_now() - timedelta(hours=1)).isoformat()
+    definition = {
+        "nodes": [
+            {
+                "key": "stale_step",
+                "kind": "work",
+                "title": "Stale step",
+                "task_instruction": "Should not run after its deadline.",
+                "worker_kind": "function.echo",
+                "deadline_at": past,
+            },
+        ]
+    }
+    with session_scope() as session:
+        service = WorkflowService(session)
+        workflow_definition = service.create_definition(
+            name="deadline",
+            version="1",
+            definition=definition,
+        )
+        run = service.start_run(workflow_definition_id=workflow_definition.id)
+        service.tick_runs()
+
+        node = session.scalar(
+            select(WorkflowNode).where(WorkflowNode.workflow_run_id == run.id)
+        )
+        assert node is not None
+        assert node.work_item_id is not None
+        assert session.get(WorkItem, node.work_item_id).deadline_at is not None
+
+        assert WorkQueue(session).expire_overdue_work() == 1
+
+        service.tick_runs()
+        assert session.get(WorkItem, node.work_item_id).status == "dead_letter"
+        assert session.get(WorkflowNode, node.id).status == "failed"
+        assert session.get(WorkflowRun, run.id).status == "failed"
 
 
 def test_workflow_gate_waits_for_answer(fresh_db: Path) -> None:
@@ -393,3 +437,114 @@ def test_workflow_cli_create_validate_and_list(fresh_db: Path, tmp_path: Path) -
             select(WorkflowDefinition).where(WorkflowDefinition.name == "cli-workflow")
         )
         assert definition is not None
+
+
+def test_fan_out_tolerates_child_failure_and_still_runs_report(fresh_db: Path) -> None:
+    # career-apply shape: a dead-lettered fan-out child must not kill the run
+    # before the aggregation node. With tolerate_child_failures the child is
+    # recorded as failed_tolerated and the report node still runs.
+    definition = {
+        "nodes": [
+            {
+                "key": "fan",
+                "kind": "fan_out",
+                "items": ["a", "b"],
+                "tolerate_child_failures": True,
+                "child_title_template": "Process {item}",
+                "child_task_instruction_template": "Process item {item}",
+                "child_worker_kind": "missing.worker",
+            },
+            {
+                "key": "report",
+                "kind": "work",
+                "depends_on": ["fan"],
+                "task_instruction": "Aggregate results.",
+                "worker_kind": "function.echo",
+            },
+        ]
+    }
+    with session_scope() as session:
+        service = WorkflowService(session)
+        workflow_definition = service.create_definition(
+            name="tolerant-fan",
+            version="1",
+            definition=definition,
+        )
+        run = service.start_run(workflow_definition_id=workflow_definition.id)
+
+        service.tick_runs()
+        service.tick_runs()
+        WorkRunner(session).run_next()
+        WorkRunner(session).run_next()
+        service.tick_runs()
+
+        children = session.scalars(
+            select(WorkflowNode)
+            .where(
+                WorkflowNode.workflow_run_id == run.id,
+                WorkflowNode.parent_node_id.is_not(None),
+            )
+            .order_by(WorkflowNode.node_key)
+        ).all()
+        assert [child.status for child in children] == ["failed_tolerated", "failed_tolerated"]
+
+        # The report node must be enqueued despite the child failures.
+        report_node = session.scalar(
+            select(WorkflowNode).where(
+                WorkflowNode.workflow_run_id == run.id,
+                WorkflowNode.node_key == "report",
+            )
+        )
+        assert report_node is not None
+        assert report_node.work_item_id is not None
+
+        WorkRunner(session).run_next()
+        service.tick_runs()
+
+        assert session.get(WorkflowNode, report_node.id).status == "succeeded"
+        assert session.get(WorkflowRun, run.id).status == "completed"
+
+
+def test_fan_out_child_failure_without_tolerance_still_fails_run(fresh_db: Path) -> None:
+    definition = {
+        "nodes": [
+            {
+                "key": "fan",
+                "kind": "fan_out",
+                "items": ["a"],
+                "child_title_template": "Process {item}",
+                "child_task_instruction_template": "Process item {item}",
+                "child_worker_kind": "missing.worker",
+            },
+            {
+                "key": "report",
+                "kind": "work",
+                "depends_on": ["fan"],
+                "task_instruction": "Aggregate results.",
+                "worker_kind": "function.echo",
+            },
+        ]
+    }
+    with session_scope() as session:
+        service = WorkflowService(session)
+        workflow_definition = service.create_definition(
+            name="strict-fan",
+            version="1",
+            definition=definition,
+        )
+        run = service.start_run(workflow_definition_id=workflow_definition.id)
+
+        service.tick_runs()
+        service.tick_runs()
+        WorkRunner(session).run_next()
+        service.tick_runs()
+
+        assert session.get(WorkflowRun, run.id).status == "failed"
+        report_node = session.scalar(
+            select(WorkflowNode).where(
+                WorkflowNode.workflow_run_id == run.id,
+                WorkflowNode.node_key == "report",
+            )
+        )
+        assert report_node is not None
+        assert report_node.work_item_id is None

@@ -11,6 +11,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    LargeBinary,
     String,
     Text,
     TypeDecorator,
@@ -562,6 +563,27 @@ class Memory(TimestampMixin, Base):
     archived_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
     pinned: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     ttl_days: Mapped[int | None] = mapped_column(Integer)
+    # Optional 1-5 salience used to weight retrieval ranking (None = neutral).
+    importance: Mapped[int | None] = mapped_column(Integer)
+
+
+class MemoryEmbedding(TimestampMixin, Base):
+    """Vector embedding for a :class:`Memory`, stored as packed float32 bytes.
+
+    Kept in a side table so embeddings can be (re)built without touching the
+    authoritative memory rows, and so superseded rows can be cheaply skipped.
+    """
+
+    __tablename__ = "memory_embeddings"
+
+    # Plain satellite keyed by memory id (no FK): MemoryService owns the lifecycle
+    # so parent/child delete ordering and DB-cascade vs ORM double-deletes never
+    # collide. Orphans are harmless — retrieval joins only active memory rows.
+    memory_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    namespace: Mapped[str] = mapped_column(String(160), nullable=False, index=True)
+    model: Mapped[str] = mapped_column(String(120), nullable=False)
+    dim: Mapped[int] = mapped_column(Integer, nullable=False)
+    vector: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
 
 
 class DiscordThread(TimestampMixin, Base):
