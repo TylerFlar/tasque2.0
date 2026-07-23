@@ -633,7 +633,7 @@ def test_semantic_model_profile_hints_are_rejected(
             failed = session.scalar(select(FailedWork).where(FailedWork.work_item_id == outcome.work_item_id))
             assert failed is not None
             assert failed.error_type == "ValueError"
-            assert failed.error_message == "model_profile must be one of: high, low, medium."
+            assert failed.error_message == "model_profile must be one of: high, low, medium, ultra."
     finally:
         reset_settings()
 

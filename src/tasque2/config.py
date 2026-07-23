@@ -8,7 +8,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 DEFAULT_MODEL_PROVIDERS = {"codex", "claude"}
 TEST_MODEL_PROVIDERS = {"fake", "subprocess"}
-MODEL_PROFILES = {"low", "medium", "high"}
+MODEL_PROFILES = {"low", "medium", "high", "ultra"}
 
 
 class Settings(BaseSettings):
@@ -53,9 +53,11 @@ class Settings(BaseSettings):
     codex_model_low: str | None = Field(default=None)
     codex_model_medium: str | None = Field(default=None)
     codex_model_high: str | None = Field(default=None)
+    codex_model_ultra: str | None = Field(default=None)
     claude_model_low: str | None = Field(default=None)
     claude_model_medium: str | None = Field(default=None)
     claude_model_high: str | None = Field(default=None)
+    claude_model_ultra: str | None = Field(default=None)
     allow_test_providers: bool = Field(default=False)
     # Memory retrieval / embeddings.
     embedding_provider: str = Field(default="auto")  # auto | hash | openai | none
