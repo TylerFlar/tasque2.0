@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -1443,10 +1444,49 @@ def _structured_candidates(text: str) -> list[str]:
     return [candidate for candidate in candidates if candidate]
 
 
+# Complete tool-call blocks the model may echo as text (Anthropic-style XML).
+_TOOL_CALL_BLOCK_RE = re.compile(
+    r"<(?:antml:)?function_calls>.*?</(?:antml:)?function_calls>", re.DOTALL
+)
+_TOOL_CALL_INVOKE_RE = re.compile(r"<(?:antml:)?invoke\b.*?</(?:antml:)?invoke>", re.DOTALL)
+_TOOL_CALL_PARAM_RE = re.compile(r"<(?:antml:)?parameter\b.*?</(?:antml:)?parameter>", re.DOTALL)
+# Any tool-call opener, complete or truncated (a session limit cuts one off mid-emit).
+# Both the bare and the namespaced spellings, since either can appear raw. The prefix
+# is composed rather than written inline so the literal tag can't be normalized away.
+_TOOL_CALL_NS = "antml" + ":"
+_TOOL_CALL_TAIL_MARKERS = tuple(
+    f"<{prefix}{name}"
+    for name in ("function_calls>", "invoke", "parameter")
+    for prefix in ("", _TOOL_CALL_NS)
+)
+
+
+def _strip_tool_call_xml(text: str) -> str:
+    """Remove tool-call XML a provider echoed as text so it never reaches the user.
+
+    A worker that dies on a token/session limit mid-tool-call leaves a truncated
+    ``<parameter name="produces">{...`` fragment in the raw stream; without this
+    it can surface as the Discord message body.
+    """
+    if not text or "<" not in text:
+        return text
+    text = _TOOL_CALL_BLOCK_RE.sub("", text)
+    text = _TOOL_CALL_INVOKE_RE.sub("", text)
+    text = _TOOL_CALL_PARAM_RE.sub("", text)
+    # Truncate at any remaining opener (a partial call with no closing tag).
+    cut = min(
+        (index for index in (text.find(marker) for marker in _TOOL_CALL_TAIL_MARKERS) if index != -1),
+        default=-1,
+    )
+    if cut != -1:
+        text = text[:cut]
+    return text.strip()
+
+
 def extract_text_from_stream(text: str) -> str:
     objects = list(_iter_json_objects(text))
     if not objects:
-        return text.strip()
+        return _strip_tool_call_xml(text.strip())
 
     preferred: list[str] = []
     fallback: list[str] = []
@@ -1458,10 +1498,10 @@ def extract_text_from_stream(text: str) -> str:
         fallback.extend(_extract_text_values(obj))
 
     if preferred:
-        return preferred[-1]
+        return _strip_tool_call_xml(preferred[-1])
     if fallback:
-        return "\n".join(fallback).strip()
-    return text.strip()
+        return _strip_tool_call_xml("\n".join(fallback).strip())
+    return _strip_tool_call_xml(text.strip())
 
 
 def extract_session_id_from_stream(text: str) -> str | None:

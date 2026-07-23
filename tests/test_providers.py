@@ -1007,6 +1007,46 @@ def test_provider_stream_helpers_parse_claude_style_jsonl() -> None:
     assert extract_structured_output(stream) == {"ok": True, "message": "done"}
 
 
+def test_extract_text_strips_truncated_tool_call_xml() -> None:
+    # A worker that died on a session limit mid-tool-call leaves a partial
+    # <parameter name="produces"> fragment in the raw (non-JSON) stream.
+    leaked = (
+        "Say yes and I'll do it, or no.\n"
+        '<parameter name="produces">{"run": "run-20", "device_touched": false, '
+        '"hinge_likes_remaining_today": 0'
+    )
+    cleaned = extract_text_from_stream(leaked)
+    assert cleaned == "Say yes and I'll do it, or no."
+    assert "<parameter" not in cleaned
+    assert "produces" not in cleaned
+
+
+def test_extract_text_strips_complete_tool_call_block() -> None:
+    leaked = (
+        "Here is the reply.\n"
+        "<function_calls><invoke name=\"submit_worker_result\">"
+        "<parameter name=\"report\">x</parameter></invoke></function_calls>"
+    )
+    assert extract_text_from_stream(leaked) == "Here is the reply."
+
+
+def test_extract_text_strips_truncated_namespaced_tool_call_xml() -> None:
+    # Same failure, but the opener carries the ``antml:`` namespace prefix.
+    # Built from parts so the literal tag survives in the test source verbatim.
+    ns = "antml" + ":"
+    leaked = f'Say yes or no.\n<{ns}parameter name="produces">{{"run": "run-21"'
+    cleaned = extract_text_from_stream(leaked)
+    assert cleaned == "Say yes or no."
+    assert "parameter" not in cleaned
+    assert "produces" not in cleaned
+
+
+def test_extract_text_leaves_clean_text_untouched() -> None:
+    assert extract_text_from_stream("A normal reply with < less-than but no tags.") == (
+        "A normal reply with < less-than but no tags."
+    )
+
+
 def test_codex_provider_builds_schema_arg_and_parses_jsonl(tmp_path: Path) -> None:
     captured: dict[str, object] = {}
 
