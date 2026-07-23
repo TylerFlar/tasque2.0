@@ -10,6 +10,7 @@ from typing import Any
 
 from sqlalchemy import select
 
+from tasque2 import android as android_device
 from tasque2 import result_inbox
 from tasque2.artifacts import ArtifactService, ArtifactStore
 from tasque2.db import session_scope
@@ -587,6 +588,153 @@ def weather_now(intent: str, days: int = 3) -> str:
     the season. days = how many forecast days to include (1-7).
     """
     return _run_json(lambda: {"ok": True, "weather": fetch_local_weather(days=days)}, intent=intent)
+
+
+def android_status(intent: str) -> str:
+    """Check the Android automation device: attached devices, screen size, lease.
+
+    Safe to call anytime (takes no lease). Reports the configured adb path and
+    serial, every attached device with its state, the screen dimensions, whether
+    the ADBKeyBoard IME (needed for non-ASCII typing) is installed, and who
+    currently holds the device lease. Start any device session here.
+    """
+    return _run_json(lambda: {"ok": True, "android": android_device.device_status()}, intent=intent)
+
+
+def android_reconnect(intent: str) -> str:
+    """(Re)establish the wireless adb link to the phone if it has dropped.
+
+    android_status already does this automatically at session start; call this
+    directly only to recover mid-session if a device action fails with a
+    connection error. Heals wifi blips and slept-phone drops; it cannot revive
+    the link after a phone reboot (that needs re-enabling Wireless Debugging /
+    adb tcpip per dating_ops).
+    """
+    return _run_json(
+        lambda: {"ok": True, "reconnect": android_device.ensure_connected()}, intent=intent
+    )
+
+
+def android_unlock(intent: str) -> str:
+    """Wake the Android device and dismiss the lock screen for a session.
+
+    Call this once at the start of any device session (right after
+    android_status), before launching apps. Wakes the screen and, if locked,
+    enters the configured PIN; a no-op if already unlocked. If it reports the
+    device still locked (or no PIN configured), stop the device work and ask
+    the user to unlock the phone by hand — do not keep retrying.
+    """
+    return _run_json(lambda: _android_action(lambda: android_device.unlock()))
+
+
+def android_screenshot(intent: str, label: str | None = None) -> str:
+    """Capture the Android device screen to a local PNG you can Read to see it.
+
+    Returns the file path plus pixel width/height — tap/swipe coordinates are
+    in this same pixel space. The loop for driving any app is: screenshot →
+    Read the path to view it → act (android_tap / android_swipe / android_type)
+    → screenshot again to verify the screen changed as expected. ``label`` goes
+    into the filename for later reference. To show the user a screenshot in
+    Discord, pass its path to image_save with send=true.
+    """
+    return _run_json(lambda: _android_action(lambda: android_device.take_screenshot(label)))
+
+
+def android_ui(intent: str, max_nodes: int = 120) -> str:
+    """Dump the current Android view hierarchy as labelled elements with centers.
+
+    Each node carries text / content-desc / resource-id, bounds, a ready-to-tap
+    ``center``, and whether it is clickable — use it to find exact coordinates
+    for buttons and fields instead of eyeballing the screenshot. Caveat: it
+    occasionally captures only an overlay and misses the content behind it; the
+    screenshot stays the source of truth.
+    """
+    return _run_json(lambda: _android_action(lambda: android_device.ui_dump(max_nodes=max_nodes)))
+
+
+def android_apps(intent: str, query: str | None = None) -> str:
+    """List installed Android package names, optionally filtered by substring.
+
+    Use once during setup to discover exact package names (e.g. query "hinge"
+    or "bumble") for android_launch; record them in a memory so future sessions
+    skip this call.
+    """
+    return _run_json(
+        lambda: {"ok": True, "packages": android_device.list_packages(query)}, intent=intent
+    )
+
+
+def android_tap(x: int, y: int) -> str:
+    """Tap the Android screen at pixel (x, y) in screenshot coordinates.
+
+    Verify with a fresh android_screenshot afterwards before chaining further
+    actions — never fire taps blind.
+    """
+    return _run_json(lambda: _android_action(lambda: android_device.tap(x, y) or {"tapped": [x, y]}))
+
+
+def android_swipe(x1: int, y1: int, x2: int, y2: int, duration_ms: int = 300) -> str:
+    """Swipe/drag on the Android screen from (x1, y1) to (x2, y2).
+
+    Longer duration_ms (500-800) reads as a deliberate drag (e.g. reordering);
+    short (150-300) as a scroll flick. Coordinates are screenshot pixels.
+    """
+    return _run_json(
+        lambda: _android_action(
+            lambda: android_device.swipe(x1, y1, x2, y2, duration_ms)
+            or {"swiped": [[x1, y1], [x2, y2]], "duration_ms": duration_ms}
+        )
+    )
+
+
+def android_type(text: str) -> str:
+    """Type text into the currently focused Android input field.
+
+    Tap the field first (cursor visible), then type. ASCII is typed directly;
+    newlines become ENTER presses. Non-ASCII (emoji, accents) requires the
+    ADBKeyBoard IME on the device — without it this errors instead of mangling
+    the text, so keep drafts ASCII unless android_status shows it installed.
+    Screenshot afterwards to confirm what actually landed in the field.
+    """
+    return _run_json(lambda: _android_action(lambda: android_device.type_text(text)))
+
+
+def android_key(key: str) -> str:
+    """Press one Android key: a name (back, home, enter, delete, tab, app_switch,
+    paste, dpad_up/down/left/right, page_up/page_down...) or a numeric keycode.
+
+    ``back`` dismisses keyboards/dialogs; ``home`` bails out of a broken flow
+    before relaunching the app.
+    """
+    return _run_json(
+        lambda: _android_action(lambda: {"keycode": android_device.press_key(key)})
+    )
+
+
+def android_launch(package: str, relaunch: bool = False) -> str:
+    """Launch an Android app by package name (see android_apps to find it).
+
+    relaunch=true force-stops the app first — the recovery move when an app is
+    wedged on an unexpected screen. After launching, screenshot to see where
+    the app actually opened.
+    """
+    return _run_json(
+        lambda: _android_action(
+            lambda: android_device.launch_app(package, relaunch=relaunch)
+            or {"launched": package, "relaunched": relaunch}
+        )
+    )
+
+
+def android_push_photo(path: str, name: str | None = None) -> str:
+    """Copy a local image onto the Android device so app photo pickers see it.
+
+    ``path`` is a local file (e.g. an artifact local_path from a photo the user
+    sent). Pushes to the device gallery and triggers a MediaStore scan; the
+    image then appears in the app's photo picker under Pictures/tasque. Returns
+    the device path.
+    """
+    return _run_json(lambda: _android_action(lambda: android_device.push_photo(path, name)))
 
 
 def system_status(intent: str) -> str:
@@ -1423,6 +1571,29 @@ def _resolve_workflow_definition(
     return definition
 
 
+def _android_action(action: Callable[[], dict[str, Any] | None]) -> dict[str, Any]:
+    """Run one device action under the single-device lease.
+
+    The lease is keyed by the calling work item (or "adhoc" outside one) and
+    hands over automatically when the holder finishes or goes stale, so a
+    reply-processor can pick up the device right after a session run ends.
+    """
+    with session_scope() as session:
+        caller = _calling_work_item(session)
+        owner = caller.id if caller is not None else "adhoc"
+
+        def _holder_running(holder: str) -> bool:
+            if holder == "adhoc":
+                return True
+            item = session.get(WorkItem, holder)
+            return bool(item is not None and item.status == "running")
+
+        android_device.ensure_lease(owner, is_owner_active=_holder_running)
+    result = action() or {}
+    result.setdefault("ok", True)
+    return result
+
+
 def _system_status() -> dict[str, Any]:
     with session_scope() as session:
         status = get_system_status(session)
@@ -1782,6 +1953,235 @@ def _slug(value: str) -> str:
     while "--" in cleaned:
         cleaned = cleaned.replace("--", "-")
     return cleaned.strip("-")[:60] or "item"
+
+
+def image_edit(
+    source: str,
+    label: str | None = None,
+    exposure: float = 0.0,
+    contrast: float = 0.0,
+    highlights: float = 0.0,
+    shadows: float = 0.0,
+    whites: float = 0.0,
+    blacks: float = 0.0,
+    temperature: float = 0.0,
+    tint: float = 0.0,
+    vibrance: float = 0.0,
+    saturation: float = 0.0,
+    clarity: float = 0.0,
+    sharpen: float = 0.0,
+    denoise: float = 0.0,
+    dehaze: float = 0.0,
+    grain: float = 0.0,
+    vignette: float = 0.0,
+    straighten: float = 0.0,
+    depth_of_field: dict[str, Any] | None = None,
+    auto: bool = False,
+    tags: list[str] | None = None,
+    work_item_id: str | None = None,
+    send: bool = False,
+) -> str:
+    """Edit a real photo in the darkroom -- non-generative, Lightroom/Camera-Raw style.
+
+    NOT AI generation: this only adjusts the pixels of an existing photo.
+    ``source`` is a local path or an artifact id. Every slider defaults to 0 (no
+    change); most take roughly -100..100, ``exposure`` is in stops (EV, ~-5..5),
+    ``straighten`` is degrees. Edits apply in photographic order regardless of
+    argument order, so you can pass several at once.
+
+    Tone: exposure, contrast, highlights, shadows, whites, blacks, dehaze.
+    Color: temperature (+warm / -cool), tint (+green / -magenta), vibrance
+    (boosts muted tones first), saturation. Detail: clarity (midtone local
+    contrast / "pop"), sharpen, denoise. Finish: grain, vignette (+darken /
+    -lighten edges), straighten. ``auto`` = auto-contrast + grey-world white
+    balance as a one-shot baseline. ``depth_of_field`` = {"focus": one of
+    center|top|bottom|left|right, "strength": 0-100} keeps the focus region
+    sharp and progressively blurs the rest (synthetic DoF / portrait background).
+
+    Saves the result as a NEW artifact (the original is never touched) and
+    returns its ``artifact_id`` + ``local_path`` + the list of ops that ran --
+    Read the local_path to see it, and iterate. Set ``send`` true to also queue
+    it to the Discord thread.
+    """
+    ops: dict[str, Any] = {
+        "exposure": exposure,
+        "contrast": contrast,
+        "highlights": highlights,
+        "shadows": shadows,
+        "whites": whites,
+        "blacks": blacks,
+        "temperature": temperature,
+        "tint": tint,
+        "vibrance": vibrance,
+        "saturation": saturation,
+        "clarity": clarity,
+        "sharpen": sharpen,
+        "denoise": denoise,
+        "dehaze": dehaze,
+        "grain": grain,
+        "vignette": vignette,
+        "straighten": straighten,
+        "depth_of_field": depth_of_field,
+        "auto": auto,
+    }
+    return _run_json(
+        lambda: _image_edit(
+            source=source,
+            label=label,
+            ops=ops,
+            tags=tags,
+            work_item_id=work_item_id,
+            send=send,
+        )
+    )
+
+
+def _image_edit(
+    *,
+    source: str,
+    label: str | None,
+    ops: dict[str, Any],
+    tags: list[str] | None,
+    work_item_id: str | None,
+    send: bool,
+) -> dict[str, Any]:
+    from io import BytesIO
+
+    from PIL import Image
+
+    from tasque2.imaging import edit_image
+
+    clean_tags = _string_list(tags)
+    if send and "discord_upload" not in clean_tags:
+        clean_tags.append("discord_upload")
+    with session_scope() as session:
+        src_path, src_id = _resolve_image_source(session, source)
+        with Image.open(src_path) as image:
+            edited, applied = edit_image(image, ops)
+        buffer = BytesIO()
+        edited.save(buffer, format="JPEG", quality=92)
+        data = buffer.getvalue()
+        title_stem = _slug(label) if label else src_path.stem
+        artifact = ArtifactStore().write_bytes(
+            session,
+            kind="image",
+            title=f"{title_stem}-edited.jpg",
+            content=data,
+            suffix=".jpg",
+            content_type="image/jpeg",
+            tags=clean_tags,
+            work_item_id=_optional_string(work_item_id),
+            source_kind="image_edit",
+            source_id=src_id,
+        )
+        return {
+            "ok": True,
+            "artifact_id": artifact.id,
+            "local_path": artifact.local_path,
+            "applied": applied,
+            "dimensions": list(edited.size),
+            "queued_for_discord": bool(send),
+            "hint": "Read local_path to view it; add artifact_id to produces.discord_upload_artifact_ids to send.",
+        }
+
+
+def photoshop_status(intent: str) -> str:
+    """Check whether Adobe Photoshop is reachable for a heavy edit (photoshop_edit).
+
+    Windows only, and Photoshop must already be OPEN. Returns availability plus
+    version and open-document count. If it's not available, use image_edit
+    instead or ask him to open Photoshop — never assume it's there.
+    """
+    from tasque2 import photoshop as _ps
+
+    return _run_json(lambda: {"ok": True, "photoshop": _ps.status()}, intent=intent)
+
+
+def photoshop_edit(
+    source: str,
+    script: str,
+    label: str | None = None,
+    quality: int = 11,
+    tags: list[str] | None = None,
+    work_item_id: str | None = None,
+    send: bool = False,
+) -> str:
+    """Run a real Photoshop (ExtendScript/JSX) edit on a photo — the heavy escalation above image_edit.
+
+    Use this only for edits image_edit's darkroom can't do: true lens blur /
+    background separation, Camera Raw grade, dodge/burn or frequency-separation
+    retouch, compositing, recorded actions. For routine exposure/contrast/white-
+    balance/crop, image_edit is faster and needs nothing running.
+
+    REQUIRES Photoshop to be open (check `photoshop_status` first; fall back to
+    image_edit if it's closed). ``script`` is an ExtendScript BODY with the
+    opened document bound to ``doc`` — e.g. ``doc.activeLayer.applyLensBlur(...)``
+    or Action-Manager ``executeAction(...)`` calls; do not open/save/close, the
+    wrapper does that and never overwrites the original. ``quality`` is the JPEG
+    export quality (0-12). Saves the result as a NEW artifact and returns its
+    ``artifact_id`` + ``local_path``; Read it to check the result. Keep edits
+    believable — the playbook still bans over-retouched / fake-looking photos.
+    """
+    return _run_json(
+        lambda: _photoshop_edit(
+            source=source,
+            script=script,
+            label=label,
+            quality=quality,
+            tags=tags,
+            work_item_id=work_item_id,
+            send=send,
+        )
+    )
+
+
+def _photoshop_edit(
+    *,
+    source: str,
+    script: str,
+    label: str | None,
+    quality: int,
+    tags: list[str] | None,
+    work_item_id: str | None,
+    send: bool,
+) -> dict[str, Any]:
+    import tempfile
+
+    from tasque2 import photoshop as ps
+
+    clean_tags = _string_list(tags)
+    if send and "discord_upload" not in clean_tags:
+        clean_tags.append("discord_upload")
+    with session_scope() as session:
+        src_path, src_id = _resolve_image_source(session, source)
+        handle = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
+        handle.close()
+        tmp = Path(handle.name)
+        try:
+            ps.edit_file(src_path, tmp, script, quality=quality)
+            title_stem = _slug(label) if label else src_path.stem
+            artifact = ArtifactStore().capture_file(
+                session,
+                path=tmp,
+                kind="image",
+                title=f"{title_stem}-ps.jpg",
+                tags=clean_tags,
+                work_item_id=_optional_string(work_item_id),
+                source_kind="photoshop_edit",
+                source_id=src_id,
+            )
+        finally:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+        return {
+            "ok": True,
+            "artifact_id": artifact.id,
+            "local_path": artifact.local_path,
+            "queued_for_discord": bool(send),
+            "hint": "Read local_path to view it; add artifact_id to produces.discord_upload_artifact_ids to send.",
+        }
 
 
 def _resolve_image_source(session: Any, source: str) -> tuple[Path, str | None]:

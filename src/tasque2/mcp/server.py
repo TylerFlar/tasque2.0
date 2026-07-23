@@ -55,6 +55,9 @@ def build_server():
     mcp.tool()(tools.image_find)
     mcp.tool()(tools.image_send)
     mcp.tool()(tools.image_compose)
+    mcp.tool()(tools.image_edit)
+    mcp.tool()(tools.photoshop_status)
+    mcp.tool()(tools.photoshop_edit)
 
     mcp.tool()(tools.work_enqueue)
     mcp.tool()(tools.work_list)
@@ -77,6 +80,19 @@ def build_server():
     mcp.tool()(tools.workflow_start)
 
     mcp.tool()(tools.weather_now)
+
+    mcp.tool()(tools.android_status)
+    mcp.tool()(tools.android_reconnect)
+    mcp.tool()(tools.android_unlock)
+    mcp.tool()(tools.android_screenshot)
+    mcp.tool()(tools.android_ui)
+    mcp.tool()(tools.android_apps)
+    mcp.tool()(tools.android_tap)
+    mcp.tool()(tools.android_swipe)
+    mcp.tool()(tools.android_type)
+    mcp.tool()(tools.android_key)
+    mcp.tool()(tools.android_launch)
+    mcp.tool()(tools.android_push_photo)
 
     mcp.tool()(tools.system_status)
     mcp.tool()(tools.submit_worker_result)

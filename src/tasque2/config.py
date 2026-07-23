@@ -30,6 +30,13 @@ class Settings(BaseSettings):
     weather_latitude: float = Field(default=32.7157)
     weather_longitude: float = Field(default=-117.1611)
     weather_location_label: str = Field(default="San Diego, CA")
+    # Android device automation (adb) for app-only surfaces; see tasque2.android.
+    # Serial only matters with multiple attached devices (e.g. 127.0.0.1:5555 for
+    # an emulator, or <ip>:5555 for a wireless phone). Unlock PIN (digits only)
+    # enables scripted lock-screen entry; leave blank to require manual unlock.
+    android_adb_path: str = Field(default="adb")
+    android_serial: str | None = Field(default=None)
+    android_unlock_pin: str | None = Field(default=None)
     discord_token: str | None = Field(default=None)
     discord_intake_channel_id: str | None = Field(default=None)
     discord_ops_channel_id: str | None = Field(default=None)
