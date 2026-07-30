@@ -28,6 +28,17 @@ from tasque2.repo import WorkRepository
 from tasque2.templates import read_template_file
 from tasque2.workflows import WorkflowService
 
+# A long worker reply is posted as several Discord messages (the 1900-char split), and
+# each one is stored as its own row. Counting rows meant a chatty worker's last two
+# replies could fill the whole window: it then read mostly its own prose, lost the
+# user's older turns entirely, and mirrored the length back. The window is counted in
+# logical messages instead — chunks of one reply collapse into one — and bounded by a
+# character budget so history stays wide and cheap.
+CONVERSATION_MESSAGE_LIMIT = 20
+CONVERSATION_MESSAGE_MAX_CHARS = 1_800
+CONVERSATION_TOTAL_MAX_CHARS = 16_000
+_CONVERSATION_ROW_FETCH_CAP = 240
+
 
 @dataclass(frozen=True)
 class DiscordAttachmentPayload:
@@ -863,7 +874,7 @@ class DiscordService:
         discord_thread_id: str | None,
         current_discord_message_id: str,
         referenced_discord_message_id: str | None,
-        limit: int = 20,
+        limit: int = CONVERSATION_MESSAGE_LIMIT,
     ) -> dict[str, Any]:
         return {
             "scope": "thread" if discord_thread_id else "channel",
@@ -885,7 +896,10 @@ class DiscordService:
         discord_thread_id: str | None,
         limit: int,
     ) -> list[dict[str, Any]]:
-        statement = select(DiscordMessage).order_by(DiscordMessage.created_at.desc()).limit(limit)
+        # Over-fetch rows so `limit` can be spent on logical messages after the chunks
+        # of each split reply are folded back together.
+        fetch = min(max(limit, 1) * 12, _CONVERSATION_ROW_FETCH_CAP)
+        statement = select(DiscordMessage).order_by(DiscordMessage.created_at.desc()).limit(fetch)
         if discord_thread_id:
             statement = statement.where(DiscordMessage.discord_thread_id == discord_thread_id)
         else:
@@ -894,7 +908,7 @@ class DiscordService:
                 DiscordMessage.discord_thread_id.is_(None),
             )
         rows = list(reversed(self.session.scalars(statement).all()))
-        return [_message_context(message) for message in rows]
+        return collapse_conversation([_message_context(message) for message in rows], limit=limit)
 
     def _parent_reply_context(self, work_item: WorkItem) -> dict[str, Any]:
         latest_attempt = self._latest_attempt(work_item.id)
@@ -1213,6 +1227,66 @@ def _message_context(message: DiscordMessage) -> dict[str, Any]:
         "workflow_run_id": message.workflow_run_id,
         "created_at": message.created_at.isoformat(),
     }
+
+
+def collapse_conversation(
+    messages: Sequence[dict[str, Any]],
+    *,
+    limit: int = CONVERSATION_MESSAGE_LIMIT,
+    max_chars_per_message: int = CONVERSATION_MESSAGE_MAX_CHARS,
+    total_max_chars: int = CONVERSATION_TOTAL_MAX_CHARS,
+) -> list[dict[str, Any]]:
+    """Fold a chronological transcript into a bounded window of logical messages.
+
+    Consecutive outbound rows produced by the same work item are one reply that
+    Discord's length limit split, so they rejoin into a single entry carrying a
+    ``parts`` count. The newest ``limit`` entries survive, each capped at
+    ``max_chars_per_message`` and the window as a whole at ``total_max_chars``,
+    dropping oldest first — a worker that writes at length loses its own tail, never
+    the user's turns.
+    """
+    grouped: list[dict[str, Any]] = []
+    for message in messages:
+        previous = grouped[-1] if grouped else None
+        if previous is not None and _is_same_reply(previous, message):
+            previous["content"] = f"{previous['content']}\n\n{message.get('content') or ''}".strip()
+            previous["parts"] = int(previous.get("parts", 1)) + 1
+            previous["last_discord_message_id"] = message.get("discord_message_id")
+            previous["created_at"] = message.get("created_at") or previous.get("created_at")
+            continue
+        grouped.append({**message, "content": str(message.get("content") or ""), "parts": 1})
+
+    window = grouped[-limit:] if limit > 0 else []
+    for entry in window:
+        entry["content"] = _truncate_message_content(entry["content"], max_chars_per_message)
+
+    kept: list[dict[str, Any]] = []
+    budget = total_max_chars
+    for entry in reversed(window):
+        cost = len(entry["content"])
+        if kept and cost > budget:
+            break  # stop at the budget rather than skipping past it: the window stays contiguous
+        budget -= cost
+        kept.append(entry)
+    return list(reversed(kept))
+
+
+def _is_same_reply(previous: dict[str, Any], message: dict[str, Any]) -> bool:
+    """True when ``message`` is another chunk of the reply ``previous`` started."""
+    work_item_id = message.get("work_item_id")
+    return bool(
+        work_item_id
+        and message.get("direction") == "outbound"
+        and previous.get("direction") == "outbound"
+        and previous.get("work_item_id") == work_item_id
+    )
+
+
+def _truncate_message_content(content: str, max_chars: int) -> str:
+    if max_chars <= 0 or len(content) <= max_chars:
+        return content
+    dropped = len(content) - max_chars
+    return f"{content[:max_chars].rstrip()}\n… [trimmed {dropped} chars]"
 
 
 def _optional_string(value: Any) -> str | None:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import tempfile
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -47,6 +48,12 @@ WORKFLOW_WORK_EVENT_TYPES = {
     "work.succeeded",
 }
 DISCORD_MESSAGE_LIMIT = 1900
+# Discord's default per-file upload cap is 10 MiB and error 40005 (413) on breach is
+# fatal to the message, so stay under it with multipart headroom and bound the whole
+# request. Oversized images get re-encoded; anything else is dropped with a note.
+DISCORD_MAX_FILE_BYTES = 9_500_000
+DISCORD_MAX_REQUEST_BYTES = 24_000_000
+_SHRINKABLE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff"}
 
 
 @dataclass(frozen=True)
@@ -66,6 +73,94 @@ class DiscordFileUpload:
     path: str
     filename: str | None = None
     artifact_id: str | None = None
+
+
+def _shrink_image_for_discord(path: Path, *, max_bytes: int) -> Path | None:
+    """Re-encode an oversized image as a JPEG under ``max_bytes``; None if it can't."""
+    try:
+        from PIL import Image
+    except ImportError:
+        return None
+    try:
+        with Image.open(path) as source:
+            image = source.convert("RGB")
+    except Exception:  # noqa: BLE001 - unreadable/corrupt image just gets dropped
+        return None
+    handle = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
+    handle.close()
+    target = Path(handle.name)
+    quality = 88
+    for _ in range(8):
+        image.save(target, format="JPEG", quality=quality, optimize=True)
+        if target.stat().st_size <= max_bytes:
+            return target
+        if quality > 55:
+            quality -= 12
+        else:
+            width, height = image.size
+            if min(width, height) < 320:
+                break
+            image = image.resize((max(1, int(width * 0.75)), max(1, int(height * 0.75))))
+    try:
+        target.unlink()
+    except OSError:
+        pass
+    return None
+
+
+def prepare_discord_uploads(
+    attachments: Sequence[DiscordFileUpload],
+    *,
+    max_file_bytes: int = DISCORD_MAX_FILE_BYTES,
+    max_request_bytes: int = DISCORD_MAX_REQUEST_BYTES,
+) -> tuple[list[DiscordFileUpload], list[str], list[Path]]:
+    """Fit uploads under Discord's payload caps; returns (sendable, notes, temp_paths).
+
+    Oversized images are re-encoded to JPEG under the per-file cap; anything still
+    too big (or unreadable) is dropped with a note, as are files past the cumulative
+    request budget. Callers unlink the returned temp paths after sending. A 413 must
+    never reach Discord — it dead-ends the message and can take the output loop with
+    it.
+    """
+    sendable: list[DiscordFileUpload] = []
+    notes: list[str] = []
+    temps: list[Path] = []
+    total = 0
+    for upload in list(attachments)[:10]:
+        path = Path(upload.path)
+        display = upload.filename or path.name
+        try:
+            size = path.stat().st_size
+        except OSError:
+            notes.append(f"attachment unavailable: {display}")
+            continue
+        if size > max_file_bytes:
+            shrunk = None
+            if path.suffix.lower() in _SHRINKABLE_SUFFIXES:
+                shrunk = _shrink_image_for_discord(path, max_bytes=max_file_bytes)
+            if shrunk is None:
+                notes.append(
+                    f"{display} ({size / 1_000_000:.1f} MB) exceeds Discord's upload cap — "
+                    f"kept as artifact {upload.artifact_id or upload.path}"
+                )
+                continue
+            temps.append(shrunk)
+            size = shrunk.stat().st_size
+            upload = DiscordFileUpload(
+                path=str(shrunk),
+                filename=(Path(display).stem or "image") + ".jpg",
+                artifact_id=upload.artifact_id,
+            )
+            notes.append(f"{display} downscaled to fit Discord's upload cap")
+        if total + size > max_request_bytes:
+            notes.append(
+                f"{display} skipped (message attachment budget) — "
+                f"kept as artifact {upload.artifact_id or upload.path}"
+            )
+            continue
+        total += size
+        sendable.append(upload)
+    return sendable, notes, temps
 
 
 class DiscordOutputGateway(Protocol):
@@ -225,11 +320,31 @@ class DiscordPyOutputGateway:
         channel = self.client.get_channel(int(channel_id))
         if channel is None:
             channel = await self.client.fetch_channel(int(channel_id))
-        files = [
-            discord.File(upload.path, filename=upload.filename)
-            for upload in list(attachments or [])[:10]
-        ]
-        message = await channel.send(content[:1900], view=view, files=files or None)
+        uploads, notes, temp_paths = prepare_discord_uploads(attachments or [])
+        body = content[:DISCORD_MESSAGE_LIMIT]
+        if notes:
+            body = (content + "\n" + " · ".join(notes))[:DISCORD_MESSAGE_LIMIT]
+        try:
+            files = [discord.File(upload.path, filename=upload.filename) for upload in uploads]
+            try:
+                message = await channel.send(body, view=view, files=files or None)
+            except discord.HTTPException as exc:
+                # Belt-and-braces: if a payload still 413s, the message must not
+                # become poison — deliver the text and point at the artifacts.
+                if not files or (getattr(exc, "status", None) != 413 and getattr(exc, "code", None) != 40005):
+                    raise
+                fallback = (
+                    content + "\n(attachments exceeded Discord's upload limit — kept as artifacts: "
+                    + ", ".join(upload.artifact_id or upload.path for upload in uploads)
+                    + ")"
+                )[:DISCORD_MESSAGE_LIMIT]
+                message = await channel.send(fallback, view=view)
+        finally:
+            for tmp in temp_paths:
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
         return DiscordSentMessage(message_id=str(message.id), channel_id=str(channel.id))
 
     async def send_embed(

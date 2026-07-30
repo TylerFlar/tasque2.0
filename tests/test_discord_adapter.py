@@ -6,7 +6,11 @@ from sqlalchemy import select
 
 from tasque2.artifacts import ArtifactStore
 from tasque2.db import session_scope
-from tasque2.discord_adapter import DiscordAttachmentPayload, DiscordService
+from tasque2.discord_adapter import (
+    DiscordAttachmentPayload,
+    DiscordService,
+    collapse_conversation,
+)
 from tasque2.models import (
     Artifact,
     DiscordMessage,
@@ -604,3 +608,141 @@ def test_discord_reply_followup_carries_parent_reply_config_forward(fresh_db: Pa
         assert followup is not None
         assert followup.context["reply_followup_work"]["title"] == "Finance manager reply"
         assert followup.context["reply_memory"]["namespace"] == "finance"
+
+
+def _conversation_row(
+    message_id: str,
+    *,
+    direction: str,
+    content: str,
+    work_item_id: str | None = None,
+) -> dict[str, object]:
+    return {
+        "discord_message_id": message_id,
+        "direction": direction,
+        "author": "tasque" if direction == "outbound" else "user",
+        "content": content,
+        "work_item_id": work_item_id,
+        "created_at": f"2026-07-25T00:00:{int(message_id.split('-')[-1]):02d}",
+    }
+
+
+def test_collapse_conversation_folds_chunked_reply_into_one_message() -> None:
+    rows = [
+        _conversation_row("in-1", direction="inbound", content="what should I cook"),
+        *[
+            _conversation_row(
+                f"out-{index}", direction="outbound", content=f"part {index}", work_item_id="w1"
+            )
+            for index in range(2, 8)
+        ],
+        _conversation_row("in-8", direction="inbound", content="just the recipe please"),
+        _conversation_row("out-9", direction="outbound", content="here it is", work_item_id="w2"),
+    ]
+
+    collapsed = collapse_conversation(rows, limit=20)
+
+    assert [message["discord_message_id"] for message in collapsed] == ["in-1", "out-2", "in-8", "out-9"]
+    assert collapsed[1]["parts"] == 6
+    assert collapsed[1]["last_discord_message_id"] == "out-7"
+    assert collapsed[1]["content"] == "\n\n".join(f"part {index}" for index in range(2, 8))
+    assert collapsed[0]["parts"] == 1
+
+
+def test_collapse_conversation_keeps_user_turns_when_worker_is_verbose() -> None:
+    rows = []
+    for turn in range(1, 4):
+        rows.append(_conversation_row(f"in-{turn}0", direction="inbound", content=f"ask {turn}"))
+        rows.extend(
+            _conversation_row(
+                f"out-{turn}{chunk}",
+                direction="outbound",
+                content="x" * 1900,
+                work_item_id=f"w{turn}",
+            )
+            for chunk in range(1, 9)
+        )
+
+    collapsed = collapse_conversation(rows, limit=4)
+
+    # One verbose reply no longer evicts the user's turns from the window.
+    assert [message["direction"] for message in collapsed] == [
+        "inbound",
+        "outbound",
+        "inbound",
+        "outbound",
+    ]
+    assert [message["content"] for message in collapsed if message["direction"] == "inbound"] == [
+        "ask 2",
+        "ask 3",
+    ]
+
+
+def test_collapse_conversation_truncates_long_messages_and_holds_a_budget() -> None:
+    rows = [
+        _conversation_row(f"out-{index}", direction="outbound", content="y" * 5_000, work_item_id=f"w{index}")
+        for index in range(1, 6)
+    ]
+
+    collapsed = collapse_conversation(rows, limit=5, max_chars_per_message=1_000, total_max_chars=2_500)
+
+    assert [message["discord_message_id"] for message in collapsed] == ["out-4", "out-5"]
+    assert all(message["content"].endswith("[trimmed 4000 chars]") for message in collapsed)
+    assert sum(len(message["content"]) for message in collapsed) <= 2_500
+
+
+def test_discord_thread_reply_conversation_window_counts_logical_messages(fresh_db: Path) -> None:
+    with session_scope() as session:
+        work = WorkRepository(session).create_work_item(
+            title="Cooking chef",
+            task_instruction="Be the chef.",
+            worker_kind="provider.fake",
+            context={
+                "memory_namespace": "cooking",
+                "reply_followup_work": {"enabled": True, "title": "Cooking chef reply"},
+            },
+            discord_thread_id="thread-cooking",
+        )
+        service = DiscordService(session)
+        service.bind_thread(
+            purpose="work",
+            discord_channel_id="jobs",
+            discord_thread_id="thread-cooking",
+            work_item_id=work.id,
+        )
+        service.record_message(
+            discord_message_id="in-old",
+            discord_channel_id="thread-cooking",
+            discord_thread_id="thread-cooking",
+            direction="inbound",
+            author="user",
+            content_preview="what should I cook",
+        )
+        for chunk in range(30):
+            service.record_message(
+                discord_message_id=f"out-{chunk}",
+                discord_channel_id="thread-cooking",
+                discord_thread_id="thread-cooking",
+                direction="outbound",
+                author="tasque",
+                content_preview=f"chunk {chunk}",
+                work_item_id=work.id,
+            )
+
+        service.handle_thread_reply(
+            discord_message_id="reply-cooking",
+            discord_channel_id="thread-cooking",
+            discord_thread_id="thread-cooking",
+            author="user",
+            content="shorter please",
+        )
+
+        followup = session.scalar(select(WorkItem).where(WorkItem.source_id == "reply-cooking"))
+        assert followup is not None
+        recent = followup.context["conversation"]["recent_messages"]
+        assert [message["discord_message_id"] for message in recent] == [
+            "in-old",
+            "out-0",
+            "reply-cooking",
+        ]
+        assert recent[1]["parts"] == 30

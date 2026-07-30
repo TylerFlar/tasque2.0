@@ -25,6 +25,35 @@ class ScoredMemory:
 _FTS_TOKEN_RE = re.compile(r"[\w]+", re.UNICODE)
 _FTS_OPERATOR_WORDS = {"and", "or", "not", "near"}
 
+# A canonical doc can declare its own size budget with a marker line. Pointer and state
+# docs that only *asked* in prose to stay small ("small pointer record only") grew to
+# tens of kilobytes anyway — every run reads the doc, adds to it, and hands the next run
+# more to re-emit. The marker makes the limit a fact the write path can check, and it
+# travels with the document, so no central registry has to know about a worker's keys.
+CANONICAL_BUDGET_RE = re.compile(r"<!--\s*tasque:max_chars\s*=\s*(\d{2,7})\s*-->")
+
+
+class MemoryBudgetExceeded(ValueError):
+    """A canonical write is larger than the budget its document declares."""
+
+    def __init__(self, *, canonical_key: str, size: int, max_chars: int) -> None:
+        self.canonical_key = canonical_key
+        self.size = size
+        self.max_chars = max_chars
+        super().__init__(
+            f"{canonical_key} is {size} characters against its declared budget of {max_chars}. "
+            "This document is a pointer, not a record: compact it — drop what is stale, move "
+            "detail into the ledger that owns it, and keep the marker line — then write again."
+        )
+
+
+def canonical_budget(content: str | None) -> int | None:
+    """The ``<!-- tasque:max_chars=N -->`` budget a document declares, if any."""
+    if not content:
+        return None
+    match = CANONICAL_BUDGET_RE.search(content)
+    return int(match.group(1)) if match else None
+
 
 class MemoryService:
     def __init__(self, session: Session) -> None:
@@ -269,8 +298,15 @@ class MemoryService:
         work_item_id: str | None = None,
         pinned: bool = False,
         ttl_days: int | None = None,
+        allow_over_budget: bool = False,
     ) -> Memory:
         old = self.get_canonical(namespace=namespace, canonical_key=canonical_key)
+        content = self._enforce_canonical_budget(
+            canonical_key=canonical_key,
+            content=content,
+            previous=old.content if old is not None else None,
+            allow_over_budget=allow_over_budget,
+        )
         new = self.create_memory(
             namespace=namespace,
             kind=kind,
@@ -295,6 +331,37 @@ class MemoryService:
                 payload={"superseded_by": new.id, "canonical_key": canonical_key},
             )
         return new
+
+    def _enforce_canonical_budget(
+        self,
+        *,
+        canonical_key: str,
+        content: str,
+        previous: str | None,
+        allow_over_budget: bool = False,
+    ) -> str:
+        """Hold a canonical document to the budget it (or its predecessor) declares.
+
+        The marker is carried forward when a rewrite drops it, so a worker cannot free
+        itself from the cap by omitting the line — deliberately raising a budget means
+        writing a new marker, which is a visible edit. ``allow_over_budget`` exists for
+        the migration that first attaches a budget to a document already past it; the
+        packet then asks its worker to compact it on the next run.
+        """
+        declared = canonical_budget(content)
+        inherited = canonical_budget(previous)
+        if declared is None and inherited is not None:
+            content = f"{content.rstrip()}\n\n<!-- tasque:max_chars={inherited} -->\n"
+            declared = inherited
+        if declared is None or allow_over_budget:
+            return content
+        if len(content) > declared:
+            raise MemoryBudgetExceeded(
+                canonical_key=canonical_key,
+                size=len(content),
+                max_chars=declared,
+            )
+        return content
 
     def archive_memory(self, memory_id: str) -> Memory:
         memory = self._get_memory(memory_id)

@@ -2,13 +2,15 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 from sqlalchemy import select
 
 from tasque2.artifacts import ArtifactStore
 from tasque2.db import session_scope
-from tasque2.memory import MemoryService
+from tasque2.memory import MemoryBudgetExceeded, MemoryService, canonical_budget
 from tasque2.memory_ingest import MemoryIngestService
 from tasque2.models import Memory
+from tasque2.worker_context import _memory_data
 
 
 def test_memory_create_and_search_by_text_namespace_and_tag(fresh_db: Path) -> None:
@@ -211,3 +213,109 @@ def test_memory_canonical_upsert_archives_previous_value(fresh_db: Path) -> None
         ).id == new.id
         assert session.get(Memory, old.id).archived_at is not None
         assert session.get(Memory, old.id).superseded_by == new.id
+
+
+def test_canonical_budget_refuses_oversized_write(fresh_db: Path) -> None:
+    with session_scope() as session:
+        service = MemoryService(session)
+        service.upsert_canonical(
+            namespace="health",
+            canonical_key="health_state",
+            kind="summary",
+            content="last_run: 2026-07-24\n\n<!-- tasque:max_chars=200 -->\n",
+        )
+
+        with pytest.raises(MemoryBudgetExceeded) as excinfo:
+            service.upsert_canonical(
+                namespace="health",
+                canonical_key="health_state",
+                kind="summary",
+                content="x" * 500 + "\n<!-- tasque:max_chars=200 -->\n",
+            )
+
+        assert excinfo.value.max_chars == 200
+        assert "compact it" in str(excinfo.value)
+        # The rejected write leaves the previous document standing.
+        current = service.get_canonical(namespace="health", canonical_key="health_state")
+        assert current.content.startswith("last_run: 2026-07-24")
+
+
+def test_canonical_budget_is_carried_forward_when_a_rewrite_drops_the_marker(fresh_db: Path) -> None:
+    with session_scope() as session:
+        service = MemoryService(session)
+        service.upsert_canonical(
+            namespace="career",
+            canonical_key="career_state",
+            kind="summary",
+            content="pointer\n\n<!-- tasque:max_chars=300 -->\n",
+        )
+
+        rewritten = service.upsert_canonical(
+            namespace="career",
+            canonical_key="career_state",
+            kind="summary",
+            content="a fresh pointer with no marker",
+        )
+        assert canonical_budget(rewritten.content) == 300
+
+        with pytest.raises(MemoryBudgetExceeded):
+            service.upsert_canonical(
+                namespace="career",
+                canonical_key="career_state",
+                kind="summary",
+                content="y" * 400,
+            )
+
+
+def test_canonical_writes_without_a_marker_are_unbounded(fresh_db: Path) -> None:
+    with session_scope() as session:
+        service = MemoryService(session)
+        memory = service.upsert_canonical(
+            namespace="cooking",
+            canonical_key="cooking_library",
+            kind="summary",
+            content="z" * 40_000,
+        )
+        assert len(memory.content) == 40_000
+        assert canonical_budget(memory.content) is None
+
+
+def test_canonical_budget_migration_can_attach_a_marker_to_an_oversized_doc(fresh_db: Path) -> None:
+    with session_scope() as session:
+        service = MemoryService(session)
+        service.upsert_canonical(
+            namespace="career",
+            canonical_key="career_state",
+            kind="summary",
+            content="w" * 5_000,
+        )
+
+        migrated = service.upsert_canonical(
+            namespace="career",
+            canonical_key="career_state",
+            kind="summary",
+            content="w" * 5_000 + "\n<!-- tasque:max_chars=800 -->\n",
+            allow_over_budget=True,
+        )
+        assert canonical_budget(migrated.content) == 800
+
+        # The worker's next packet asks it to compact, and an uncompacted write is refused.
+        delivered = _memory_data(migrated)
+        assert delivered["over_budget"] is True
+        assert "compact it" in delivered["compact_this_run"] or "Rewrite it" in delivered["compact_this_run"]
+        with pytest.raises(MemoryBudgetExceeded):
+            service.upsert_canonical(
+                namespace="career",
+                canonical_key="career_state",
+                kind="summary",
+                content="w" * 4_000,
+            )
+        # A compacted rewrite lands.
+        compacted = service.upsert_canonical(
+            namespace="career",
+            canonical_key="career_state",
+            kind="summary",
+            content="pointer only\n<!-- tasque:max_chars=800 -->\n",
+        )
+        assert canonical_budget(compacted.content) == 800
+        assert "over_budget" not in _memory_data(compacted)

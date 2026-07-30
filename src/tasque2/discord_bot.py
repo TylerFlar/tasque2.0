@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import dataclass
 
 import discord
@@ -14,7 +15,19 @@ from tasque2.discord_ui import DiscordUIService, is_modal_action, parse_custom_i
 from tasque2.migrations import upgrade_database
 from tasque2.models import WorkItem, utc_now
 
+logger = logging.getLogger(__name__)
+
 TYPING_WORK_STATUSES = {"ready", "running", "cancel_requested"}
+# Route actions whose entity_id is a WorkItem the user is now waiting on. A thread bound
+# to a workflow run answers with its own action, and it was missing here: replies to
+# those threads queued work and ran normally but showed no typing indicator, which reads
+# as the message never landing. `workflow_reply_recorded` stays out — its entity is the
+# run, not a work item, so there is nothing to poll.
+TYPING_RESULT_ACTIONS = {
+    "work_queued",
+    "work_reply_recorded",
+    "workflow_reply_followup_recorded",
+}
 
 
 @dataclass(frozen=True)
@@ -188,7 +201,7 @@ def _run_daemon_once(
 
 
 def _start_typing_for_result(client: discord.Client, channel, result) -> None:
-    if result.action not in {"work_queued", "work_reply_recorded"} or result.entity_id is None:
+    if result.action not in TYPING_RESULT_ACTIONS or result.entity_id is None:
         return
     client.loop.create_task(_typing_until_work_done(channel, result.entity_id))
 
@@ -268,15 +281,18 @@ async def _output_loop(client: discord.Client) -> None:
     gateway = DiscordPyOutputGateway(client)
     await client.wait_until_ready()
     while not client.is_closed():
-        with session_scope() as session:
-            await DiscordOutputService(session).post_pending_updates(
-                parent_channel_id=channels.ops,
-                gateway=gateway,
-                ops_channel_id=channels.ops,
-                jobs_channel_id=channels.jobs,
-                chains_channel_id=channels.chains,
-                dlq_channel_id=channels.dlq,
-            )
+        try:
+            with session_scope() as session:
+                await DiscordOutputService(session).post_pending_updates(
+                    parent_channel_id=channels.ops,
+                    gateway=gateway,
+                    ops_channel_id=channels.ops,
+                    jobs_channel_id=channels.jobs,
+                    chains_channel_id=channels.chains,
+                    dlq_channel_id=channels.dlq,
+                )
+        except Exception:  # noqa: BLE001 - one bad payload must never kill Discord output
+            logger.exception("Discord output pass failed; retrying next poll")
         await asyncio.sleep(settings.discord_output_poll_seconds)
 
 

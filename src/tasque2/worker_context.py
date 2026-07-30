@@ -8,7 +8,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from tasque2.extensions import registry as extension_registry
-from tasque2.memory import MemoryService
+from tasque2.memory import MemoryService, canonical_budget
 from tasque2.models import (
     Artifact,
     Memory,
@@ -28,6 +28,11 @@ logger = logging.getLogger(__name__)
 # relevance-excerpted (see tasque2.retrieval) rather than sliced.
 MEMORY_CONTEXT_CONTENT_CHARS = 2000
 MEMORY_CONTEXT_PINNED_CHARS = 12000
+# Ceiling on what a document can buy itself by declaring a budget. A doctrine doc worth
+# 20k arrives whole; nothing can opt a 200k ledger into the packet by writing a marker.
+MEMORY_CONTEXT_DECLARED_MAX_CHARS = 32000
+# Search hits carried beyond a worker's pinned canonical set (see adaptive_memory_limit).
+MEMORY_SEARCH_HEADROOM = 5
 
 
 class WorkerContextBuilder:
@@ -446,7 +451,10 @@ def render_provider_prompt(
                 "single line — update or delete the specific item instead. Set a 1-5 importance on "
                 "facts that should rank highly in future recall.\n"
                 "- Use memory_upsert_canonical only for genuinely single-state summaries that stay "
-                "small (a short pointer or profile), never as an ever-growing ledger.\n"
+                "small (a short pointer or profile), never as an ever-growing ledger. A document "
+                "carrying a `<!-- tasque:max_chars=N -->` marker is capped at N characters: the "
+                "write is refused above it, and the marker travels with the document, so compact "
+                "the content instead of raising the number.\n"
                 "- Use memory_ingest_text or memory_ingest_artifact when a text source, report, "
                 "uploaded file, or useful local document should become searchable context.\n"
                 "- Use todo_write for lightweight multi-step coordination state when a worker needs "
@@ -505,6 +513,26 @@ def render_provider_prompt(
             "## Context Packet JSON\n" + render_worker_context_packet(context_packet),
         ]
     )
+
+
+def adaptive_memory_limit(context: dict[str, Any] | None) -> int | None:
+    """How many memories this worker's packet should carry, from what it pinned.
+
+    Canonical keys are the documents a worker declared it needs; everything after them
+    is a ranked search tail. A flat cap spends the remainder on whatever the queries
+    happen to surface — for a long-lived thread worker that is mostly its own history
+    arriving a second time, beside the conversation window. Sizing the packet as
+    "the pinned set plus a handful" keeps the tail useful without letting it dominate.
+
+    ``None`` means "no opinion, use the default": either nothing was pinned, or the
+    context force-loads whole memory kinds, which must not be truncated.
+    """
+    if not isinstance(context, dict) or context.get("memory_kinds"):
+        return None
+    specs = _memory_canonical_specs(context, _context_memory_namespaces(context))
+    if not specs:
+        return None
+    return len(specs) + MEMORY_SEARCH_HEADROOM
 
 
 def _context_memory_kinds(context: dict[str, Any]) -> list[str]:
@@ -736,6 +764,12 @@ def _artifact_data(artifact: Artifact) -> dict[str, Any]:
 def _memory_data(memory: Memory, *, query: str = "") -> dict[str, Any]:
     is_durable = memory.pinned or bool(memory.canonical_key)
     budget = MEMORY_CONTEXT_PINNED_CHARS if is_durable else MEMORY_CONTEXT_CONTENT_CHARS
+    # A declared budget is a promise about size, so it buys delivery in full: rules a
+    # worker must obey cannot be relevance-excerpted, or which rules apply silently
+    # depends on the query. The marker caps what that costs.
+    declared = canonical_budget(memory.content)
+    if declared is not None and declared <= MEMORY_CONTEXT_DECLARED_MAX_CHARS:
+        budget = max(budget, declared)
     # Logs/state accrete newest-last, so bias durable docs toward recent sections.
     position_bias = 0.5 if is_durable else 0.0
     content, trimmed = select_relevant_excerpt(
@@ -744,7 +778,7 @@ def _memory_data(memory: Memory, *, query: str = "") -> dict[str, Any]:
         budget_chars=budget,
         position_bias=position_bias,
     )
-    return {
+    data = {
         "id": memory.id,
         "namespace": memory.namespace,
         "kind": memory.kind,
@@ -755,6 +789,19 @@ def _memory_data(memory: Memory, *, query: str = "") -> dict[str, Any]:
         "work_item_id": memory.work_item_id,
         "pinned": memory.pinned,
     }
+    max_chars = canonical_budget(memory.content)
+    if max_chars is not None:
+        data["max_chars"] = max_chars
+        if len(memory.content) > max_chars:
+            # Only reachable for a document that grew before it declared a budget: the
+            # write path refuses oversized writes. Say so where the worker will see it.
+            data["over_budget"] = True
+            data["compact_this_run"] = (
+                f"{memory.canonical_key} is {len(memory.content)} characters against its "
+                f"{max_chars} budget. Rewrite it inside the budget this run: drop what is "
+                "stale, move detail into the ledger that owns it, keep the marker line."
+            )
+    return data
 
 
 def _event_data(event: WorkEvent) -> dict[str, Any]:

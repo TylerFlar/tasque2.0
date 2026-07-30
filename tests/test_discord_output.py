@@ -790,3 +790,72 @@ def _post_pending(service: DiscordOutputService, gateway: FakeDiscordOutputGatew
             dlq_channel_id="dlq",
         )
     )
+
+
+def test_prepare_discord_uploads_size_guards(tmp_path: Path) -> None:
+    from tasque2.discord_output import DiscordFileUpload, prepare_discord_uploads
+
+    small = tmp_path / "small.bin"
+    small.write_bytes(b"x" * 1_000)
+    huge = tmp_path / "huge.bin"
+    huge.write_bytes(b"x" * 5_000)
+
+    sendable, notes, temps = prepare_discord_uploads(
+        [
+            DiscordFileUpload(path=str(small), filename="small.bin", artifact_id="a1"),
+            DiscordFileUpload(path=str(huge), filename="huge.bin", artifact_id="a2"),
+            DiscordFileUpload(path=str(tmp_path / "gone.png"), filename="gone.png"),
+        ],
+        max_file_bytes=2_000,
+        max_request_bytes=10_000,
+    )
+    assert [upload.filename for upload in sendable] == ["small.bin"]
+    assert temps == []
+    # Oversized non-image is dropped but stays discoverable via its artifact id.
+    assert any("huge.bin" in note and "a2" in note for note in notes)
+    assert any("gone.png" in note for note in notes)
+
+
+def test_prepare_discord_uploads_shrinks_oversized_images(tmp_path: Path) -> None:
+    from PIL import Image
+
+    from tasque2.discord_output import DiscordFileUpload, prepare_discord_uploads
+
+    big = tmp_path / "render.png"
+    Image.effect_noise((256, 256), 64).convert("RGB").save(big, format="PNG")
+    cap = big.stat().st_size - 1  # just under the PNG's size, so it must re-encode
+
+    sendable, notes, temps = prepare_discord_uploads(
+        [DiscordFileUpload(path=str(big), filename="render.png", artifact_id="a3")],
+        max_file_bytes=cap,
+        max_request_bytes=10 * cap,
+    )
+    assert len(sendable) == 1
+    assert sendable[0].filename == "render.jpg"
+    assert sendable[0].artifact_id == "a3"
+    assert Path(sendable[0].path).stat().st_size <= cap
+    assert temps == [Path(sendable[0].path)]
+    assert any("downscaled" in note for note in notes)
+    for tmp in temps:
+        tmp.unlink()
+
+
+def test_prepare_discord_uploads_request_budget(tmp_path: Path) -> None:
+    from tasque2.discord_output import DiscordFileUpload, prepare_discord_uploads
+
+    first = tmp_path / "one.bin"
+    first.write_bytes(b"x" * 900)
+    second = tmp_path / "two.bin"
+    second.write_bytes(b"x" * 900)
+
+    sendable, notes, temps = prepare_discord_uploads(
+        [
+            DiscordFileUpload(path=str(first), filename="one.bin"),
+            DiscordFileUpload(path=str(second), filename="two.bin"),
+        ],
+        max_file_bytes=1_000,
+        max_request_bytes=1_000,
+    )
+    assert [upload.filename for upload in sendable] == ["one.bin"]
+    assert temps == []
+    assert any("two.bin" in note for note in notes)
