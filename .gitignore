@@ -34,6 +34,33 @@ pytest.ini
 mcps/
 node_modules/
 
+# Ad-hoc worker scratch. Scout/apply runs write probe scripts, board dumps and JD
+# text straight into the repo root (390 such files by 2026-07-30). They are
+# regenerable and must never be committed. Prefer writing to scratch/ instead.
+scratch/
+/.abnormal_*
+/.ats*
+/.booth_*
+/.bt_*
+/.c3_*
+/.c_*
+/.dv_*
+/.iterable_*
+/.jobsweep*
+/.js*
+/.lane_*
+/.mitre_*
+/.natlab_*
+/.qc_*
+/.rem_*
+/.scout_*
+/.sd_*
+/.wd_*
+/p_*.json
+/mcp_*_by_worker.json
+/style_state_draft.txt
+/wiki_zombied.json
+
 # Editor and OS noise
 .vscode/
 .idea/

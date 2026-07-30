@@ -59,6 +59,11 @@ class Settings(BaseSettings):
     claude_model_high: str | None = Field(default=None)
     claude_model_ultra: str | None = Field(default=None)
     allow_test_providers: bool = Field(default=False)
+    # Comma-separated user-scope MCP servers a claude worker may load when its
+    # runtime_contract declares no `mcp_servers` allowlist. Unset (None) keeps the
+    # historical behavior: inherit EVERY user-scope server, whose tool schemas are
+    # injected into every run whether the worker touches them or not.
+    default_mcp_servers: str | None = Field(default=None)
     # Memory retrieval / embeddings.
     embedding_provider: str = Field(default="auto")  # auto | hash | openai | none
     embedding_model: str = Field(default="text-embedding-3-small")

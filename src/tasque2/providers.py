@@ -9,7 +9,7 @@ import sys
 import tempfile
 import threading
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
@@ -20,12 +20,13 @@ from tasque2 import result_inbox
 from tasque2.artifacts import ArtifactStore
 from tasque2.compression import compress_text
 from tasque2.config import DEFAULT_MODEL_PROVIDERS, get_settings
-from tasque2.memory import MemoryService
+from tasque2.memory import MemoryBudgetExceeded, MemoryService
 from tasque2.memory_ingest import MemoryIngestService
 from tasque2.models import ProviderRun, WorkAttempt, WorkItem, utc_now
 from tasque2.repo import WorkRepository
 from tasque2.worker_context import (
     WorkerContextBuilder,
+    adaptive_memory_limit,
     render_provider_prompt,
 )
 
@@ -431,9 +432,21 @@ class ClaudeCodeProvider(SubprocessProvider):
             "--permission-mode",
             "bypassPermissions",
         ]
+        servers = request.context.get("tasque_mcp_servers")
+        allowlist = list(servers) if isinstance(servers, list) else None
         argv.extend(
-            ["--mcp-config", _claude_tasque_mcp_config(work_item_id=request.env.get("TASQUE2_WORK_ITEM_ID"))]
+            [
+                "--mcp-config",
+                _claude_tasque_mcp_config(
+                    work_item_id=request.env.get("TASQUE2_WORK_ITEM_ID"),
+                    servers=allowlist,
+                ),
+            ]
         )
+        if allowlist is not None:
+            # Without this the CLI ALSO loads every user-scope server, which is the
+            # default when a work item declares no allowlist.
+            argv.append("--strict-mcp-config")
         if request.model:
             argv.extend(["--model", request.model])
         if request.output_schema:
@@ -731,7 +744,9 @@ class ProviderRuntime:
                         f"Unsupported memory_writes[{index}].operation: {operation!r}."
                     )
                 memory_ids.append(memory.id)
-            except ProviderExecutionError as error:
+            except (ProviderExecutionError, MemoryBudgetExceeded) as error:
+                # A rejected write must not sink the whole result payload; the worker
+                # sees the reason in produces and the prior document stands.
                 skipped.append(str(error))
                 continue
 
@@ -792,6 +807,7 @@ class ProviderRuntime:
                 **context,
                 "tasque_context_packet": context_packet,
                 "result_token": result_token,
+                "tasque_mcp_servers": _mcp_server_allowlist(contract),
             },
         )
 
@@ -1121,7 +1137,18 @@ def model_routing_for_provider_request(
     native_worker_profile = None
 
     if provider_name in DEFAULT_MODEL_PROVIDERS:
-        orchestrator_profile = settings.normalize_model_profile(settings.orchestrator_model_profile)
+        # A work item's declared tier governs the model it actually RUNS on, not only
+        # the tier it hands to native sub-workers. Before 2026-07-29 the orchestrator
+        # was env-global and nothing in the contract could lower it, so every node --
+        # including ones deliberately marked low/medium -- executed at the global
+        # profile (measured: 389/389 runs on opus, 146 of them declared low/medium).
+        # `native_worker_model_profile`/`worker_model_profile` remain sub-worker-only.
+        orchestrator_profile = _first_profile(
+            contract,
+            "orchestrator_model_profile",
+            "model_profile",
+            "tier",
+        ) or settings.normalize_model_profile(settings.orchestrator_model_profile)
         orchestrator_model = settings.model_for_profile(provider_name, orchestrator_profile)
 
         if native_worker_model is None:
@@ -1180,6 +1207,9 @@ def _work_memory_namespace(work_item: WorkItem) -> str:
 
 def _provider_context_limits(work_item: WorkItem) -> dict[str, int | None]:
     limits = dict(DEFAULT_PROVIDER_CONTEXT_LIMITS)
+    adaptive = adaptive_memory_limit(work_item.context)
+    if adaptive is not None:
+        limits["memories"] = adaptive
     for source in (work_item.runtime_contract or {}, work_item.context or {}):
         configured = source.get("context_limits")
         if not isinstance(configured, dict):
@@ -1403,10 +1433,65 @@ def _codex_tasque_mcp_args(*, work_item_id: str | None = None) -> list[str]:
     return result
 
 
-def _claude_tasque_mcp_config(*, work_item_id: str | None = None) -> str:
-    return json.dumps(
-        {"mcpServers": {"tasque2": tasque_mcp_server_config(work_item_id=work_item_id)}}
-    )
+def _claude_tasque_mcp_config(
+    *,
+    work_item_id: str | None = None,
+    servers: Sequence[str] | None = None,
+) -> str:
+    """Build the --mcp-config payload for a claude worker.
+
+    ``servers is None`` reproduces the historical behavior: declare only tasque2 and
+    let the CLI additionally inherit every user-scope server. When a work item DOES
+    declare an allowlist, the named user-scope servers are inlined here so the caller
+    can add --strict-mcp-config and load nothing else -- a worker that never browses
+    should not pay for the autopilot/blender/figma tool schemas on every run.
+    """
+    configured: dict[str, Any] = {"tasque2": tasque_mcp_server_config(work_item_id=work_item_id)}
+    if servers is not None:
+        available = _user_scope_mcp_servers()
+        for name in servers:
+            if name == "tasque2":
+                continue
+            server = available.get(name)
+            if server is None:
+                raise ProviderExecutionError(
+                    f"runtime_contract.mcp_servers names {name!r}, which is not a "
+                    f"user-scope MCP server. Known: {', '.join(sorted(available)) or '(none)'}."
+                )
+            configured[name] = server
+    return json.dumps({"mcpServers": configured})
+
+
+def _user_scope_mcp_servers() -> dict[str, Any]:
+    """User-scope MCP server definitions (``~/.claude.json``), or {} if unreadable.
+
+    These are what a worker inherits today when --strict-mcp-config is absent.
+    """
+    path = Path.home() / ".claude.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    servers = data.get("mcpServers")
+    return dict(servers) if isinstance(servers, dict) else {}
+
+
+def _mcp_server_allowlist(contract: Mapping[str, Any]) -> list[str] | None:
+    """Resolve the MCP allowlist for a work item.
+
+    Precedence: the work item's own ``runtime_contract.mcp_servers`` wins; otherwise
+    the ``TASQUE2_DEFAULT_MCP_SERVERS`` baseline applies. None (neither set) keeps the
+    historical inherit-everything behavior.
+    """
+    declared = contract.get("mcp_servers")
+    if declared is None:
+        configured = get_settings().default_mcp_servers
+        if configured is None or not configured.strip():
+            return None
+        return [item.strip() for item in configured.split(",") if item.strip()]
+    if not isinstance(declared, list) or not all(isinstance(item, str) for item in declared):
+        raise ProviderExecutionError("runtime_contract.mcp_servers must be a list of strings.")
+    return [item.strip() for item in declared if item.strip()]
 
 
 def _toml_value(value: Any) -> str:

@@ -17,14 +17,18 @@ from tasque2.db import session_scope
 from tasque2.memory import MemoryService
 from tasque2.models import Artifact, FailedWork, Memory, ProviderRun, WorkAttempt, WorkItem
 from tasque2.providers import (
+    DEFAULT_PROVIDER_CONTEXT_LIMITS,
     ClaudeCodeProvider,
     CodexCliProvider,
     FakeProvider,
+    ProviderExecutionError,
     ProviderRegistry,
     ProviderRequest,
     ProviderResponse,
     ProviderRuntime,
     SubprocessProvider,
+    _mcp_server_allowlist,
+    _provider_context_limits,
     extract_session_id_from_stream,
     extract_structured_output,
     extract_text_from_stream,
@@ -32,6 +36,7 @@ from tasque2.providers import (
 from tasque2.queue import WorkQueue
 from tasque2.repo import WorkRepository
 from tasque2.runtime import WorkRunner
+from tasque2.worker_context import MEMORY_SEARCH_HEADROOM
 
 
 def test_fake_provider_success_records_run_and_artifacts(fresh_db: Path, monkeypatch) -> None:
@@ -533,10 +538,16 @@ def test_provider_default_worker_kind_uses_env_provider(
         reset_settings()
 
 
-def test_model_profile_resolves_native_worker_while_orchestrator_is_high(
+def test_model_profile_drives_orchestrator_and_native_worker(
     fresh_db: Path,
     monkeypatch,
 ) -> None:
+    """A declared profile must govern the model the work item actually RUNS on.
+
+    Until 2026-07-29 the orchestrator was pinned to the env-global profile, so a
+    node marked `medium` still executed on the `high` model and only its native
+    sub-workers got the cheaper tier.
+    """
     monkeypatch.setenv("TASQUE2_CODEX_MODEL_HIGH", "codex-high-test")
     monkeypatch.setenv("TASQUE2_CODEX_MODEL_MEDIUM", "codex-medium-test")
     reset_settings()
@@ -560,7 +571,7 @@ def test_model_profile_resolves_native_worker_while_orchestrator_is_high(
             ).run_next()
 
             assert outcome is not None
-            assert captured[0].model == "codex-high-test"
+            assert captured[0].model == "codex-medium-test"
             assert '"native_worker"' in captured[0].prompt
             assert '"model": "codex-medium-test"' in captured[0].prompt
             assert '"model_profile": "medium"' in captured[0].prompt
@@ -595,7 +606,7 @@ def test_tier_contract_aliases_to_model_profile(
             ).run_next()
 
             assert outcome is not None
-            assert captured[0].model == "codex-high-test"
+            assert captured[0].model == "codex-medium-test"
             assert '"model": "codex-medium-test"' in captured[0].prompt
             assert '"model_profile": "medium"' in captured[0].prompt
     finally:
@@ -671,10 +682,12 @@ def test_explicit_model_sets_native_worker_while_orchestrator_is_high(
         reset_settings()
 
 
-def test_orchestrator_stays_high_even_if_contract_requests_low(
+def test_orchestrator_model_profile_overrides_env_global(
     fresh_db: Path,
     monkeypatch,
 ) -> None:
+    """`orchestrator_model_profile` wins over the env-global default, and can be
+    set independently of the `model_profile` handed to native sub-workers."""
     monkeypatch.setenv("TASQUE2_CODEX_MODEL_LOW", "codex-low-test")
     monkeypatch.setenv("TASQUE2_CODEX_MODEL_MEDIUM", "codex-medium-test")
     monkeypatch.setenv("TASQUE2_CODEX_MODEL_HIGH", "codex-high-test")
@@ -702,10 +715,44 @@ def test_orchestrator_stays_high_even_if_contract_requests_low(
             ).run_next()
 
             assert outcome is not None
-            assert captured[0].model == "codex-high-test"
+            assert captured[0].model == "codex-low-test"
             assert '"native_worker"' in captured[0].prompt
             assert '"model": "codex-medium-test"' in captured[0].prompt
             assert '"model_profile": "medium"' in captured[0].prompt
+    finally:
+        reset_settings()
+
+
+def test_native_worker_profile_alone_leaves_orchestrator_on_env_global(
+    fresh_db: Path,
+    monkeypatch,
+) -> None:
+    """Sub-worker-only keys must NOT lower the orchestrator (back-compat guard)."""
+    monkeypatch.setenv("TASQUE2_CODEX_MODEL_MEDIUM", "codex-medium-test")
+    monkeypatch.setenv("TASQUE2_CODEX_MODEL_HIGH", "codex-high-test")
+    reset_settings()
+    captured: list[ProviderRequest] = []
+    adapter = FakeProvider(capture_requests=captured)
+    adapter.name = "codex"
+    registry = ProviderRegistry()
+    registry.register(adapter)
+
+    try:
+        with session_scope() as session:
+            WorkRepository(session).create_work_item(
+                title="Native-only profile work",
+                task_instruction="Only the sub-worker tier is declared.",
+                worker_kind="provider.codex",
+                runtime_contract={"native_worker_model_profile": "medium"},
+            )
+            outcome = WorkRunner(
+                session,
+                provider_runtime=ProviderRuntime(registry=registry),
+            ).run_next()
+
+            assert outcome is not None
+            assert captured[0].model == "codex-high-test"
+            assert '"model": "codex-medium-test"' in captured[0].prompt
     finally:
         reset_settings()
 
@@ -1160,6 +1207,87 @@ def test_claude_provider_passes_json_schema_and_parses_result(tmp_path: Path) ->
     assert response.provider_session_id == "claude-session"
     assert response.usage["total_cost_usd"] == 0.01
     assert response.structured_output == {"ok": True, "provider": "claude"}
+    # No allowlist declared -> historical behavior: user-scope servers still inherited.
+    assert "--strict-mcp-config" not in argv
+
+
+def _run_claude_with_context(context: dict[str, object]) -> list[str]:
+    captured: dict[str, object] = {}
+
+    def runner(argv, **kwargs):
+        captured["argv"] = argv
+        return subprocess.CompletedProcess(
+            argv, 0, stdout='{"type":"result","result":"ok"}\n', stderr=""
+        )
+
+    ClaudeCodeProvider(runner=runner).run(
+        ProviderRequest(provider="claude", prompt="hi", context=context)
+    )
+    return list(captured["argv"])
+
+
+def test_claude_mcp_allowlist_restricts_servers_and_sets_strict(monkeypatch) -> None:
+    """A declared allowlist inlines only those servers and blocks inheritance."""
+    monkeypatch.setattr(
+        "tasque2.providers._user_scope_mcp_servers",
+        lambda: {"autopilot": {"command": "ap"}, "blender": {"command": "bl"}},
+    )
+
+    argv = _run_claude_with_context({"tasque_mcp_servers": ["autopilot"]})
+
+    assert "--strict-mcp-config" in argv
+    servers = json.loads(argv[argv.index("--mcp-config") + 1])["mcpServers"]
+    # tasque2 is always present; the un-named server must not be loaded.
+    assert set(servers) == {"tasque2", "autopilot"}
+
+
+def test_claude_empty_allowlist_loads_only_tasque2(monkeypatch) -> None:
+    """An explicit [] is meaningful: the cheapest possible worker."""
+    monkeypatch.setattr(
+        "tasque2.providers._user_scope_mcp_servers", lambda: {"autopilot": {"command": "ap"}}
+    )
+
+    argv = _run_claude_with_context({"tasque_mcp_servers": []})
+
+    assert "--strict-mcp-config" in argv
+    assert set(json.loads(argv[argv.index("--mcp-config") + 1])["mcpServers"]) == {"tasque2"}
+
+
+def test_claude_unknown_mcp_server_is_rejected(monkeypatch) -> None:
+    monkeypatch.setattr("tasque2.providers._user_scope_mcp_servers", lambda: {"autopilot": {}})
+
+    with pytest.raises(ProviderExecutionError, match="not a user-scope MCP server"):
+        _run_claude_with_context({"tasque_mcp_servers": ["autopilto"]})
+
+
+def test_mcp_allowlist_falls_back_to_configured_default(monkeypatch) -> None:
+    monkeypatch.setenv("TASQUE2_DEFAULT_MCP_SERVERS", "autopilot, google-workspace")
+    reset_settings()
+    try:
+        # No contract allowlist -> the baseline applies...
+        assert _mcp_server_allowlist({}) == ["autopilot", "google-workspace"]
+        # ...but an explicit contract allowlist still wins, including an empty one.
+        assert _mcp_server_allowlist({"mcp_servers": ["openart"]}) == ["openart"]
+        assert _mcp_server_allowlist({"mcp_servers": []}) == []
+    finally:
+        reset_settings()
+
+
+def test_mcp_allowlist_contract_parsing(monkeypatch) -> None:
+    # Isolate from the ambient .env, which configures a real baseline.
+    monkeypatch.setenv("TASQUE2_DEFAULT_MCP_SERVERS", "")
+    reset_settings()
+    try:
+        assert _mcp_server_allowlist({}) is None  # absent + unconfigured -> inherit all
+        assert _mcp_server_allowlist({"mcp_servers": []}) == []
+        assert _mcp_server_allowlist({"mcp_servers": ["autopilot", " openart "]}) == [
+            "autopilot",
+            "openart",
+        ]
+        with pytest.raises(ProviderExecutionError, match="must be a list of strings"):
+            _mcp_server_allowlist({"mcp_servers": "autopilot"})
+    finally:
+        reset_settings()
 
 
 def test_provider_smoke_cli_runs_subprocess_when_test_providers_are_enabled(
@@ -1178,3 +1306,50 @@ def test_provider_smoke_cli_runs_subprocess_when_test_providers_are_enabled(
         assert "succeeded" in result.output
     finally:
         reset_settings()
+
+
+def test_context_limits_size_the_memory_packet_from_the_pinned_set(fresh_db: Path) -> None:
+    with session_scope() as session:
+        pinned = WorkRepository(session).create_work_item(
+            title="Cooking chef reply",
+            task_instruction="Reply.",
+            worker_kind="provider.fake",
+            context={
+                "memory_namespace": "cooking",
+                "memory_canonical_keys": ["a", "b", "c"],
+            },
+        )
+        unpinned = WorkRepository(session).create_work_item(
+            title="General intake",
+            task_instruction="Do the thing.",
+            worker_kind="provider.fake",
+            context={"memory_namespace": "cooking"},
+        )
+        register = WorkRepository(session).create_work_item(
+            title="Local scout watch",
+            task_instruction="Scout.",
+            worker_kind="provider.fake",
+            context={
+                "memory_namespace": "local",
+                "memory_canonical_keys": ["a", "b"],
+                "memory_kinds": ["interest"],
+            },
+        )
+        explicit = WorkRepository(session).create_work_item(
+            title="Explicit",
+            task_instruction="Reply.",
+            worker_kind="provider.fake",
+            context={
+                "memory_namespace": "cooking",
+                "memory_canonical_keys": ["a", "b", "c"],
+                "context_limits": {"memories": 30},
+            },
+        )
+
+        # Pinned set + headroom, so search hits can't crowd out what the worker declared.
+        assert _provider_context_limits(pinned)["memories"] == 3 + MEMORY_SEARCH_HEADROOM
+        # Nothing pinned, or whole kinds force-loaded: keep the default, don't truncate.
+        assert _provider_context_limits(unpinned)["memories"] == DEFAULT_PROVIDER_CONTEXT_LIMITS["memories"]
+        assert _provider_context_limits(register)["memories"] == DEFAULT_PROVIDER_CONTEXT_LIMITS["memories"]
+        # An explicit setting still wins.
+        assert _provider_context_limits(explicit)["memories"] == 30
