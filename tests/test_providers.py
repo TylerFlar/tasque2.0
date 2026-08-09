@@ -730,6 +730,10 @@ def test_native_worker_profile_alone_leaves_orchestrator_on_env_global(
     """Sub-worker-only keys must NOT lower the orchestrator (back-compat guard)."""
     monkeypatch.setenv("TASQUE2_CODEX_MODEL_MEDIUM", "codex-medium-test")
     monkeypatch.setenv("TASQUE2_CODEX_MODEL_HIGH", "codex-high-test")
+    # Pin the env-global rather than inheriting whatever .env currently sets --
+    # this test is about the orchestrator ignoring sub-worker keys, not about
+    # which tier the deployment happens to default to.
+    monkeypatch.setenv("TASQUE2_ORCHESTRATOR_MODEL_PROFILE", "high")
     reset_settings()
     captured: list[ProviderRequest] = []
     adapter = FakeProvider(capture_requests=captured)

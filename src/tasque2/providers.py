@@ -500,8 +500,6 @@ class ProviderRuntime:
         return worker_kind.startswith("provider.")
 
     def run(self, session: Session, work_item: WorkItem, attempt: WorkAttempt) -> WorkerResult:
-        from tasque2.runtime import WorkerResult
-
         provider_name = provider_name_for_worker_kind(work_item.worker_kind)
         adapter = self.registry.get(provider_name)
         result_token = result_inbox.mint_token()
@@ -606,6 +604,35 @@ class ProviderRuntime:
             if response.status != "succeeded":
                 raise TransientProviderError(response.summary)
             raise TransientProviderError(_missing_result_error_message(response))
+
+        return self.finalize_submitted_payload(
+            session,
+            work_item=work_item,
+            attempt=attempt,
+            provider_run=provider_run,
+            request=request,
+            payload=payload,
+            provider_name=provider_name,
+        )
+
+    def finalize_submitted_payload(
+        self,
+        session: Session,
+        *,
+        work_item: WorkItem,
+        attempt: WorkAttempt,
+        provider_run: ProviderRun,
+        request: ProviderRequest,
+        payload: dict[str, Any],
+        provider_name: str,
+    ) -> WorkerResult:
+        """Turn a deposited worker payload into a completed WorkerResult.
+
+        Split out of :meth:`run` so orphan recovery can finish a result that a
+        provider subprocess deposited after its parent daemon died, instead of
+        discarding it and re-running the work.
+        """
+        from tasque2.runtime import WorkerResult
 
         worker_status, summary, report, produces = _normalize_submitted_result(payload)
         if worker_status in {"failed", "error"}:

@@ -197,6 +197,9 @@ def _run_daemon_once(
             max_work_items=max_work_items,
             recover_orphaned_lease_owner=recover_orphaned_lease_owner,
             orphaned_before=orphaned_before,
+            # Dispatch without blocking: a long provider run must not stall
+            # schedule polling, workflow ticks or lease recovery behind it.
+            wait=False,
         )
 
 

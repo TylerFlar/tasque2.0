@@ -333,7 +333,33 @@ def test_mcp_submit_worker_result_deposits_in_inbox(fresh_db: Path) -> None:
         "summary": "Workout summary",
         "produces": {"focus": "push"},
         "error": None,
+        "work_item_id": None,
     }
+
+
+def test_mcp_submit_worker_result_stamps_work_item_for_orphan_recovery(
+    fresh_db: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("TASQUE2_WORK_ITEM_ID", "work-123")
+    token = result_inbox.mint_token()
+
+    _ok(
+        tools.submit_worker_result(
+            result_token=token,
+            report="Workout report",
+            summary="Workout summary",
+        )
+    )
+
+    # Recoverable by work item, not just by the in-memory result token.
+    with session_scope() as session:
+        payload = result_inbox.consume_for_work_item(session, "work-123")
+        assert payload is not None
+        assert payload["summary"] == "Workout summary"
+        # And consuming it removes it, so it can't be adopted twice.
+        assert result_inbox.consume_for_work_item(session, "work-123") is None
+    assert result_inbox.read_and_consume(token, agent_kind="worker") is None
 
 
 def test_mcp_work_enqueue_inherits_reply_config_from_calling_work_item(

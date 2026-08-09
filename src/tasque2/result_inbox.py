@@ -6,6 +6,7 @@ from typing import Any
 from uuid import uuid4
 
 from sqlalchemy import delete, select
+from sqlalchemy.orm import Session
 
 from tasque2.db import session_scope
 from tasque2.models import AgentResult, utc_now
@@ -67,6 +68,47 @@ def read_and_consume(result_token: str, *, agent_kind: str = "worker") -> dict[s
     except json.JSONDecodeError:
         return None
     return parsed if isinstance(parsed, dict) else None
+
+
+def consume_for_work_item(
+    session: Session,
+    work_item_id: str,
+    *,
+    agent_kind: str = "worker",
+) -> dict[str, Any] | None:
+    """Fetch and delete a result a worker deposited for ``work_item_id``.
+
+    The runtime normally consumes a result by its in-memory ``result_token``.
+    When the daemon dies while a provider subprocess is still running, that
+    token is lost but the subprocess can still finish and deposit -- so
+    recovery looks the payload up by work item instead of re-running work that
+    already completed.
+
+    Runs on the caller's session, not its own: recovery holds an open write
+    transaction, and SQLite allows a single writer, so opening a second session
+    here would deadlock. Sharing the session also makes consuming the payload
+    and completing the attempt atomic -- a crash between the two cannot drop
+    the result.
+    """
+    target = _required(work_item_id, "work_item_id")
+    rows = list(
+        session.scalars(
+            select(AgentResult)
+            .where(AgentResult.agent_kind == agent_kind)
+            .order_by(AgentResult.created_at.desc())
+        ).all()
+    )
+    for row in rows:
+        try:
+            parsed = json.loads(row.payload_json)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(parsed, dict) or parsed.get("work_item_id") != target:
+            continue
+        session.delete(row)
+        session.flush()
+        return parsed
+    return None
 
 
 def reap_stale(*, max_age_seconds: int = DEFAULT_REAP_AGE_SECONDS) -> int:

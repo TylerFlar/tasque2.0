@@ -47,6 +47,10 @@ class Settings(BaseSettings):
     discord_allowed_user_ids: str | None = Field(default=None)
     discord_max_attachment_bytes: int = Field(default=25 * 1024 * 1024)
     daemon_concurrency: int = Field(default=1)
+    # Lease held by an in-flight attempt, refreshed every tick. If the daemon
+    # dies the lease goes stale and the work becomes recoverable instead of
+    # sitting in "running" forever with no watchdog.
+    daemon_lease_seconds: int = Field(default=600)
     default_provider: str = Field(default="codex")
     orchestrator_model_profile: str = Field(default="high")
     native_worker_model_profile: str | None = Field(default=None)

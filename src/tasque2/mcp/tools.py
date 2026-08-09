@@ -1636,6 +1636,11 @@ def _submit_worker_result(
             "summary": _string_field(summary, "summary"),
             "produces": produces or {},
             "error": clean_error,
+            # Stamped so a result deposited after its parent daemon died can
+            # still be matched back to its work item. Without this the runtime
+            # only knows the in-memory result_token, so a restart re-runs work
+            # that already finished (and, for career applies, submits twice).
+            "work_item_id": (os.environ.get("TASQUE2_WORK_ITEM_ID") or "").strip() or None,
         },
     )
     return {"ok": True, "result_token": token}

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import re
+import threading
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
@@ -105,6 +107,42 @@ def limit_retry_delay_seconds(
     return max(60, min(delay, LIMIT_RETRY_MAX_SECONDS))
 
 
+# A provider session limit is account-wide, not per-item: once one run is told
+# "resets 4:40pm", every other provider run will be told the same thing. Without
+# a gate the daemon keeps claiming ready items and burning a real attempt on each
+# one for a ~2s $0 failure -- on 2026-08-03 that spent 8 of 10 career-apply
+# attempts in 77 seconds against a window that was already closed. The gate is
+# process-local on purpose: it is an optimisation, not a correctness boundary
+# (each item's own not_before already holds the retry), so a restarted daemon
+# simply relearns it from the first limit stop instead of needing schema.
+_LIMIT_GATE_MAX_SECONDS = 6 * 60 * 60
+_limit_gate_lock = threading.Lock()
+_limit_gate_until: datetime | None = None
+
+
+def note_provider_limit_stop(until: datetime) -> None:
+    """Record that provider capacity is exhausted until ``until``."""
+    global _limit_gate_until
+    ceiling = utc_now() + timedelta(seconds=_LIMIT_GATE_MAX_SECONDS)
+    capped = min(until, ceiling)
+    with _limit_gate_lock:
+        if _limit_gate_until is None or capped > _limit_gate_until:
+            _limit_gate_until = capped
+
+
+def provider_limit_gate_until() -> datetime | None:
+    """The time provider work may be claimed again, or None when not gated."""
+    with _limit_gate_lock:
+        return _limit_gate_until
+
+
+def reset_provider_limit_gate() -> None:
+    """Clear the gate (used by tests and by operators forcing a retry)."""
+    global _limit_gate_until
+    with _limit_gate_lock:
+        _limit_gate_until = None
+
+
 @dataclass(frozen=True)
 class ClaimedWork:
     work_item: WorkItem
@@ -123,6 +161,8 @@ class WorkQueue:
         now: datetime | None = None,
     ) -> ClaimedWork | None:
         now = now or utc_now()
+        gated_until = provider_limit_gate_until()
+        provider_gated = gated_until is not None and gated_until > now
         candidates = self.session.scalars(
             select(WorkItem)
             .where(
@@ -134,6 +174,10 @@ class WorkQueue:
         ).all()
 
         for work_item in candidates:
+            if provider_gated and work_item.worker_kind.startswith("provider."):
+                # Provider capacity is exhausted account-wide; claiming this
+                # would spend an attempt on a guaranteed instant failure.
+                continue
             if self._deadline_passed(work_item, now):
                 # Time-sensitive work whose window closed must not run late
                 # (e.g. a daily trading step resuming a day after the daemon was
@@ -202,6 +246,38 @@ class WorkQueue:
             summary="Lease heartbeat recorded",
         )
         return attempt
+
+    def heartbeat_running_attempts(
+        self,
+        attempt_ids: Sequence[str],
+        *,
+        lease_seconds: int | None = None,
+        now: datetime | None = None,
+    ) -> int:
+        """Refresh leases for in-flight attempts without emitting an event each time.
+
+        The daemon calls this every tick (seconds apart), so the per-heartbeat
+        ``work.heartbeat`` event that :meth:`heartbeat_attempt` writes would bloat
+        the event log by thousands of rows a day. The lease itself is the signal
+        that matters: a daemon that dies stops refreshing it, and lease recovery
+        picks the work back up.
+        """
+        ids = [str(attempt_id) for attempt_id in attempt_ids if attempt_id]
+        if not ids:
+            return 0
+        now = now or utc_now()
+        expires_at = now + timedelta(seconds=lease_seconds) if lease_seconds is not None else None
+        attempts = self.session.scalars(
+            select(WorkAttempt).where(
+                WorkAttempt.id.in_(ids),
+                WorkAttempt.status == "running",
+            )
+        ).all()
+        for attempt in attempts:
+            attempt.heartbeat_at = now
+            attempt.lease_expires_at = expires_at
+        self.session.flush()
+        return len(attempts)
 
     def complete_attempt(
         self,
@@ -613,6 +689,10 @@ class WorkQueue:
             base_delay = int((work_item.retry_policy or {}).get("delay_seconds", 0))
             if is_transient:
                 limit_delay = limit_retry_delay_seconds(attempt.error_message, now=now)
+                if limit_delay is not None:
+                    # Account-wide capacity stop: hold every other provider claim
+                    # until the stated reset instead of burning an attempt each.
+                    note_provider_limit_stop(now + timedelta(seconds=limit_delay))
                 transient_delay = (
                     limit_delay if limit_delay is not None else TRANSIENT_RETRY_DELAY_SECONDS
                 )

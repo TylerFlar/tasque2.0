@@ -3,13 +3,16 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any
 
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
+from tasque2 import result_inbox
 from tasque2.extensions import registry as extension_registry
-from tasque2.models import WorkItem
-from tasque2.providers import ProviderRuntime
+from tasque2.models import ProviderRun, WorkAttempt, WorkItem, utc_now
+from tasque2.providers import ProviderRequest, ProviderRuntime
 from tasque2.queue import ClaimedWork, WorkQueue
 
 logger = logging.getLogger(__name__)
@@ -125,6 +128,81 @@ class WorkRunner:
         self.provider_runtime = provider_runtime or ProviderRuntime()
         self.lease_owner = lease_owner
         self.lease_seconds = lease_seconds
+
+    def recover_deposited_results(self, *, orphaned_before: datetime) -> int:
+        """Finish attempts whose worker deposited a result after the daemon died.
+
+        A provider subprocess is spawned into its own process group, so it
+        outlives the daemon that started it and can still submit its result --
+        but the in-memory result_token that the runtime would have consumed died
+        with the parent. Without this, restart requeues work that already
+        completed, which for a career apply means submitting the same
+        application twice.
+
+        Scoped by the same ``orphaned_before`` predicate that orphan recovery
+        uses, so it can only touch attempts from a previous daemon process and
+        never races the live poll loop for a result.
+        """
+        queue = WorkQueue(self.session)
+        attempts = self.session.scalars(
+            select(WorkAttempt).where(
+                WorkAttempt.status == "running",
+                WorkAttempt.lease_owner == self.lease_owner,
+                or_(
+                    WorkAttempt.heartbeat_at.is_(None),
+                    WorkAttempt.heartbeat_at < orphaned_before,
+                ),
+            )
+        ).all()
+
+        recovered = 0
+        for attempt in attempts:
+            work_item = attempt.work_item
+            payload = result_inbox.consume_for_work_item(self.session, work_item.id)
+            if payload is None:
+                continue
+            provider_run = self.session.get(ProviderRun, attempt.provider_run_id or "")
+            if provider_run is None:
+                continue
+            try:
+                result = self.provider_runtime.finalize_submitted_payload(
+                    self.session,
+                    work_item=work_item,
+                    attempt=attempt,
+                    provider_run=provider_run,
+                    request=ProviderRequest(
+                        provider=provider_run.provider,
+                        prompt="",
+                        cwd=provider_run.cwd,
+                    ),
+                    payload=payload,
+                    provider_name=provider_run.provider,
+                )
+            except Exception as exc:  # noqa: BLE001 - a bad payload must not block recovery
+                queue.fail_attempt(
+                    attempt.id,
+                    error_type=type(exc).__name__,
+                    error_message=str(exc),
+                )
+                recovered += 1
+                continue
+
+            provider_run.status = "succeeded"
+            provider_run.ended_at = utc_now()
+            provider_run.usage = {
+                **(provider_run.usage or {}),
+                "recovered_deposited_result": True,
+            }
+            queue.complete_attempt(
+                attempt.id,
+                summary=result.summary,
+                produces=result.produces,
+                report_artifact_id=result.report_artifact_id,
+            )
+            recovered += 1
+
+        self.session.flush()
+        return recovered
 
     def claim(self) -> ClaimedWork | None:
         """Claim the next ready work item for this runner's lease owner.

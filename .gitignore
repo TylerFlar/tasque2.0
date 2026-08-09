@@ -38,6 +38,7 @@ node_modules/
 # text straight into the repo root (390 such files by 2026-07-30). They are
 # regenerable and must never be committed. Prefer writing to scratch/ instead.
 scratch/
+tmp/
 /.abnormal_*
 /.ats*
 /.booth_*

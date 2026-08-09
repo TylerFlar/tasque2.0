@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import threading
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -82,6 +82,130 @@ def _run_work_concurrently(
     return sum(totals)
 
 
+class _BackgroundWorkPool:
+    """Long-lived worker pool that runs claims without blocking the tick.
+
+    ``_run_work_concurrently`` drains synchronously: the tick does not return
+    until every claimed item finishes. That is fine for one-shot CLI runs, but
+    in the service loop it means a 30-minute provider run also freezes schedule
+    polling, workflow ticks and lease recovery for 30 minutes -- on 2026-08-03
+    every schedule sat at the same ``last_evaluated_at`` for the whole afternoon
+    because two career applies were still executing inside one tick.
+
+    Here the executor outlives the tick: each tick reaps whatever finished,
+    refreshes leases for what is still in flight, tops the pool back up to
+    ``concurrency``, and returns immediately.
+    """
+
+    def __init__(self, concurrency: int) -> None:
+        self.concurrency = max(1, int(concurrency))
+        self._executor = ThreadPoolExecutor(
+            max_workers=self.concurrency,
+            thread_name_prefix="tasque-work",
+        )
+        self._claim_lock = threading.Lock()
+        self._state_lock = threading.Lock()
+        self._in_flight: dict[Future[object], dict[str, str | None]] = {}
+
+    def in_flight_count(self) -> int:
+        """Count work still executing, ignoring finished futures awaiting reap."""
+        with self._state_lock:
+            return sum(1 for future in self._in_flight if not future.done())
+
+    def in_flight_attempt_ids(self) -> list[str]:
+        with self._state_lock:
+            return [
+                attempt_id
+                for future, holder in self._in_flight.items()
+                if not future.done() and (attempt_id := holder.get("attempt_id")) is not None
+            ]
+
+    def reap(self) -> int:
+        """Drop finished futures and return how many actually ran work."""
+        with self._state_lock:
+            done = [future for future in self._in_flight if future.done()]
+            for future in done:
+                del self._in_flight[future]
+        ran = 0
+        for future in done:
+            try:
+                if future.result() is not _NO_WORK:
+                    ran += 1
+            except Exception as exc:  # noqa: BLE001 - isolate the pool from one bad run
+                print(f"Tasque daemon worker failed: {exc}")
+        return ran
+
+    def dispatch(self, *, limit: int, lease_owner: str, lease_seconds: int | None) -> int:
+        """Submit up to ``limit`` new claims, respecting the concurrency cap."""
+        capacity = self.concurrency - self.in_flight_count()
+        slots = max(0, min(int(limit), capacity))
+        for _ in range(slots):
+            holder: dict[str, str | None] = {"attempt_id": None}
+            future = self._executor.submit(
+                self._claim_and_run,
+                holder,
+                lease_owner,
+                lease_seconds,
+            )
+            with self._state_lock:
+                self._in_flight[future] = holder
+        return slots
+
+    def shutdown(self) -> None:
+        self._executor.shutdown(wait=False, cancel_futures=True)
+
+    def _claim_and_run(
+        self,
+        holder: dict[str, str | None],
+        lease_owner: str,
+        lease_seconds: int | None,
+    ) -> object:
+        with session_scope() as session:
+            runner = WorkRunner(
+                session,
+                lease_owner=lease_owner,
+                lease_seconds=lease_seconds,
+            )
+            with self._claim_lock:
+                claimed = runner.claim()
+                if claimed is None:
+                    return _NO_WORK
+                # Publish the claim before releasing the lock so a sibling can't
+                # re-claim the same item from a stale pre-commit snapshot.
+                session.commit()
+            holder["attempt_id"] = claimed.attempt.id
+            return runner.execute(claimed)
+
+
+_background_pool: _BackgroundWorkPool | None = None
+_background_pool_lock = threading.Lock()
+
+
+def _get_background_pool(concurrency: int) -> _BackgroundWorkPool:
+    global _background_pool
+    with _background_pool_lock:
+        if _background_pool is None or _background_pool.concurrency != max(1, int(concurrency)):
+            _background_pool = _BackgroundWorkPool(concurrency)
+        return _background_pool
+
+
+def reset_background_pool() -> None:
+    """Drop the shared pool (used by tests; a real daemon keeps one for its life)."""
+    global _background_pool
+    with _background_pool_lock:
+        pool = _background_pool
+        _background_pool = None
+    if pool is not None:
+        pool.shutdown()
+
+
+def background_pool_is_idle() -> bool:
+    """True when no dispatched work is still running."""
+    with _background_pool_lock:
+        pool = _background_pool
+    return pool is None or pool.in_flight_count() == 0
+
+
 @dataclass(frozen=True)
 class DaemonTickResult:
     recovered_leases: int
@@ -91,6 +215,7 @@ class DaemonTickResult:
     work_items_ran: int
     memory_ingested: int = 0
     expired_overdue: int = 0
+    recovered_results: int = 0
 
     @property
     def has_activity(self) -> bool:
@@ -103,6 +228,7 @@ class DaemonTickResult:
                 self.work_items_ran,
                 self.memory_ingested,
                 self.expired_overdue,
+                self.recovered_results,
             )
         )
 
@@ -118,14 +244,42 @@ class TasqueDaemon:
         concurrency: int | None = None,
         recover_orphaned_lease_owner: str | None = None,
         orphaned_before: datetime | None = None,
+        wait: bool = True,
     ) -> DaemonTickResult:
+        """Run one daemon tick.
+
+        ``wait=True`` (the default, used by ``daemon-once`` and tests) drains
+        claimed work synchronously. The service loop passes ``wait=False`` so a
+        long provider run cannot stall schedule polling and workflow ticks.
+        """
         if concurrency is None:
             concurrency = get_settings().daemon_concurrency
         concurrency = max(1, int(concurrency))
+        settings = get_settings()
 
         queue = WorkQueue(self.session)
         scheduler = ScheduleService(self.session)
         workflows = WorkflowService(self.session)
+
+        pool = None if wait else _get_background_pool(concurrency)
+        lease_seconds = settings.daemon_lease_seconds if pool is not None else None
+        if pool is not None:
+            # Refresh leases before recovery so in-flight work is never mistaken
+            # for the leavings of a dead daemon.
+            queue.heartbeat_running_attempts(
+                pool.in_flight_attempt_ids(),
+                lease_seconds=lease_seconds,
+            )
+
+        recovered_results = 0
+        if recover_orphaned_lease_owner is not None:
+            # Before requeueing anything, adopt results that a subprocess
+            # deposited after its parent daemon died -- re-running those would
+            # redo already-completed work (and resubmit real applications).
+            recovered_results = WorkRunner(
+                self.session,
+                lease_owner=recover_orphaned_lease_owner,
+            ).recover_deposited_results(orphaned_before=orphaned_before or utc_now())
 
         recovered = queue.recover_expired_leases()
         expired_overdue = queue.expire_overdue_work()
@@ -138,7 +292,16 @@ class TasqueDaemon:
         scheduled = scheduler.poll_due_schedules()
         workflow_changes = workflows.tick_runs()
 
-        if concurrency > 1:
+        if pool is not None:
+            self.session.commit()
+            ran = pool.reap()
+            pool.dispatch(
+                limit=max_work_items,
+                lease_owner="daemon",
+                lease_seconds=lease_seconds,
+            )
+            self.session.expire_all()
+        elif concurrency > 1:
             # Worker threads run in their own sessions, so they can only see work
             # that's already committed. Publish what this tick just scheduled and
             # fanned out, run the claims in parallel, then drop our now-stale
@@ -173,4 +336,5 @@ class TasqueDaemon:
             work_items_ran=ran,
             memory_ingested=memory_ingested,
             expired_overdue=expired_overdue,
+            recovered_results=recovered_results,
         )

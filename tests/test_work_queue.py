@@ -1,16 +1,28 @@
 from __future__ import annotations
 
+import json
 from datetime import timedelta
 from pathlib import Path
 
 from sqlalchemy import select
 
+from tasque2 import result_inbox
 from tasque2.db import session_scope
-from tasque2.models import FailedWork, ProviderRun, WorkAttempt, WorkEvent, WorkItem, utc_now
+from tasque2.models import (
+    AgentResult,
+    FailedWork,
+    ProviderRun,
+    WorkAttempt,
+    WorkEvent,
+    WorkItem,
+    utc_now,
+)
 from tasque2.queue import (
     TRANSIENT_RETRY_DELAY_SECONDS,
     TRANSIENT_RETRY_FLOOR,
     WorkQueue,
+    note_provider_limit_stop,
+    provider_limit_gate_until,
 )
 from tasque2.repo import WorkRepository
 from tasque2.runtime import FunctionWorkerRegistry, WorkerResult, WorkRunner
@@ -336,6 +348,128 @@ def test_orphaned_attempt_requeues_without_worker_timeout(fresh_db: Path) -> Non
         assert event is not None
 
 
+def _deposit_on(
+    session,
+    *,
+    token: str,
+    work_item_id: str,
+    summary: str,
+    report: str,
+    produces: dict | None = None,
+) -> None:
+    """Write a worker result deposit on the caller's session."""
+    session.add(
+        AgentResult(
+            result_token=token,
+            agent_kind="worker",
+            payload_json=json.dumps(
+                {
+                    "status": "succeeded",
+                    "report": report,
+                    "summary": summary,
+                    "produces": produces or {},
+                    "error": None,
+                    "work_item_id": work_item_id,
+                }
+            ),
+        )
+    )
+    session.flush()
+
+
+def test_deposited_result_is_adopted_instead_of_rerunning_the_work(fresh_db: Path) -> None:
+    # A provider subprocess outlives the daemon that spawned it, so it can still
+    # submit its result after the parent dies -- the in-memory result_token is
+    # gone, but the deposit names its work item. Re-running instead of adopting
+    # it is what resubmitted a real job application on 2026-08-03.
+    now = utc_now()
+    with session_scope() as session:
+        repo = WorkRepository(session)
+        work = repo.create_work_item(
+            title="Apply: Example Corp",
+            task_instruction="Submit the application.",
+            worker_kind="provider.default",
+            max_attempts=2,
+        )
+        queue = WorkQueue(session)
+        claimed = queue.claim_next_ready_work(
+            lease_owner="daemon",
+            now=now - timedelta(minutes=10),
+        )
+        assert claimed is not None
+        provider_run = ProviderRun(
+            attempt_id=claimed.attempt.id,
+            provider="claude",
+            status="running",
+            started_at=claimed.attempt.started_at,
+        )
+        session.add(provider_run)
+        session.flush()
+        claimed.attempt.provider_run_id = provider_run.id
+        session.flush()
+
+        # Deposited by the surviving subprocess (a different process in
+        # production, so written here on the test's own session).
+        _deposit_on(
+            session,
+            token="tok-late",
+            work_item_id=work.id,
+            summary="Applied to Example Corp",
+            report="Applied to Example Corp. Confirmation received.",
+            produces={"applied": True},
+        )
+
+        adopted = WorkRunner(session, lease_owner="daemon").recover_deposited_results(
+            orphaned_before=now,
+        )
+        assert adopted == 1
+
+        # Completed, not requeued -- the application is not submitted twice.
+        assert session.get(WorkItem, work.id).status == "succeeded"
+        assert session.get(WorkAttempt, claimed.attempt.id).status == "succeeded"
+        assert session.get(WorkAttempt, claimed.attempt.id).summary == "Applied to Example Corp"
+
+        # And the payload is consumed, so a later tick cannot adopt it again.
+        assert result_inbox.consume_for_work_item(session, work.id) is None
+
+        # Orphan recovery now has nothing left to requeue.
+        assert (
+            queue.recover_orphaned_attempts(
+                lease_owner="daemon",
+                orphaned_before=now,
+                now=now,
+            )
+            == 0
+        )
+
+
+def test_deposited_result_recovery_leaves_in_flight_attempts_alone(fresh_db: Path) -> None:
+    # An attempt heartbeating after `orphaned_before` belongs to the live
+    # daemon; its result must be consumed by the running poll loop, not stolen
+    # by recovery.
+    now = utc_now()
+    with session_scope() as session:
+        work = WorkRepository(session).create_work_item(
+            title="Still running",
+            task_instruction="In flight.",
+            worker_kind="provider.default",
+        )
+        queue = WorkQueue(session)
+        claimed = queue.claim_next_ready_work(lease_owner="daemon", now=now)
+        assert claimed is not None
+        session.flush()
+
+        _deposit_on(session, token="tok-live", work_item_id=work.id, summary="s", report="r")
+
+        adopted = WorkRunner(session, lease_owner="daemon").recover_deposited_results(
+            orphaned_before=now - timedelta(minutes=5),
+        )
+        assert adopted == 0
+        assert session.get(WorkItem, work.id).status == "running"
+        # The live runtime can still claim its own result.
+        assert result_inbox.consume_for_work_item(session, work.id) is not None
+
+
 def test_late_orphaned_completion_closes_replacement_attempt(fresh_db: Path) -> None:
     now = utc_now()
     with session_scope() as session:
@@ -524,3 +658,74 @@ def test_session_limit_transient_failure_waits_for_reset(fresh_db: Path) -> None
         assert delay >= 300
         assert delay > TRANSIENT_RETRY_DELAY_SECONDS
         assert delay <= 12 * 3600 + 60
+
+
+def test_session_limit_gates_other_provider_claims(fresh_db: Path) -> None:
+    # A session limit is account-wide. Once one run reports it, claiming the
+    # other ready provider items would spend a real attempt each on a
+    # guaranteed instant failure (8 of 10 career applies died that way on
+    # 2026-08-03), so provider work is held until the stated reset.
+    with session_scope() as session:
+        repo = WorkRepository(session)
+        first = repo.create_work_item(
+            title="Apply 1",
+            task_instruction="Apply.",
+            worker_kind="provider.default",
+            max_attempts=1,
+        )
+        repo.create_work_item(
+            title="Apply 2",
+            task_instruction="Apply.",
+            worker_kind="provider.default",
+            max_attempts=1,
+        )
+        function_work = repo.create_work_item(
+            title="Local bookkeeping",
+            task_instruction="No provider needed.",
+            worker_kind="manual",
+        )
+        session.flush()
+
+        queue = WorkQueue(session)
+        now = utc_now()
+        claimed = queue.claim_next_ready_work(lease_owner="daemon", now=now)
+        assert claimed is not None
+        assert claimed.work_item.id == first.id
+        queue.fail_attempt(
+            claimed.attempt.id,
+            error_type="TransientProviderError",
+            error_message="You've hit your session limit · resets 11:40am (America/Los_Angeles)",
+            now=now,
+        )
+
+        assert provider_limit_gate_until() is not None
+
+        # The sibling provider item is ready and due, but must not be claimed.
+        # Non-provider work is unaffected -- the limit is a provider quota, so
+        # the queue skips past the gated apply and claims the local item.
+        nxt = queue.claim_next_ready_work(lease_owner="daemon", now=now)
+        assert nxt is not None
+        assert nxt.work_item.id == function_work.id
+
+        # With only gated provider work left, there is nothing to claim at all.
+        assert queue.claim_next_ready_work(lease_owner="daemon", now=now) is None
+
+
+def test_limit_gate_releases_after_the_reset_passes(fresh_db: Path) -> None:
+    with session_scope() as session:
+        work = WorkRepository(session).create_work_item(
+            title="Apply",
+            task_instruction="Apply.",
+            worker_kind="provider.default",
+        )
+        session.flush()
+        queue = WorkQueue(session)
+        now = utc_now()
+        note_provider_limit_stop(now + timedelta(minutes=30))
+
+        assert queue.claim_next_ready_work(lease_owner="daemon", now=now) is None
+
+        after_reset = now + timedelta(minutes=31)
+        claimed = queue.claim_next_ready_work(lease_owner="daemon", now=after_reset)
+        assert claimed is not None
+        assert claimed.work_item.id == work.id
