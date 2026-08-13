@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session
 from tasque2.config import get_settings
 from tasque2.embeddings import get_embedder, pack_vector, top_k_by_vector, unpack_vector
 from tasque2.memory_vault import mirror_memory
-from tasque2.models import Memory, MemoryEmbedding, WorkEvent, utc_now
+from tasque2.models import Memory, MemoryEmbedding, WorkEvent, WorkItem, utc_now
 
 
 @dataclass(frozen=True)
@@ -607,6 +607,11 @@ class MemoryService:
         summary: str | None = None,
         payload: dict[str, Any] | None = None,
     ) -> WorkEvent:
+        # Old memories can reference work items a jobs reset has since deleted;
+        # emitting the event with that id would violate the FK and make the
+        # memory impossible to archive/supersede. Drop the dangling pointer.
+        if work_item_id is not None and self.session.get(WorkItem, work_item_id) is None:
+            work_item_id = None
         event = WorkEvent(
             event_type=event_type,
             entity_kind="memory",
