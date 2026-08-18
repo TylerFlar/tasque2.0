@@ -75,10 +75,11 @@ def test_discord_output_creates_work_thread_and_posts_once(fresh_db: Path) -> No
 def test_discord_output_reply_followup_reuses_thread_but_spawned_work_opens_new(
     fresh_db: Path,
 ) -> None:
-    """A reply-processor's own response (source_kind 'discord_reply_followup') stays
-    in the thread the user replied in. But a *new* worker the reply-processor then
-    spawns (e.g. the next generator, enqueued via MCP / produces.child_work) opens its
-    own fresh thread, even when it carries the same inherited discord_thread_id."""
+    """Any work item carrying a bound discord_thread_id posts into that thread —
+    reply followups, and also work another worker spawned/relayed into a domain's
+    designated thread (the Daybook queueing the chef must land in the cooking
+    thread, not a fresh one). A fresh thread happens only when no thread id is
+    carried, or when the item opts out with context.discord_new_thread."""
     gateway = FakeDiscordOutputGateway()
     with session_scope() as session:
         repo = WorkRepository(session)
@@ -120,11 +121,12 @@ def test_discord_output_reply_followup_reuses_thread_but_spawned_work_opens_new(
             is None
         )
 
-        # 2) A worker the reply-processor spawns (carrying the inherited thread) opens
-        #    a NEW thread instead of reusing the current one.
+        # 2) A worker the reply-processor spawns carrying the designated thread
+        #    posts into it too — the relay case (Daybook -> chef into the cooking
+        #    thread). No new thread, no re-binding.
         spawned = repo.create_work_item(
-            title="Workout Generator",
-            task_instruction="Next session prescription.",
+            title="Cooking chef — dinner relayed",
+            task_instruction="Recipe and timeline.",
             worker_kind="function.echo",
             discord_thread_id=day_thread_id,
             source_kind="provider_child_work",
@@ -132,9 +134,29 @@ def test_discord_output_reply_followup_reuses_thread_but_spawned_work_opens_new(
         WorkRunner(session).run_next()
         assert _post_pending(service, gateway) == 1
 
+        assert len(gateway.created_threads) == 1
+        assert gateway.sent_messages[-1][0] == day_thread_id
+        assert (
+            session.scalar(select(DiscordThread).where(DiscordThread.work_item_id == spawned.id))
+            is None
+        )
+
+        # 3) An explicit opt-out (context.discord_new_thread) still gets its own
+        #    fresh thread even though it inherited a thread id.
+        opted_out = repo.create_work_item(
+            title="Workout Generator",
+            task_instruction="Next session prescription.",
+            worker_kind="function.echo",
+            discord_thread_id=day_thread_id,
+            source_kind="provider_child_work",
+            context={"discord_new_thread": True},
+        )
+        WorkRunner(session).run_next()
+        assert _post_pending(service, gateway) == 1
+
         assert len(gateway.created_threads) == 2
         new_thread = session.scalar(
-            select(DiscordThread).where(DiscordThread.work_item_id == spawned.id)
+            select(DiscordThread).where(DiscordThread.work_item_id == opted_out.id)
         )
         assert new_thread is not None
         assert new_thread.discord_thread_id != day_thread_id

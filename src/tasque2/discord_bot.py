@@ -80,6 +80,12 @@ def run_bot(
     async def on_message(message: discord.Message) -> None:
         if message.author.bot:
             return
+        # Discord SYSTEM messages (thread renames, pin notices, thread-created
+        # stubs) arrive authored by the acting user, so without this gate a
+        # thread rename reads as that user speaking in every bound thread and
+        # fires its reply processor.
+        if message.type not in (discord.MessageType.default, discord.MessageType.reply):
+            return
         if not _is_author_allowed(str(message.author.id)):
             return
 

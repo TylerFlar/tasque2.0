@@ -773,23 +773,21 @@ class DiscordOutputService:
         if existing is not None:
             return existing
 
-        # A reply-processor's own response stays in the thread the user replied in:
-        # it inherits that thread via work_item.discord_thread_id. Post into the
-        # existing thread instead of opening a new one — but do NOT re-bind it, so the
-        # generator stays the bound owner (handle_thread_reply keeps routing replies
-        # against its reply_followup_work context) and uq_discord_thread_work holds.
+        # A work item that carries a destination thread posts INTO that thread
+        # whenever the thread is one Tasque knows (bound) — regardless of how the
+        # item was enqueued: reply followups, scheduled runs, native handoffs
+        # (meal-plan-handoff), and work another worker relayed via the work_enqueue
+        # MCP tool (a Daybook reply queueing the chef into the cooking thread). Do
+        # NOT re-bind it: the original opener stays the bound owner, so
+        # handle_thread_reply keeps routing replies against its reply_followup_work
+        # context and uq_discord_thread_work holds.
         #
-        # This reuse is limited to direct reply responses (source_kind
-        # "discord_reply_followup") and scheduled runs explicitly bound to a thread
-        # (source_kind "schedule" with a discord_thread_id in the schedule payload --
-        # e.g. an agent-owned "watch" that fires into its own thread). Any *new*
-        # worker a reply-processor spawns (the next generator, via produces.child_work
-        # or the work_enqueue MCP tool) still gets its own fresh thread, even though it
-        # may carry an inherited discord_thread_id.
-        if work_item.discord_thread_id and work_item.source_kind in {
-            "discord_reply_followup",
-            "schedule",
-        }:
+        # The only ways to get a fresh thread are to carry no discord_thread_id at
+        # all (openers, seeds) or to set context.discord_new_thread = true — for a
+        # spawned worker that genuinely deserves its own room despite inheriting a
+        # thread id from its parent.
+        wants_new_thread = bool((work_item.context or {}).get("discord_new_thread"))
+        if work_item.discord_thread_id and not wants_new_thread:
             bound = self.session.scalar(
                 select(DiscordThread).where(
                     DiscordThread.discord_thread_id == work_item.discord_thread_id,
