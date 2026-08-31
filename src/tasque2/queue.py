@@ -32,6 +32,11 @@ TERMINAL_WORK_STATUSES = {"succeeded", "dead_letter", "canceled"}
 TRANSIENT_ERROR_TYPES = frozenset({"TransientProviderError"})
 TRANSIENT_RETRY_FLOOR = 3
 TRANSIENT_RETRY_DELAY_SECONDS = 30
+# A usage-limit stop is "no capacity right now", not an attempt at the task, so
+# it gets its own (higher) floor. Three attempts is plenty for a dropped socket
+# but nowhere near enough to ride out a weekly window, which is why limit stops
+# were the single largest source of dead-lettered work through 2026-08.
+LIMIT_RETRY_FLOOR = 8
 
 # Providers surface subscription usage/session-limit stops as transient errors
 # whose message states the reset time, e.g. "You've hit your session limit ·
@@ -39,12 +44,21 @@ TRANSIENT_RETRY_DELAY_SECONDS = 30
 # transient cadence burns the whole retry floor in ~a minute while the limit
 # is still in force (that is how a career-apply child dead-lettered on
 # 2026-07-08), so limit-shaped failures wait for the stated reset instead.
+#
+# Longer windows state a *date* as well ("resets Aug 19, 11pm"), and a spend
+# cap states no reset at all ("hit your monthly spend limit - raise it at ...").
+# Both used to fall through to the 30-minute fallback and burn the retry floor
+# inside an hour against a window that stays shut for days -- that is how the
+# 2026-08-18 career-apply run failed. So: parse the date form, and scale the
+# no-reset fallback to the stated scope.
 LIMIT_RETRY_FALLBACK_SECONDS = 30 * 60
 LIMIT_RETRY_BUFFER_SECONDS = 5 * 60
-LIMIT_RETRY_MAX_SECONDS = 12 * 60 * 60
+# A stated reset may legitimately be days out on a weekly window; only the
+# *parsed* target is clamped this far, so same-day session resets are unaffected.
+LIMIT_RETRY_MAX_SECONDS = 7 * 24 * 60 * 60
 
 _LIMIT_MESSAGE_RE = re.compile(
-    r"\b(?:session|usage|weekly|rate|hourly|5-hour)[\s-]*limit\b"
+    r"\b(?:session|usage|weekly|monthly|rate|hourly|5-hour)[\s-]*limit\b"
     r"|hit\s+your\b[^.\n]{0,40}\blimit\b"
     r"|limit\s+reached\b",
     re.IGNORECASE,
@@ -53,7 +67,40 @@ _LIMIT_RESET_TIME_RE = re.compile(
     r"\bresets?\b[^0-9\n]{0,15}(?P<hour>\d{1,2})(?::(?P<minute>\d{2}))?\s*(?P<ampm>am|pm)\b",
     re.IGNORECASE,
 )
+# "resets Aug 19, 11pm" / "resets Jul 28, 7:30pm" -- the weekly-window shape.
+_LIMIT_RESET_DATE_RE = re.compile(
+    r"\bresets?\b[^A-Za-z0-9\n]{0,5}(?P<month>[A-Za-z]{3,9})\.?\s+(?P<day>\d{1,2})"
+    r"\s*,?\s*(?P<hour>\d{1,2})(?::(?P<minute>\d{2}))?\s*(?P<ampm>am|pm)\b",
+    re.IGNORECASE,
+)
 _LIMIT_TZ_RE = re.compile(r"\(([A-Za-z]+(?:/[A-Za-z_+\-0-9]+)+)\)")
+_LIMIT_MONTHS = {
+    name: number
+    for number, names in enumerate(
+        (
+            ("jan", "january"),
+            ("feb", "february"),
+            ("mar", "march"),
+            ("apr", "april"),
+            ("may",),
+            ("jun", "june"),
+            ("jul", "july"),
+            ("aug", "august"),
+            ("sep", "sept", "september"),
+            ("oct", "october"),
+            ("nov", "november"),
+            ("dec", "december"),
+        ),
+        start=1,
+    )
+    for name in names
+}
+# When the provider states no reset time, back off by how long the window
+# plausibly lasts rather than the flat 30 minutes a session stop deserves.
+_LIMIT_SCOPE_FALLBACK_SECONDS: tuple[tuple[re.Pattern[str], int], ...] = (
+    (re.compile(r"\bmonthly\b", re.IGNORECASE), 12 * 60 * 60),
+    (re.compile(r"\bweekly\b", re.IGNORECASE), 6 * 60 * 60),
+)
 
 
 def limit_retry_delay_seconds(
@@ -65,46 +112,106 @@ def limit_retry_delay_seconds(
     """Retry delay for a provider usage/session-limit stop, if this is one.
 
     Returns None when the message does not look like a limit stop. When it
-    does, prefer the reset time stated in the message (plus a small buffer);
-    without a parseable time, back off LIMIT_RETRY_FALLBACK_SECONDS instead of
-    the normal transient cadence.
+    does, prefer the reset stated in the message (plus a small buffer), whether
+    that reset names a date ("resets Aug 19, 11pm") or only a time-of-day
+    ("resets 11:40am"). With no parseable reset, back off by the window's stated
+    scope instead of the normal transient cadence.
     """
     message = (error_message or "").strip()
     if not message or _LIMIT_MESSAGE_RE.search(message) is None:
         return None
-    time_match = _LIMIT_RESET_TIME_RE.search(message)
-    if time_match is None:
-        return LIMIT_RETRY_FALLBACK_SECONDS
-    hour = int(time_match.group("hour"))
-    minute = int(time_match.group("minute") or 0)
-    ampm = time_match.group("ampm").lower()
+
+    fallback = _limit_scope_fallback_seconds(message)
+    date_match = _LIMIT_RESET_DATE_RE.search(message)
+    time_match = None if date_match is not None else _LIMIT_RESET_TIME_RE.search(message)
+    if date_match is None and time_match is None:
+        return fallback
+
+    match = date_match or time_match
+    assert match is not None  # narrowed by the check above
+    clock = _parse_reset_clock(match)
+    if clock is None:
+        return fallback
+    hour, minute = clock
+
+    tzinfo = _resolve_reset_timezone(message, default_timezone)
+    if tzinfo is None:
+        return fallback
+
+    local_now = (now or utc_now()).astimezone(tzinfo)
+    if date_match is not None:
+        target = _reset_target_from_date(date_match, local_now, hour, minute)
+        if target is None:
+            return fallback
+    else:
+        target = local_now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if target <= local_now:
+            target += timedelta(days=1)
+    delay = int((target - local_now).total_seconds()) + LIMIT_RETRY_BUFFER_SECONDS
+    return max(60, min(delay, LIMIT_RETRY_MAX_SECONDS))
+
+
+def _limit_scope_fallback_seconds(message: str) -> int:
+    """Backoff for a limit stop that states no reset, scaled to its scope."""
+    for pattern, seconds in _LIMIT_SCOPE_FALLBACK_SECONDS:
+        if pattern.search(message) is not None:
+            return seconds
+    return LIMIT_RETRY_FALLBACK_SECONDS
+
+
+def _parse_reset_clock(match: re.Match[str]) -> tuple[int, int] | None:
+    """12-hour clock from a reset match, normalized to 24-hour (hour, minute)."""
+    hour = int(match.group("hour"))
+    minute = int(match.group("minute") or 0)
     if not (1 <= hour <= 12 and 0 <= minute <= 59):
-        return LIMIT_RETRY_FALLBACK_SECONDS
+        return None
+    ampm = match.group("ampm").lower()
     if ampm == "pm" and hour != 12:
         hour += 12
     elif ampm == "am" and hour == 12:
         hour = 0
+    return hour, minute
 
-    tzinfo = None
+
+def _resolve_reset_timezone(message: str, default_timezone: str | None) -> ZoneInfo | None:
+    """Timezone the reset is stated in: message first, then caller, then settings."""
     tz_match = _LIMIT_TZ_RE.search(message)
     for tz_name in filter(None, (tz_match.group(1) if tz_match else None, default_timezone)):
         try:
-            tzinfo = ZoneInfo(tz_name)
-            break
+            return ZoneInfo(tz_name)
         except (KeyError, ValueError):
             continue
-    if tzinfo is None:
-        try:
-            tzinfo = ZoneInfo(get_settings().timezone)
-        except (KeyError, ValueError):
-            return LIMIT_RETRY_FALLBACK_SECONDS
+    try:
+        return ZoneInfo(get_settings().timezone)
+    except (KeyError, ValueError):
+        return None
 
-    local_now = (now or utc_now()).astimezone(tzinfo)
-    target = local_now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-    if target <= local_now:
-        target += timedelta(days=1)
-    delay = int((target - local_now).total_seconds()) + LIMIT_RETRY_BUFFER_SECONDS
-    return max(60, min(delay, LIMIT_RETRY_MAX_SECONDS))
+
+def _reset_target_from_date(
+    match: re.Match[str],
+    local_now: datetime,
+    hour: int,
+    minute: int,
+) -> datetime | None:
+    """Absolute reset instant for a dated reset, resolving the unstated year.
+
+    The provider states no year, so pick the one that puts the reset ahead of
+    now -- which is what rolls "resets Jan 2" forward correctly on Dec 31.
+    """
+    month = _LIMIT_MONTHS.get(match.group("month").lower())
+    day = int(match.group("day"))
+    if month is None or not (1 <= day <= 31):
+        return None
+    for year in (local_now.year, local_now.year + 1):
+        try:
+            target = local_now.replace(
+                year=year, month=month, day=day, hour=hour, minute=minute, second=0, microsecond=0
+            )
+        except ValueError:  # e.g. Feb 30, or Feb 29 in a common year
+            continue
+        if target > local_now:
+            return target
+    return None
 
 
 # A provider session limit is account-wide, not per-item: once one run is told
@@ -365,6 +472,10 @@ class WorkQueue:
             attempt.ended_at = now
             attempt.error_type = "LeaseExpired"
             attempt.error_message = "The work attempt lease expired before completion."
+            # The subprocess behind an expired lease is gone with it. Without
+            # this its ProviderRun row stays "running" forever and shows up as
+            # phantom in-flight work in status output.
+            self._close_running_provider_runs(attempt, now=now, marker="lease_expired")
             self._transition_after_failure(
                 attempt,
                 now=now,
@@ -373,6 +484,29 @@ class WorkQueue:
             )
 
         return len(attempts)
+
+    def _close_running_provider_runs(
+        self,
+        attempt: WorkAttempt,
+        *,
+        now: datetime,
+        marker: str,
+        extra: dict[str, object] | None = None,
+    ) -> list[ProviderRun]:
+        """Mark this attempt's still-'running' provider runs as orphaned."""
+        provider_runs = list(
+            self.session.scalars(
+                select(ProviderRun).where(
+                    ProviderRun.attempt_id == attempt.id,
+                    ProviderRun.status == "running",
+                )
+            ).all()
+        )
+        for provider_run in provider_runs:
+            provider_run.status = "orphaned"
+            provider_run.ended_at = now
+            provider_run.usage = {**(provider_run.usage or {}), marker: True, **(extra or {})}
+        return provider_runs
 
     def recover_orphaned_attempts(
         self,
@@ -414,19 +548,9 @@ class WorkQueue:
                 work_item.not_before = None
                 work_item.max_attempts = max(work_item.max_attempts, work_item.attempt_count + 1)
 
-            provider_runs = self.session.scalars(
-                select(ProviderRun).where(
-                    ProviderRun.attempt_id == attempt.id,
-                    ProviderRun.status == "running",
-                )
-            ).all()
-            for provider_run in provider_runs:
-                provider_run.status = "orphaned"
-                provider_run.ended_at = now
-                provider_run.usage = {
-                    **(provider_run.usage or {}),
-                    "orphaned_recovered": True,
-                }
+            provider_runs = self._close_running_provider_runs(
+                attempt, now=now, marker="orphaned_recovered"
+            )
 
             self._emit_event(
                 event_type="work.orphaned_attempt_recovered",
@@ -522,19 +646,12 @@ class WorkQueue:
             sibling.error_type = "SupersededAttempt"
             sibling.error_message = summary
 
-            provider_runs = self.session.scalars(
-                select(ProviderRun).where(
-                    ProviderRun.attempt_id == sibling.id,
-                    ProviderRun.status == "running",
-                )
-            ).all()
-            for provider_run in provider_runs:
-                provider_run.status = "orphaned"
-                provider_run.ended_at = now
-                provider_run.usage = {
-                    **(provider_run.usage or {}),
-                    "superseded_by_attempt_id": attempt.id,
-                }
+            provider_runs = self._close_running_provider_runs(
+                sibling,
+                now=now,
+                marker="superseded",
+                extra={"superseded_by_attempt_id": attempt.id},
+            )
 
             self._emit_event(
                 event_type="work.sibling_attempt_superseded",
@@ -642,9 +759,13 @@ class WorkQueue:
         max_attempts. Transient/infra failures (TRANSIENT_ERROR_TYPES) are
         guaranteed at least TRANSIENT_RETRY_FLOOR attempts regardless, so a
         single dropped socket cannot permanently dead-letter a max_attempts=1
-        work item that never ran to completion.
+        work item that never ran to completion. Usage-limit stops get the larger
+        LIMIT_RETRY_FLOOR: each one costs an attempt but ran no task, and a
+        weekly window outlasts the transient floor several times over.
         """
         if (attempt.error_type or "") in TRANSIENT_ERROR_TYPES:
+            if limit_retry_delay_seconds(attempt.error_message) is not None:
+                return max(work_item.max_attempts, LIMIT_RETRY_FLOOR)
             return max(work_item.max_attempts, TRANSIENT_RETRY_FLOOR)
         return work_item.max_attempts
 

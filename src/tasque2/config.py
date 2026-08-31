@@ -78,6 +78,19 @@ class Settings(BaseSettings):
     # source memories created huge recall noise; off by default. Deliberate
     # memory_ingest_* calls still work regardless of this flag.
     memory_auto_ingest: bool = Field(default=False)
+    # Artifact retention. Raw provider streams are debug material: one per run,
+    # ~500KB each, and nothing ever collected them -- by 2026-08 they were 4.9GB
+    # of the 6.2GB artifact store. Files older than the window are deleted from
+    # disk and their rows archived (the row stays as a record of what ran).
+    # Set artifact_retention_days=0 to disable pruning entirely.
+    artifact_retention_days: int = Field(default=30)
+    artifact_retention_kinds: str = Field(default="provider_stream")
+    # How often the daemon runs the retention pass. It is bookkeeping, not work.
+    artifact_retention_interval_seconds: int = Field(default=6 * 60 * 60)
+
+    @property
+    def artifact_retention_kind_list(self) -> list[str]:
+        return [kind.strip() for kind in self.artifact_retention_kinds.split(",") if kind.strip()]
 
     @property
     def resolved_data_dir(self) -> Path:

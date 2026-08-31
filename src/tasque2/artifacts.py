@@ -3,13 +3,15 @@ from __future__ import annotations
 import hashlib
 import mimetypes
 import shutil
+from dataclasses import dataclass
+from datetime import timedelta
 from pathlib import Path
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from tasque2.config import get_settings
-from tasque2.models import Artifact, new_id
+from tasque2.models import Artifact, new_id, utc_now
 from tasque2.repo import WorkRepository
 
 
@@ -201,3 +203,68 @@ class ArtifactService:
         if artifact is None:
             raise KeyError(f"Unknown artifact: {artifact_id}")
         return artifact
+
+
+@dataclass(frozen=True)
+class PruneResult:
+    pruned: int
+    bytes_freed: int
+
+    @property
+    def megabytes_freed(self) -> float:
+        return self.bytes_freed / 1048576
+
+
+def prune_artifacts(
+    session: Session,
+    *,
+    kinds: list[str] | None = None,
+    older_than_days: int | None = None,
+    limit: int = 2000,
+) -> PruneResult:
+    """Delete the files of aged-out artifacts and archive their rows.
+
+    Only the bytes go: the row survives (archived) so the record of which run
+    produced what is never lost, and read paths already skip archived rows. Rows
+    with no file left on disk are archived too, so a partially-cleaned store
+    converges instead of being rescanned every pass.
+    """
+    settings = get_settings()
+    window = settings.artifact_retention_days if older_than_days is None else older_than_days
+    if window <= 0:
+        return PruneResult(pruned=0, bytes_freed=0)
+    target_kinds = kinds if kinds is not None else settings.artifact_retention_kind_list
+    if not target_kinds:
+        return PruneResult(pruned=0, bytes_freed=0)
+
+    cutoff = utc_now() - timedelta(days=window)
+    rows = session.scalars(
+        select(Artifact)
+        .where(
+            Artifact.kind.in_(target_kinds),
+            Artifact.archived_at.is_(None),
+            Artifact.created_at < cutoff,
+        )
+        .order_by(Artifact.created_at.asc())
+        .limit(limit)
+    ).all()
+
+    pruned = 0
+    freed = 0
+    now = utc_now()
+    for artifact in rows:
+        if artifact.local_path:
+            path = Path(artifact.local_path)
+            try:
+                if path.is_file():
+                    freed += path.stat().st_size
+                    path.unlink()
+            except OSError:
+                # A file held open or already gone is not a reason to stall the
+                # pass; the row is archived either way so it is not retried.
+                pass
+        artifact.archived_at = now
+        pruned += 1
+    if pruned:
+        session.flush()
+    return PruneResult(pruned=pruned, bytes_freed=freed)

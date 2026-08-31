@@ -7,6 +7,7 @@ from datetime import datetime
 
 from sqlalchemy.orm import Session
 
+from tasque2.artifacts import prune_artifacts
 from tasque2.config import get_settings
 from tasque2.db import session_scope
 from tasque2.memory_ingest import MemoryIngestService
@@ -18,6 +19,29 @@ from tasque2.workflows import WorkflowService
 
 # Sentinel returned by the concurrent worker when nothing was claimable.
 _NO_WORK = object()
+
+# Artifact retention is bookkeeping, not work: running it on every tick would
+# rescan the store every few seconds for nothing. Process-local like the limit
+# gate -- a restarted daemon simply prunes once on its first tick.
+_retention_lock = threading.Lock()
+_last_retention_at: datetime | None = None
+
+
+def reset_artifact_retention_clock() -> None:
+    """Forget when retention last ran (used by tests)."""
+    global _last_retention_at
+    with _retention_lock:
+        _last_retention_at = None
+
+
+def _claim_retention_slot(now: datetime, interval_seconds: int) -> bool:
+    """True when the retention pass is due, reserving the slot if so."""
+    global _last_retention_at
+    with _retention_lock:
+        if _last_retention_at is not None and (now - _last_retention_at).total_seconds() < interval_seconds:
+            return False
+        _last_retention_at = now
+        return True
 
 
 def _run_work_concurrently(
@@ -216,6 +240,7 @@ class DaemonTickResult:
     memory_ingested: int = 0
     expired_overdue: int = 0
     recovered_results: int = 0
+    artifacts_pruned: int = 0
 
     @property
     def has_activity(self) -> bool:
@@ -229,6 +254,7 @@ class DaemonTickResult:
                 self.memory_ingested,
                 self.expired_overdue,
                 self.recovered_results,
+                self.artifacts_pruned,
             )
         )
 
@@ -327,6 +353,7 @@ class TasqueDaemon:
             if get_settings().memory_auto_ingest
             else 0
         )
+        artifacts_pruned = self._prune_artifacts_if_due(settings)
         self.session.flush()
         return DaemonTickResult(
             recovered_leases=recovered,
@@ -337,4 +364,23 @@ class TasqueDaemon:
             memory_ingested=memory_ingested,
             expired_overdue=expired_overdue,
             recovered_results=recovered_results,
+            artifacts_pruned=artifacts_pruned,
         )
+
+    def _prune_artifacts_if_due(self, settings) -> int:
+        """Run the artifact retention pass when its interval has elapsed."""
+        if settings.artifact_retention_days <= 0:
+            return 0
+        if not _claim_retention_slot(utc_now(), settings.artifact_retention_interval_seconds):
+            return 0
+        try:
+            result = prune_artifacts(self.session)
+        except Exception as exc:  # noqa: BLE001 - retention must never break a tick
+            print(f"Tasque artifact retention failed: {exc}")
+            return 0
+        if result.pruned:
+            print(
+                f"Tasque artifact retention: pruned {result.pruned} artifacts "
+                f"({result.megabytes_freed:.1f} MB)"
+            )
+        return result.pruned

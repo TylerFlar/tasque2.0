@@ -18,11 +18,13 @@ from tasque2.models import (
     utc_now,
 )
 from tasque2.queue import (
+    LIMIT_RETRY_FLOOR,
     TRANSIENT_RETRY_DELAY_SECONDS,
     TRANSIENT_RETRY_FLOOR,
     WorkQueue,
     note_provider_limit_stop,
     provider_limit_gate_until,
+    reset_provider_limit_gate,
 )
 from tasque2.repo import WorkRepository
 from tasque2.runtime import FunctionWorkerRegistry, WorkerResult, WorkRunner
@@ -617,12 +619,37 @@ def test_limit_retry_delay_parses_reset_time() -> None:
     )
     assert delay == int(3.5 * 3600) + LIMIT_RETRY_BUFFER_SECONDS
 
-    # Limit-shaped message without a parseable clock time backs off the
-    # fallback instead of the 30-second transient cadence.
+    # Limit-shaped message without a parseable clock time backs off a fallback
+    # scaled to the window's scope, not the 30-second transient cadence.
     assert (
         limit_retry_delay_seconds("You've hit your weekly limit - resets Jul 15, 2026")
-        == LIMIT_RETRY_FALLBACK_SECONDS
+        == 6 * 3600
     )
+    assert limit_retry_delay_seconds("You've hit your session limit") == LIMIT_RETRY_FALLBACK_SECONDS
+    # A spend cap states no reset at all; 30 minutes would just burn attempts.
+    assert (
+        limit_retry_delay_seconds(
+            "You've hit your monthly spend limit · raise it at claude.ai/settings/usage"
+        )
+        == 12 * 3600
+    )
+
+    # A weekly window states a date as well as a time; the retry must wait for
+    # the actual reset rather than falling through to the short fallback.
+    delay = limit_retry_delay_seconds(
+        "You've hit your weekly limit · resets Aug 19, 11pm (America/Los_Angeles)",
+        now=datetime(2026, 8, 18, 15, 17, tzinfo=tz),
+    )
+    # 08-18 15:17 -> 08-19 23:00 is 31h43m.
+    assert delay == 31 * 3600 + 43 * 60 + LIMIT_RETRY_BUFFER_SECONDS
+
+    # An unstated year resolves forward, so a New Year reset does not land in
+    # the past and collapse to the fallback.
+    delay = limit_retry_delay_seconds(
+        "weekly limit · resets Jan 2, 9am (America/Los_Angeles)",
+        now=datetime(2026, 12, 31, 12, 0, tzinfo=tz),
+    )
+    assert delay == 45 * 3600 + LIMIT_RETRY_BUFFER_SECONDS  # Dec 31 12:00 -> Jan 2 09:00
 
     # Ordinary transient messages keep the normal cadence.
     assert limit_retry_delay_seconds("API Error: socket closed unexpectedly") is None
@@ -653,11 +680,90 @@ def test_session_limit_transient_failure_waits_for_reset(fresh_db: Path) -> None
         refreshed = session.get(WorkItem, work.id)
         assert refreshed.status == "ready"
         delay = (refreshed.not_before - now).total_seconds()
-        # Reset-aware: at least the buffer, never the 30s cadence, and capped
-        # regardless of what wall-clock time the test runs at.
+        # Reset-aware: at least the buffer, never the 30s cadence, and bounded
+        # by a day regardless of what wall-clock time the test runs at -- a
+        # time-only reset can be at most tomorrow at the stated hour.
         assert delay >= 300
         assert delay > TRANSIENT_RETRY_DELAY_SECONDS
-        assert delay <= 12 * 3600 + 60
+        assert delay <= 24 * 3600 + 360
+
+
+def test_expired_lease_closes_its_provider_run(fresh_db: Path) -> None:
+    # The subprocess behind an expired lease is gone with it. Leaving the
+    # ProviderRun row "running" made it phantom in-flight work in status output
+    # forever -- four such rows were still open weeks later in 2026-08.
+    with session_scope() as session:
+        repo = WorkRepository(session)
+        repo.create_work_item(
+            title="Leased apply",
+            task_instruction="Apply.",
+            worker_kind="provider.default",
+        )
+        queue = WorkQueue(session)
+        now = utc_now()
+        claimed = queue.claim_next_ready_work(
+            lease_owner="daemon", lease_seconds=60, now=now
+        )
+        assert claimed is not None
+        run = ProviderRun(
+            attempt_id=claimed.attempt.id,
+            provider="claude",
+            model="claude-sonnet-5",
+            status="running",
+            started_at=now,
+        )
+        session.add(run)
+        session.flush()
+        run_id = run.id
+
+        queue.recover_expired_leases(now=now + timedelta(seconds=120))
+
+        refreshed = session.get(ProviderRun, run_id)
+        assert refreshed.status == "orphaned"
+        assert refreshed.ended_at is not None
+
+
+def test_limit_stops_do_not_burn_the_transient_retry_floor(fresh_db: Path) -> None:
+    # A limit stop ran no task -- it means "no capacity right now". Three
+    # attempts is enough for a dropped socket but nowhere near a weekly window,
+    # so limit stops get their own larger floor. Before this, a weekly limit
+    # spent the whole transient floor inside an hour and dead-lettered the work
+    # (that is how the 2026-08-18 career-apply run died).
+    with session_scope() as session:
+        work = WorkRepository(session).create_work_item(
+            title="Weekly-limited apply",
+            task_instruction="Apply.",
+            worker_kind="provider.default",
+            max_attempts=1,
+        )
+        work_id = work.id
+        queue = WorkQueue(session)
+
+        for attempt_number in range(1, LIMIT_RETRY_FLOOR + 1):
+            reset_provider_limit_gate()  # the gate is not what is under test here
+            refreshed = session.get(WorkItem, work_id)
+            refreshed.not_before = None
+            session.flush()
+            claimed = queue.claim_next_ready_work(lease_owner="daemon", now=utc_now())
+            assert claimed is not None, f"work was not claimable on attempt {attempt_number}"
+            queue.fail_attempt(
+                claimed.attempt.id,
+                error_type="TransientProviderError",
+                error_message=(
+                    "You've hit your weekly limit · resets Dec 30, 11pm (America/Los_Angeles)"
+                ),
+                now=utc_now(),
+            )
+            refreshed = session.get(WorkItem, work_id)
+            if attempt_number < LIMIT_RETRY_FLOOR:
+                # Notably still alive at TRANSIENT_RETRY_FLOOR, where it used to die.
+                assert refreshed.status == "ready", f"died on attempt {attempt_number}"
+                # And each retry waits for the stated reset, not the 30s cadence.
+                assert (refreshed.not_before - utc_now()).total_seconds() > 3600
+
+        # Exhausting the limit floor still dead-letters, so nothing retries forever.
+        assert refreshed.attempt_count == LIMIT_RETRY_FLOOR
+        assert refreshed.status == "dead_letter"
 
 
 def test_session_limit_gates_other_provider_claims(fresh_db: Path) -> None:

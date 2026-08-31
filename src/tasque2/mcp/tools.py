@@ -2086,7 +2086,10 @@ def _image_edit(
             "applied": applied,
             "dimensions": list(edited.size),
             "queued_for_discord": bool(send),
-            "hint": "Read local_path to view it; add artifact_id to produces.discord_upload_artifact_ids to send.",
+            "hint": (
+                "Read local_path to view it; add artifact_id to "
+                "produces.discord_upload_artifact_ids to send."
+            ),
         }
 
 
@@ -2185,7 +2188,10 @@ def _photoshop_edit(
             "artifact_id": artifact.id,
             "local_path": artifact.local_path,
             "queued_for_discord": bool(send),
-            "hint": "Read local_path to view it; add artifact_id to produces.discord_upload_artifact_ids to send.",
+            "hint": (
+                "Read local_path to view it; add artifact_id to "
+                "produces.discord_upload_artifact_ids to send."
+            ),
         }
 
 
