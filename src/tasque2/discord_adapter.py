@@ -1129,6 +1129,15 @@ _MODEL_ROUTING_CONTRACT_KEYS = (
 )
 
 
+# Contract keys a reply child inherits from its parent beyond model routing.
+# ``mcp_servers`` belongs here: a parent that was deliberately narrowed to the
+# servers it actually uses should not spawn reply children that silently fall
+# back to TASQUE2_DEFAULT_MCP_SERVERS and pay for every tool schema again. The
+# reply config can still override it, and an explicit [] still means "tasque2
+# only" rather than "unset".
+_INHERITED_RUNTIME_CONTRACT_KEYS = ("mcp_servers",)
+
+
 def _reply_followup_runtime_contract(
     *,
     parent_contract: dict[str, Any],
@@ -1140,6 +1149,9 @@ def _reply_followup_runtime_contract(
         for key in _MODEL_ROUTING_CONTRACT_KEYS:
             if key in parent_contract:
                 runtime_contract[key] = parent_contract[key]
+    for key in _INHERITED_RUNTIME_CONTRACT_KEYS:
+        if key in parent_contract:
+            runtime_contract[key] = parent_contract[key]
     runtime_contract.update(config_contract)
     return runtime_contract
 

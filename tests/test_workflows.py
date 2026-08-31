@@ -548,3 +548,189 @@ def test_fan_out_child_failure_without_tolerance_still_fails_run(fresh_db: Path)
         )
         assert report_node is not None
         assert report_node.work_item_id is None
+
+
+def test_scout_lane_fan_out_feeds_merge_then_apply_fan_out(fresh_db: Path) -> None:
+    # career-apply shape as of 2026-08-19: the scout is a static-items fan_out of
+    # four search lanes -> a merge node that is the only place with a global view
+    # -> a second fan_out over merge's picked batch -> report. Guards the two
+    # claims that topology rests on: merge waits for EVERY lane before it runs
+    # (so it can dedupe across all of them), and the lanes' outputs are readable
+    # downstream by node_key the way the worker context packet exposes them.
+    lanes = [
+        {"key": "remote-us", "name": "Remote US"},
+        {"key": "san-diego", "name": "San Diego"},
+        {"key": "ats-direct", "name": "ATS sweep"},
+        {"key": "wildcard", "name": "Wildcard"},
+    ]
+    definition = {
+        "nodes": [
+            {
+                "key": "scout",
+                "kind": "fan_out",
+                "items": lanes,
+                "tolerate_child_failures": True,
+                "child_title_template": "Scout: {item[name]}",
+                "child_task_instruction_template": "Sweep the {item[name]} lane.",
+                "child_worker_kind": "provider.fake",
+            },
+            {
+                "key": "merge",
+                "kind": "work",
+                "title": "Merge lanes",
+                "task_instruction": "Dedupe and pick the batch.",
+                "worker_kind": "provider.fake",
+                "depends_on": ["scout"],
+            },
+            {
+                "key": "apply",
+                "kind": "fan_out",
+                "items_from_output": "merge.jobs",
+                "tolerate_child_failures": True,
+                "child_title_template": "Apply: {item[company]}",
+                "child_task_instruction_template": "Apply to {item[company]}.",
+                "child_worker_kind": "function.echo",
+                "depends_on": ["merge"],
+            },
+            {
+                "key": "report",
+                "kind": "work",
+                "task_instruction": "Report.",
+                "worker_kind": "function.echo",
+                "depends_on": ["apply"],
+            },
+        ]
+    }
+    with session_scope() as session:
+        service = WorkflowService(session)
+        workflow_definition = service.create_definition(
+            name="career-apply-shape",
+            version="1",
+            definition=definition,
+        )
+        run = service.start_run(workflow_definition_id=workflow_definition.id)
+
+        service.tick_runs()  # expands the scout fan-out
+        service.tick_runs()  # enqueues the lane children
+
+        def node(key: str) -> WorkflowNode:
+            found = session.scalar(
+                select(WorkflowNode).where(
+                    WorkflowNode.workflow_run_id == run.id,
+                    WorkflowNode.node_key == key,
+                )
+            )
+            assert found is not None, key
+            return found
+
+        lane_keys = [f"scout.{index}" for index in range(len(lanes))]
+        assert [node(key).definition["title"] for key in lane_keys] == [
+            "Scout: Remote US",
+            "Scout: San Diego",
+            "Scout: ATS sweep",
+            "Scout: Wildcard",
+        ]
+        # Each lane carries its own mandate through as `item`.
+        assert node("scout.0").input["item"]["key"] == "remote-us"
+
+        # Merge must not start while any lane is outstanding.
+        for finished, key in enumerate(lane_keys, start=1):
+            WorkRunner(session).run_next()
+            attempt = node(key).work_item.attempts[0]
+            attempt.produces = {"lane": lanes[finished - 1]["key"], "candidates": [{"slug": f"s{finished}"}]}
+            session.flush()
+            service.tick_runs()
+            if finished < len(lane_keys):
+                assert node("merge").work_item_id is None, (
+                    f"merge started with only {finished}/{len(lane_keys)} lanes done"
+                )
+
+        merge_node = node("merge")
+        assert merge_node.work_item_id is not None, "merge never started after all lanes finished"
+
+        # Every lane's output is readable downstream by node_key -- this is what
+        # the merge template reads out of workflow.nodes[*].output.
+        assert [node(key).output["lane"] for key in lane_keys] == [lane["key"] for lane in lanes]
+
+        # merge picks the batch; apply fans out over exactly that batch.
+        WorkRunner(session).run_next()
+        merge_node.work_item.attempts[0].produces = {
+            "jobs": [{"company": "Acme"}, {"company": "Globex"}]
+        }
+        session.flush()
+        service.tick_runs()
+        service.tick_runs()
+
+        apply_children = session.scalars(
+            select(WorkflowNode)
+            .where(
+                WorkflowNode.workflow_run_id == run.id,
+                WorkflowNode.node_key.like("apply.%"),
+            )
+            .order_by(WorkflowNode.node_key)
+        ).all()
+        assert [child.definition["title"] for child in apply_children] == [
+            "Apply: Acme",
+            "Apply: Globex",
+        ]
+
+        for _ in apply_children:
+            WorkRunner(session).run_next()
+        service.tick_runs()
+        WorkRunner(session).run_next()  # report
+        service.tick_runs()
+
+        assert node("report").status == "succeeded"
+        assert session.get(WorkflowRun, run.id).status == "completed"
+
+
+def test_scout_lane_failure_does_not_block_merge(fresh_db: Path) -> None:
+    # A lane that dies must not strand the run: the surviving lanes still reach
+    # merge, which is why the scout node sets tolerate_child_failures.
+    definition = {
+        "nodes": [
+            {
+                "key": "scout",
+                "kind": "fan_out",
+                "items": [{"key": "remote-us"}, {"key": "wildcard"}],
+                "tolerate_child_failures": True,
+                "child_title_template": "Scout: {item[key]}",
+                "child_task_instruction_template": "Sweep {item[key]}.",
+                "child_worker_kind": "missing.worker",
+            },
+            {
+                "key": "merge",
+                "kind": "work",
+                "task_instruction": "Merge.",
+                "worker_kind": "function.echo",
+                "depends_on": ["scout"],
+            },
+        ]
+    }
+    with session_scope() as session:
+        service = WorkflowService(session)
+        workflow_definition = service.create_definition(
+            name="career-scout-tolerance",
+            version="1",
+            definition=definition,
+        )
+        run = service.start_run(workflow_definition_id=workflow_definition.id)
+
+        service.tick_runs()
+        service.tick_runs()
+        WorkRunner(session).run_next()
+        WorkRunner(session).run_next()
+        service.tick_runs()
+
+        merge_node = session.scalar(
+            select(WorkflowNode).where(
+                WorkflowNode.workflow_run_id == run.id,
+                WorkflowNode.node_key == "merge",
+            )
+        )
+        assert merge_node is not None
+        assert merge_node.work_item_id is not None, "a dead lane stranded the merge node"
+
+        WorkRunner(session).run_next()
+        service.tick_runs()
+        assert session.get(WorkflowRun, run.id).status == "completed"
