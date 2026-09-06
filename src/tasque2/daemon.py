@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 from tasque2.artifacts import prune_artifacts
 from tasque2.config import get_settings
 from tasque2.db import session_scope
+from tasque2.memory import expire_ttl_memories
 from tasque2.memory_ingest import MemoryIngestService
 from tasque2.models import utc_now
 from tasque2.queue import WorkQueue
@@ -20,28 +21,76 @@ from tasque2.workflows import WorkflowService
 # Sentinel returned by the concurrent worker when nothing was claimable.
 _NO_WORK = object()
 
-# Artifact retention is bookkeeping, not work: running it on every tick would
-# rescan the store every few seconds for nothing. Process-local like the limit
-# gate -- a restarted daemon simply prunes once on its first tick.
-_retention_lock = threading.Lock()
-_last_retention_at: datetime | None = None
+
+class _IntervalGate:
+    """Process-local "is this pass due yet" clock for tick-time bookkeeping.
+
+    Retention-style sweeps are bookkeeping, not work: running them on every tick
+    would rescan the store every few seconds for nothing. Process-local like the
+    limit gate -- a restarted daemon simply runs each pass once on its first tick.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._last_at: datetime | None = None
+
+    def claim(self, now: datetime, interval_seconds: int) -> bool:
+        """True when the pass is due, reserving the slot if so."""
+        with self._lock:
+            if self._last_at is not None and (now - self._last_at).total_seconds() < interval_seconds:
+                return False
+            self._last_at = now
+            return True
+
+    def reset(self) -> None:
+        with self._lock:
+            self._last_at = None
 
 
-def reset_artifact_retention_clock() -> None:
-    """Forget when retention last ran (used by tests)."""
-    global _last_retention_at
-    with _retention_lock:
-        _last_retention_at = None
+_artifact_retention_gate = _IntervalGate()
+_memory_ttl_gate = _IntervalGate()
 
 
-def _claim_retention_slot(now: datetime, interval_seconds: int) -> bool:
-    """True when the retention pass is due, reserving the slot if so."""
-    global _last_retention_at
-    with _retention_lock:
-        if _last_retention_at is not None and (now - _last_retention_at).total_seconds() < interval_seconds:
-            return False
-        _last_retention_at = now
-        return True
+def reset_bookkeeping_clocks() -> None:
+    """Forget when the bookkeeping passes last ran (used by tests)."""
+    _artifact_retention_gate.reset()
+    _memory_ttl_gate.reset()
+
+
+def _claim_and_run_one(
+    *,
+    claim_lock: threading.Lock,
+    lease_owner: str,
+    lease_seconds: int | None,
+    holder: dict[str, str | None] | None = None,
+) -> object:
+    """Claim the next ready item under ``claim_lock`` and run it in its own session.
+
+    SQLite allows a single writer, so the *claim* step (the only place two
+    threads would fight for the write lock) is serialized and committed before
+    the lock is released -- no two workers can claim the same item, and no write
+    lock is held across a subprocess (``ProviderRuntime.run`` commits before it
+    spawns one). ``holder`` receives the attempt id once claimed so a caller can
+    keep the lease fresh while the run is in flight. Returns ``_NO_WORK`` when
+    nothing was claimable.
+    """
+    with session_scope() as session:
+        runner = WorkRunner(
+            session,
+            lease_owner=lease_owner,
+            lease_seconds=lease_seconds,
+        )
+        with claim_lock:
+            claimed = runner.claim()
+            if claimed is None:
+                return _NO_WORK
+            # Publish the claim (status=running) before releasing the lock so a
+            # sibling worker can't re-claim the same item against a stale
+            # pre-commit snapshot.
+            session.commit()
+        if holder is not None:
+            holder["attempt_id"] = claimed.attempt.id
+        return runner.execute(claimed)
 
 
 def _run_work_concurrently(
@@ -54,32 +103,12 @@ def _run_work_concurrently(
     """Drain up to ``max_work_items`` ready work items using ``concurrency`` threads.
 
     Each worker thread runs in its own ``session_scope`` so the long provider
-    subprocesses execute in parallel. SQLite allows a single writer, so the
-    *claim* step (the only place two threads would fight for the write lock) is
-    serialized with a process-local lock and committed before the lock is
-    released -- no two workers can claim the same item, and no write lock is held
-    across a subprocess (``ProviderRuntime.run`` commits before it spawns one).
+    subprocesses execute in parallel; see ``_claim_and_run_one`` for why the
+    claim itself is serialized.
     """
     claim_lock = threading.Lock()
     counter_lock = threading.Lock()
     counter = {"ran": 0}
-
-    def claim_and_run_one() -> object:
-        with session_scope() as session:
-            runner = WorkRunner(
-                session,
-                lease_owner=lease_owner,
-                lease_seconds=lease_seconds,
-            )
-            with claim_lock:
-                claimed = runner.claim()
-                if claimed is None:
-                    return _NO_WORK
-                # Publish the claim (status=running) before releasing the lock so
-                # a sibling worker can't re-claim the same item against a stale
-                # pre-commit snapshot.
-                session.commit()
-            return runner.execute(claimed)
 
     def worker(index: int) -> int:
         ran = 0
@@ -89,7 +118,11 @@ def _run_work_concurrently(
                     break
                 counter["ran"] += 1  # reserve a slot before claiming
             try:
-                outcome: object = claim_and_run_one()
+                outcome: object = _claim_and_run_one(
+                    claim_lock=claim_lock,
+                    lease_owner=lease_owner,
+                    lease_seconds=lease_seconds,
+                )
             except Exception as exc:  # noqa: BLE001 - isolate one worker from the pool
                 print(f"Tasque daemon worker {index} failed: {exc}")
                 outcome = _NO_WORK
@@ -184,21 +217,12 @@ class _BackgroundWorkPool:
         lease_owner: str,
         lease_seconds: int | None,
     ) -> object:
-        with session_scope() as session:
-            runner = WorkRunner(
-                session,
-                lease_owner=lease_owner,
-                lease_seconds=lease_seconds,
-            )
-            with self._claim_lock:
-                claimed = runner.claim()
-                if claimed is None:
-                    return _NO_WORK
-                # Publish the claim before releasing the lock so a sibling can't
-                # re-claim the same item from a stale pre-commit snapshot.
-                session.commit()
-            holder["attempt_id"] = claimed.attempt.id
-            return runner.execute(claimed)
+        return _claim_and_run_one(
+            claim_lock=self._claim_lock,
+            lease_owner=lease_owner,
+            lease_seconds=lease_seconds,
+            holder=holder,
+        )
 
 
 _background_pool: _BackgroundWorkPool | None = None
@@ -241,6 +265,7 @@ class DaemonTickResult:
     expired_overdue: int = 0
     recovered_results: int = 0
     artifacts_pruned: int = 0
+    memories_expired: int = 0
 
     @property
     def has_activity(self) -> bool:
@@ -255,6 +280,7 @@ class DaemonTickResult:
                 self.expired_overdue,
                 self.recovered_results,
                 self.artifacts_pruned,
+                self.memories_expired,
             )
         )
 
@@ -354,6 +380,7 @@ class TasqueDaemon:
             else 0
         )
         artifacts_pruned = self._prune_artifacts_if_due(settings)
+        memories_expired = self._expire_memory_ttl_if_due(settings)
         self.session.flush()
         return DaemonTickResult(
             recovered_leases=recovered,
@@ -365,13 +392,30 @@ class TasqueDaemon:
             expired_overdue=expired_overdue,
             recovered_results=recovered_results,
             artifacts_pruned=artifacts_pruned,
+            memories_expired=memories_expired,
         )
+
+    def _expire_memory_ttl_if_due(self, settings) -> int:
+        """Archive TTL-expired memories when the pass's interval has elapsed."""
+        interval = settings.memory_ttl_interval_seconds
+        if interval <= 0:
+            return 0
+        if not _memory_ttl_gate.claim(utc_now(), interval):
+            return 0
+        try:
+            expired = expire_ttl_memories(self.session)
+        except Exception as exc:  # noqa: BLE001 - bookkeeping must never break a tick
+            print(f"Tasque memory TTL expiry failed: {exc}")
+            return 0
+        if expired:
+            print(f"Tasque memory TTL expiry: archived {expired} memories")
+        return expired
 
     def _prune_artifacts_if_due(self, settings) -> int:
         """Run the artifact retention pass when its interval has elapsed."""
         if settings.artifact_retention_days <= 0:
             return 0
-        if not _claim_retention_slot(utc_now(), settings.artifact_retention_interval_seconds):
+        if not _artifact_retention_gate.claim(utc_now(), settings.artifact_retention_interval_seconds):
             return 0
         try:
             result = prune_artifacts(self.session)

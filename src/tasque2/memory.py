@@ -684,3 +684,45 @@ def _proportional(values: dict[str, float]) -> dict[str, float]:
     if high <= 1e-12:
         return {key: 0.0 for key in values}
     return {key: value / high for key, value in values.items()}
+
+
+def expire_ttl_memories(session: Session, *, now: datetime | None = None, limit: int = 500) -> int:
+    """Archive active rows whose ``ttl_days`` has elapsed.
+
+    Every write may carry a TTL, but nothing evaluated it: reply notes and run
+    reports accumulated forever (441 live working rows by 2026-09). Canonical and
+    pinned rows never expire here regardless of TTL -- a TTL on a document that
+    workers pin is a mistake to surface, not to act on. Returns how many rows
+    were archived; the daemon runs this on an interval like artifact retention.
+    """
+    now = now or utc_now()
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=UTC)
+    candidates = session.scalars(
+        select(Memory)
+        .where(
+            Memory.archived_at.is_(None),
+            Memory.ttl_days.is_not(None),
+            Memory.pinned.is_(False),
+            Memory.canonical_key.is_(None),
+        )
+        .order_by(Memory.created_at.asc())
+    ).all()
+
+    service = MemoryService(session)
+    expired = 0
+    for memory in candidates:
+        created = memory.created_at
+        if created is None or memory.ttl_days is None:
+            continue
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=UTC)
+        if created + timedelta(days=int(memory.ttl_days)) > now:
+            continue
+        service.archive_memory(memory.id)
+        expired += 1
+        if expired >= limit:
+            break
+    if expired:
+        session.flush()
+    return expired

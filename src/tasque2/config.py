@@ -87,6 +87,9 @@ class Settings(BaseSettings):
     artifact_retention_kinds: str = Field(default="provider_stream")
     # How often the daemon runs the retention pass. It is bookkeeping, not work.
     artifact_retention_interval_seconds: int = Field(default=6 * 60 * 60)
+    # Memory TTL expiry: rows written with ttl_days are archived once it elapses.
+    # Runs on the daemon on this interval; 0 disables the pass.
+    memory_ttl_interval_seconds: int = Field(default=6 * 60 * 60)
 
     @property
     def artifact_retention_kind_list(self) -> list[str]:
