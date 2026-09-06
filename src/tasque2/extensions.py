@@ -40,6 +40,9 @@ DigestBuild = Callable[[Any], dict[str, Any]]
 # ingest(session, work_item, attempt) -> Any; must be safe to run on every attempt
 AttemptIngestor = Callable[[Any, Any, Any], Any]
 
+# resolve(session, context) -> list[str] of canonical keys, chosen per run.
+CanonicalKeyResolver = Callable[[Any, dict[str, Any]], list[str]]
+
 
 class ExtensionError(RuntimeError):
     """Raised when an extension package cannot be loaded or registered."""
@@ -50,6 +53,9 @@ class ExtensionRegistry:
     """Everything the loaded extension packages contributed to the core."""
 
     context_digests: list[tuple[str, DigestWants, DigestBuild]] = field(default_factory=list)
+    canonical_key_resolvers: list[tuple[DigestWants, CanonicalKeyResolver]] = field(
+        default_factory=list
+    )
     mcp_tools: list[Callable[..., str]] = field(default_factory=list)
     attempt_ingestors: list[tuple[str, AttemptIngestor]] = field(default_factory=list)
     migration_locations: list[Path] = field(default_factory=list)
@@ -58,6 +64,19 @@ class ExtensionRegistry:
     def add_context_digest(self, key: str, wants: DigestWants, build: DigestBuild) -> None:
         """Inject ``build(session)`` as ``packet[key]`` when ``wants(context)`` is true."""
         self.context_digests.append((key, wants, build))
+
+    def add_canonical_keys(self, wants: DigestWants, resolve: CanonicalKeyResolver) -> None:
+        """Pin canonical docs chosen PER RUN, not from a static context list.
+
+        ``resolve(session, context)`` returns canonical keys to load alongside
+        the context's own ``memory_canonical_keys``. It exists for pinned sets
+        where only one member is ever relevant to a given run — a per-focus
+        ledger, say — so the packet carries the one that matters instead of the
+        whole family. A resolver MUST fail safe: if it cannot decide, it returns
+        the full set rather than nothing, because a silently missing ledger is
+        far worse than an oversized packet.
+        """
+        self.canonical_key_resolvers.append((wants, resolve))
 
     def add_mcp_tools(self, *tools: Callable[..., str]) -> None:
         """Serve these callables as MCP tools (name/docstring become the schema)."""

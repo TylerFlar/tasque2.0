@@ -28,7 +28,12 @@ from pathlib import Path
 def register(registry) -> None:
     from . import models  # noqa: F401 - put your tables on Base.metadata
     from . import tools
-    from .reading_log import build_reading_log, wants_reading_log, ingest_reading_produces
+    from .reading_log import (
+        build_reading_log,
+        ingest_reading_produces,
+        resolve_shelf_keys,
+        wants_reading_log,
+    )
 
     # Alembic revisions for your tables. Chain your first revision's
     # down_revision off the current core head; core and extension histories
@@ -38,6 +43,14 @@ def register(registry) -> None:
     # A code-computed digest injected into matching work items' context
     # packets: wants(context) decides, build(session) computes.
     registry.add_context_digest("reading_log", wants_reading_log, build_reading_log)
+
+    # Canonical docs chosen PER RUN rather than from a context's static
+    # memory_canonical_keys list -- for pinned sets where only one member is
+    # relevant to a given run (this week's shelf, say). resolve(session, context)
+    # returns the keys to load; it must fail safe by returning the whole set
+    # when it cannot decide, since a silently missing doc is worse than a big
+    # packet. A raising resolver is logged and skipped, never fatal to the run.
+    registry.add_canonical_keys(wants_reading_log, resolve_shelf_keys)
 
     # MCP tools served alongside the core tools (name/docstring = schema).
     registry.add_mcp_tools(tools.reading_log_entry, tools.reading_history)

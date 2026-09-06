@@ -135,6 +135,24 @@ class WorkerContextBuilder:
             if _limit_reached(memories, limit):
                 return _trim_to_limit(memories, limit)
 
+        # Extension-resolved canonical keys: pinned docs chosen per run rather
+        # than from a static list, for sets where only one member matters to a
+        # given run. Resolvers fail safe by returning the whole set, and a
+        # raising resolver must not cost the worker its other memories.
+        namespace = default_namespaces[0] if default_namespaces else "global"
+        for wants, resolve in extension_registry().canonical_key_resolvers:
+            if not wants(context or {}):
+                continue
+            try:
+                resolved = resolve(self.session, context or {}) or []
+            except Exception:  # noqa: BLE001 - context assembly must not fail the run
+                logger.exception("Canonical key resolver failed; skipping")
+                continue
+            for key in resolved:
+                add(service.get_canonical(namespace=namespace, canonical_key=str(key)))
+                if _limit_reached(memories, limit):
+                    return _trim_to_limit(memories, limit)
+
         # Force-load complete structured registers (e.g. every `interest` record) so the
         # worker always checks the full set, not whatever a fuzzy search happens to return.
         for namespace in default_namespaces or ["global"]:
