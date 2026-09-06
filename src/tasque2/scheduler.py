@@ -296,6 +296,7 @@ class ScheduleService:
             schedule_id=schedule.id,
             schedule_occurrence_id=occurrence.id,
             discord_thread_id=_optional_str(payload.get("discord_thread_id")),
+            visible=_payload_visible(payload),
         )
         occurrence.work_item_id = work.id
         occurrence.status = "enqueued"
@@ -531,3 +532,16 @@ def _optional_str(value: Any) -> str | None:
     if value is None:
         return None
     return str(value)
+
+
+def _payload_visible(payload: dict[str, Any]) -> bool:
+    """``visible: false`` keeps a schedule's runs out of Discord entirely.
+
+    Bookkeeping schedules (memory consolidation, retention sweeps) otherwise open
+    a fresh thread per run that nobody reads -- 28 such threads in one month.
+    Their output still lands in attempts and artifacts; it just is not posted.
+    """
+    value = payload.get("visible", True)
+    if isinstance(value, str):
+        return value.strip().lower() not in {"0", "false", "no", "off"}
+    return bool(value)

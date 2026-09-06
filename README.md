@@ -31,7 +31,11 @@ uv run tasque2 daemon
 ```
 
 The daemon runs migrations on startup, polls schedules, advances workflows,
-processes queued work, and handles Discord intake/output when configured.
+processes queued work, and handles Discord intake/output when configured. On an
+interval it also prunes aged artifacts and archives memories whose `ttl_days`
+has elapsed (`TASQUE2_ARTIFACT_RETENTION_*`, `TASQUE2_MEMORY_TTL_INTERVAL_SECONDS`).
+A schedule payload may set `"visible": false` to keep bookkeeping runs out of
+Discord entirely.
 
 ## Useful Commands
 

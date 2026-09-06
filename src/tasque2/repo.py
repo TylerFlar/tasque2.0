@@ -35,6 +35,7 @@ class WorkRepository:
         workflow_run_id: str | None = None,
         workflow_node_id: str | None = None,
         discord_thread_id: str | None = None,
+        visible: bool = True,
     ) -> WorkItem:
         if idempotency_key:
             existing = self.session.scalar(
@@ -62,6 +63,7 @@ class WorkRepository:
             workflow_run_id=workflow_run_id,
             workflow_node_id=workflow_node_id,
             discord_thread_id=discord_thread_id,
+            visible=visible,
         )
         self.session.add(work_item)
         self.session.flush()

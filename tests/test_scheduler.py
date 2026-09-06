@@ -284,3 +284,36 @@ def test_schedule_fire_edit_and_delete_cli_commands(fresh_db: Path) -> None:
         work = session.scalar(select(WorkItem).where(WorkItem.title == "CLI edited"))
         assert work is not None
         assert work.task_instruction == "Edited."
+
+
+def test_schedule_payload_can_keep_runs_out_of_discord(fresh_db: Path) -> None:
+    # Bookkeeping schedules (memory consolidation, retention sweeps) otherwise
+    # open a fresh Discord thread per run that nobody reads. `visible: false` in
+    # the payload keeps the work item off the output loop; the default is
+    # unchanged so every existing schedule still posts.
+    now = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
+    with session_scope() as session:
+        service = ScheduleService(session)
+        service.create_schedule(
+            name="Quiet bookkeeping",
+            schedule_type="date",
+            expression=(now - timedelta(minutes=1)).isoformat(),
+            worker_kind="function.echo",
+            payload={"title": "Quiet work", "task_instruction": "Tidy.", "visible": False},
+            timezone_name="UTC",
+        )
+        service.create_schedule(
+            name="Loud as ever",
+            schedule_type="date",
+            expression=(now - timedelta(minutes=1)).isoformat(),
+            worker_kind="function.echo",
+            payload={"title": "Loud work", "task_instruction": "Post."},
+            timezone_name="UTC",
+        )
+
+        assert service.poll_due_schedules(now=now) == 2
+
+        quiet = session.scalar(select(WorkItem).where(WorkItem.title == "Quiet work"))
+        loud = session.scalar(select(WorkItem).where(WorkItem.title == "Loud work"))
+        assert quiet is not None and quiet.visible is False
+        assert loud is not None and loud.visible is True
