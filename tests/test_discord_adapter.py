@@ -746,3 +746,28 @@ def test_discord_thread_reply_conversation_window_counts_logical_messages(fresh_
             "reply-cooking",
         ]
         assert recent[1]["parts"] == 30
+
+
+def test_reply_child_inherits_tool_deny_list_and_server_allowlist() -> None:
+    """A parent barred from credential tools must not spawn reply children that get them back."""
+    from tasque2.discord_adapter import _reply_followup_runtime_contract
+
+    parent = {
+        "model_profile": "medium",
+        "mcp_servers": ["google-workspace", "autopilot"],
+        "disallowed_tools": ["mcp__autopilot__fill_login"],
+        "cwd": "parent-only",
+    }
+
+    inherited = _reply_followup_runtime_contract(parent_contract=parent, config_contract={})
+    assert inherited == {
+        "model_profile": "medium",
+        "mcp_servers": ["google-workspace", "autopilot"],
+        "disallowed_tools": ["mcp__autopilot__fill_login"],
+    }
+
+    # The reply config still has the last word.
+    overridden = _reply_followup_runtime_contract(
+        parent_contract=parent, config_contract={"disallowed_tools": []}
+    )
+    assert overridden["disallowed_tools"] == []

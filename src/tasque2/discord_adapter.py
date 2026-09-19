@@ -1134,8 +1134,10 @@ _MODEL_ROUTING_CONTRACT_KEYS = (
 # servers it actually uses should not spawn reply children that silently fall
 # back to TASQUE2_DEFAULT_MCP_SERVERS and pay for every tool schema again. The
 # reply config can still override it, and an explicit [] still means "tasque2
-# only" rather than "unset".
-_INHERITED_RUNTIME_CONTRACT_KEYS = ("mcp_servers",)
+# only" rather than "unset". ``disallowed_tools`` rides along for the mirror
+# reason: a parent barred from credential tools must not spawn reply children
+# that quietly get them back.
+_INHERITED_RUNTIME_CONTRACT_KEYS = ("mcp_servers", "disallowed_tools")
 
 
 def _reply_followup_runtime_contract(

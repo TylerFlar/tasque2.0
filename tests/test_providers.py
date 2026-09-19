@@ -27,6 +27,7 @@ from tasque2.providers import (
     ProviderResponse,
     ProviderRuntime,
     SubprocessProvider,
+    _disallowed_tools,
     _mcp_server_allowlist,
     _provider_context_limits,
     extract_session_id_from_stream,
@@ -1292,6 +1293,67 @@ def test_mcp_allowlist_contract_parsing(monkeypatch) -> None:
             _mcp_server_allowlist({"mcp_servers": "autopilot"})
     finally:
         reset_settings()
+
+
+def test_claude_disallowed_tools_are_denied_on_the_cli() -> None:
+    """A node's deny list reaches the CLI as one --disallowedTools value."""
+    argv = _run_claude_with_context(
+        {
+            "tasque_disallowed_tools": [
+                "mcp__autopilot__fill_login",
+                "mcp__autopilot__reveal_credentials",
+            ]
+        }
+    )
+
+    assert argv[argv.index("--disallowedTools") + 1] == (
+        "mcp__autopilot__fill_login,mcp__autopilot__reveal_credentials"
+    )
+    # No ban declared -> no flag, so every other worker keeps its full tool set.
+    assert "--disallowedTools" not in _run_claude_with_context({})
+    assert "--disallowedTools" not in _run_claude_with_context({"tasque_disallowed_tools": []})
+
+
+def test_codex_rejects_a_deny_list_it_cannot_enforce() -> None:
+    def runner(argv, **kwargs):  # pragma: no cover - must not be reached
+        raise AssertionError("codex must not launch with an unenforceable tool ban")
+
+    with pytest.raises(ProviderExecutionError, match="only by the claude provider"):
+        CodexCliProvider(runner=runner).run(
+            ProviderRequest(
+                provider="codex",
+                prompt="hi",
+                context={"tasque_disallowed_tools": ["mcp__autopilot__fill_login"]},
+            )
+        )
+
+
+def test_disallowed_tools_contract_parsing() -> None:
+    assert _disallowed_tools({}) == []
+    assert _disallowed_tools({"disallowed_tools": None}) == []
+    assert _disallowed_tools(
+        {"disallowed_tools": [" mcp__autopilot__fill_login ", "", "mcp__autopilot__fill_login", "x"]}
+    ) == ["mcp__autopilot__fill_login", "x"]
+    with pytest.raises(ProviderExecutionError, match="must be a list of strings"):
+        _disallowed_tools({"disallowed_tools": "mcp__autopilot__fill_login"})
+
+
+def test_provider_request_carries_the_contract_deny_list(fresh_db: Path) -> None:
+    """The work item's contract reaches every provider as a normalized deny list."""
+    captured: list[ProviderRequest] = []
+    registry = ProviderRegistry()
+    registry.register(FakeProvider(capture_requests=captured))
+
+    with session_scope() as session:
+        WorkRepository(session).create_work_item(
+            title="Preflight",
+            task_instruction="Probe accounts.",
+            worker_kind="provider.fake",
+            runtime_contract={"disallowed_tools": ["mcp__autopilot__fill_login", " "]},
+        )
+        WorkRunner(session, provider_runtime=ProviderRuntime(registry=registry)).run_next()
+
+    assert captured[0].context["tasque_disallowed_tools"] == ["mcp__autopilot__fill_login"]
 
 
 def test_provider_smoke_cli_runs_subprocess_when_test_providers_are_enabled(

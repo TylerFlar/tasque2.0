@@ -386,6 +386,12 @@ class CodexCliProvider(SubprocessProvider):
     name = "codex"
 
     def run(self, request: ProviderRequest) -> ProviderResponse:
+        if request.context.get("tasque_disallowed_tools"):
+            # Codex has no per-tool deny switch; failing loudly beats running a worker
+            # whose contract promised a ban the CLI cannot keep.
+            raise ProviderExecutionError(
+                "runtime_contract.disallowed_tools is enforced only by the claude provider."
+            )
         argv = ["codex", "exec", "--json", "--dangerously-bypass-approvals-and-sandbox"]
         argv.extend(_codex_tasque_mcp_args(work_item_id=request.env.get("TASQUE2_WORK_ITEM_ID")))
         if request.cwd:
@@ -447,6 +453,13 @@ class ClaudeCodeProvider(SubprocessProvider):
             # Without this the CLI ALSO loads every user-scope server, which is the
             # default when a work item declares no allowlist.
             argv.append("--strict-mcp-config")
+        denied = request.context.get("tasque_disallowed_tools")
+        if denied:
+            # A per-node tool ban the harness enforces on top of the server allowlist
+            # (e.g. a node that may browse but must never enter credentials). One
+            # comma-joined value: the CLI option is variadic and would otherwise
+            # swallow the flags that follow it.
+            argv.extend(["--disallowedTools", ",".join(str(name) for name in denied)])
         if request.model:
             argv.extend(["--model", request.model])
         if request.output_schema:
@@ -835,6 +848,7 @@ class ProviderRuntime:
                 "tasque_context_packet": context_packet,
                 "result_token": result_token,
                 "tasque_mcp_servers": _mcp_server_allowlist(contract),
+                "tasque_disallowed_tools": _disallowed_tools(contract),
             },
         )
 
@@ -1519,6 +1533,25 @@ def _mcp_server_allowlist(contract: Mapping[str, Any]) -> list[str] | None:
     if not isinstance(declared, list) or not all(isinstance(item, str) for item in declared):
         raise ProviderExecutionError("runtime_contract.mcp_servers must be a list of strings.")
     return [item.strip() for item in declared if item.strip()]
+
+
+def _disallowed_tools(contract: Mapping[str, Any]) -> list[str]:
+    """Resolve ``runtime_contract.disallowed_tools``: tool names the worker must never
+    be offered, e.g. ``mcp__autopilot__fill_login`` on a node that may browse but must
+    not enter credentials. Absent means no ban. Order is kept; blanks and duplicates
+    are dropped.
+    """
+    declared = contract.get("disallowed_tools")
+    if declared is None:
+        return []
+    if not isinstance(declared, list) or not all(isinstance(item, str) for item in declared):
+        raise ProviderExecutionError("runtime_contract.disallowed_tools must be a list of strings.")
+    names: list[str] = []
+    for item in declared:
+        name = item.strip()
+        if name and name not in names:
+            names.append(name)
+    return names
 
 
 def _toml_value(value: Any) -> str:
