@@ -881,3 +881,40 @@ def test_prepare_discord_uploads_request_budget(tmp_path: Path) -> None:
     assert [upload.filename for upload in sendable] == ["one.bin"]
     assert temps == []
     assert any("two.bin" in note for note in notes)
+
+
+def test_discord_output_hidden_canceled_workflow_posts_nothing(fresh_db: Path) -> None:
+    """A run canceled by hand with its work hidden must not drop "Canceled." anywhere."""
+    gateway = FakeDiscordOutputGateway()
+    definition = {
+        "nodes": [
+            {
+                "key": "step",
+                "kind": "work",
+                "title": "Workflow Step",
+                "task_instruction": "Run workflow step.",
+                "worker_kind": "function.echo",
+            },
+        ]
+    }
+    with session_scope() as session:
+        workflow_service = WorkflowService(session)
+        workflow = workflow_service.create_definition(
+            name="hidden-cancel-workflow",
+            version="1",
+            definition=definition,
+        )
+        run = workflow_service.start_run(workflow_definition_id=workflow.id)
+        workflow_service.tick_runs()
+        for work_item in session.scalars(select(WorkItem).where(WorkItem.workflow_run_id == run.id)):
+            work_item.visible = False
+        session.flush()
+        workflow_service.cancel_run(run.id)
+        session.flush()
+
+        output = DiscordOutputService(session)
+        posted = _post_pending(output, gateway)
+
+        assert posted == 0
+        assert len(gateway.created_threads) == 0
+        assert all("Canceled." not in message[1] for message in gateway.sent_messages)

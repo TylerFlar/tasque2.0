@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from tasque2.discord_adapter import DiscordService
@@ -921,7 +921,24 @@ class DiscordOutputService:
             run
             for run in candidates
             if not self._has_status_post("discord.workflow_final_posted", run.id, run.status)
+            and not self._silently_canceled(run)
         ][:limit]
+
+    def _silently_canceled(self, run: WorkflowRun) -> bool:
+        """A canceled run whose work items were all hidden posts nothing.
+
+        Killing a run by hand sets ``visible=False`` on its work items; without this
+        check the run-level final status still dropped a bare "Canceled." into the
+        bound thread (or opened a stray thread when the binding had been cleared).
+        """
+        if run.status != "canceled":
+            return False
+        visible = self.session.scalar(
+            select(func.count())
+            .select_from(WorkItem)
+            .where(WorkItem.workflow_run_id == run.id, WorkItem.visible.is_(True))
+        )
+        return not visible
 
     def _workflow_panel_candidates(self, limit: int) -> Sequence[WorkflowRun]:
         if limit <= 0:
