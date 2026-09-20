@@ -32,8 +32,12 @@ uv run tasque2 daemon
 
 The daemon runs migrations on startup, polls schedules, advances workflows,
 processes queued work, and handles Discord intake/output when configured. On an
-interval it also prunes aged artifacts and archives memories whose `ttl_days`
-has elapsed (`TASQUE2_ARTIFACT_RETENTION_*`, `TASQUE2_MEMORY_TTL_INTERVAL_SECONDS`).
+interval it also prunes aged artifacts, archives memories whose `ttl_days`
+has elapsed, and deletes aged per-run scratch directories
+(`TASQUE2_ARTIFACT_RETENTION_*`, `TASQUE2_MEMORY_TTL_INTERVAL_SECONDS`,
+`TASQUE2_SCRATCH_RETENTION_DAYS`). Every provider run gets its own scratch
+directory under `data/scratch/`, named in the prompt and exported as the run's
+temp dir, so workers keep temporary files out of the repository root.
 A schedule payload may set `"visible": false` to keep bookkeeping runs out of
 Discord entirely.
 

@@ -16,6 +16,7 @@ from tasque2.models import utc_now
 from tasque2.queue import WorkQueue
 from tasque2.runtime import WorkRunner
 from tasque2.scheduler import ScheduleService
+from tasque2.scratch import prune_scratch_dirs
 from tasque2.workflows import WorkflowService
 
 # Sentinel returned by the concurrent worker when nothing was claimable.
@@ -49,12 +50,14 @@ class _IntervalGate:
 
 _artifact_retention_gate = _IntervalGate()
 _memory_ttl_gate = _IntervalGate()
+_scratch_retention_gate = _IntervalGate()
 
 
 def reset_bookkeeping_clocks() -> None:
     """Forget when the bookkeeping passes last ran (used by tests)."""
     _artifact_retention_gate.reset()
     _memory_ttl_gate.reset()
+    _scratch_retention_gate.reset()
 
 
 def _claim_and_run_one(
@@ -266,6 +269,7 @@ class DaemonTickResult:
     recovered_results: int = 0
     artifacts_pruned: int = 0
     memories_expired: int = 0
+    scratch_dirs_pruned: int = 0
 
     @property
     def has_activity(self) -> bool:
@@ -281,6 +285,7 @@ class DaemonTickResult:
                 self.recovered_results,
                 self.artifacts_pruned,
                 self.memories_expired,
+                self.scratch_dirs_pruned,
             )
         )
 
@@ -381,6 +386,7 @@ class TasqueDaemon:
         )
         artifacts_pruned = self._prune_artifacts_if_due(settings)
         memories_expired = self._expire_memory_ttl_if_due(settings)
+        scratch_dirs_pruned = self._prune_scratch_if_due(settings)
         self.session.flush()
         return DaemonTickResult(
             recovered_leases=recovered,
@@ -393,7 +399,26 @@ class TasqueDaemon:
             recovered_results=recovered_results,
             artifacts_pruned=artifacts_pruned,
             memories_expired=memories_expired,
+            scratch_dirs_pruned=scratch_dirs_pruned,
         )
+
+    def _prune_scratch_if_due(self, settings) -> int:
+        """Delete aged per-run scratch directories on the retention interval."""
+        if settings.scratch_retention_days <= 0:
+            return 0
+        if not _scratch_retention_gate.claim(utc_now(), settings.artifact_retention_interval_seconds):
+            return 0
+        try:
+            result = prune_scratch_dirs()
+        except Exception as exc:  # noqa: BLE001 - bookkeeping must never break a tick
+            print(f"Tasque scratch retention failed: {exc}")
+            return 0
+        if result.pruned:
+            print(
+                f"Tasque scratch retention: removed {result.pruned} run directories "
+                f"({result.megabytes_freed:.1f} MB)"
+            )
+        return result.pruned
 
     def _expire_memory_ttl_if_due(self, settings) -> int:
         """Archive TTL-expired memories when the pass's interval has elapsed."""

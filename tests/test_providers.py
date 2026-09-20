@@ -1419,3 +1419,103 @@ def test_context_limits_size_the_memory_packet_from_the_pinned_set(fresh_db: Pat
         assert _provider_context_limits(register)["memories"] == DEFAULT_PROVIDER_CONTEXT_LIMITS["memories"]
         # An explicit setting still wins.
         assert _provider_context_limits(explicit)["memories"] == 30
+
+
+def _init_event(*servers: tuple[str, str]) -> str:
+    payload = {
+        "type": "system",
+        "subtype": "init",
+        "session_id": "s-1",
+        "mcp_servers": [{"name": name, "status": status} for name, status in servers],
+        "tools": ["Bash"],
+    }
+    return json.dumps(payload)
+
+
+def test_provider_missing_result_names_a_failed_tasque_mcp_server(fresh_db: Path) -> None:
+    # When the harness's own MCP server never came up the agent had no
+    # submit_worker_result to call; the failure must say so (2 runs in 2026-09
+    # burned a turn discovering it and were logged as the agent's fault).
+    stdout = "\n".join(
+        [
+            _init_event(("tasque2", "failed")),
+            '{"type":"result","subtype":"success","is_error":false,'
+            '"result":"The tasque2 MCP server is down this session; nothing I can submit."}',
+        ]
+    )
+    registry = ProviderRegistry()
+    registry.register(
+        FakeProvider(
+            response=ProviderResponse(
+                status="succeeded", summary="done", output_text="", stdout=stdout, raw_stream=stdout
+            ),
+            deposit_structured_result=False,
+        )
+    )
+
+    with session_scope() as session:
+        work = WorkRepository(session).create_work_item(
+            title="No harness", task_instruction="Submit.", worker_kind="provider.fake"
+        )
+        WorkRunner(session, provider_runtime=ProviderRuntime(registry=registry)).run_next()
+        attempt = session.scalar(select(WorkAttempt).where(WorkAttempt.work_item_id == work.id))
+        assert attempt is not None
+        assert attempt.error_type == "TransientProviderError"
+        assert "Tasque MCP server ('tasque2') failed to connect" in attempt.error_message
+        assert "did not call submit_worker_result" not in attempt.error_message
+
+
+def test_provider_missing_result_quotes_the_agents_closing_words(fresh_db: Path) -> None:
+    # The agent's last message usually explains the miss ("waiting for the
+    # background agents"); surfacing it turns a bare protocol failure into a
+    # triageable one. Servers that did connect are not mentioned.
+    stdout = "\n".join(
+        [
+            _init_event(("tasque2", "connected"), ("autopilot", "failed")),
+            '{"type":"result","subtype":"success","is_error":false,'
+            '"result":"Both research agents are still running in the background; '
+            "I'll resume once they report back.\"}",
+        ]
+    )
+    registry = ProviderRegistry()
+    registry.register(
+        FakeProvider(
+            response=ProviderResponse(
+                status="succeeded", summary="done", output_text="", stdout=stdout, raw_stream=stdout
+            ),
+            deposit_structured_result=False,
+        )
+    )
+
+    with session_scope() as session:
+        work = WorkRepository(session).create_work_item(
+            title="Backgrounded", task_instruction="Submit.", worker_kind="provider.fake"
+        )
+        WorkRunner(session, provider_runtime=ProviderRuntime(registry=registry)).run_next()
+        attempt = session.scalar(select(WorkAttempt).where(WorkAttempt.work_item_id == work.id))
+        assert attempt is not None
+        message = attempt.error_message
+        assert message.startswith("Provider did not call submit_worker_result")
+        assert "failed to connect at startup: autopilot" in message
+        assert "Final assistant text: \"Both research agents are still running" in message
+
+
+def test_claude_provider_killed_before_a_result_event_has_a_readable_summary() -> None:
+    # A run killed mid-flight (a reset script, taskkill) emits no result event;
+    # the summary used to be the first stdout line, i.e. the raw init JSON.
+    def runner(argv, **kwargs):
+        stream = "\n".join(
+            [
+                _init_event(("tasque2", "connected")),
+                '{"type":"assistant","message":{"content":[{"type":"text","text":"Starting."}]}}',
+            ]
+        )
+        return subprocess.CompletedProcess(argv, 4294967295, stdout=stream, stderr="")
+
+    response = ClaudeCodeProvider(runner=runner).run(
+        ProviderRequest(provider="claude", prompt="do work")
+    )
+
+    assert response.status == "failed"
+    assert response.summary == "claude exited with code 4294967295 before emitting a result event."
+    assert not response.summary.startswith("{")

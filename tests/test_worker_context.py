@@ -170,3 +170,19 @@ def test_canonical_key_resolver_failure_does_not_cost_other_memories(fresh_db: P
             assert {m["content"] for m in packet["memories"]} == {"doctrine body"}
     finally:
         registry.canonical_key_resolvers.remove((wants, resolve))
+
+
+def test_provider_prompt_keeps_delegation_in_the_foreground() -> None:
+    # Two of the three no-result failures in 2026-09 ended their turn "to wait
+    # for" background subagents; a --print session ends with the turn and
+    # nothing resumes it, so the rule has to be in the frame.
+    from tasque2.worker_context import render_provider_prompt
+
+    prompt = render_provider_prompt(
+        task_instruction="Do the thing.", context_packet={"version": 1}, result_token="tok"
+    )
+
+    assert "one-shot, non-interactive session" in prompt
+    assert "`run_in_background: false`" in prompt
+    # No scratch dir in the packet (older callers, tests): the section is simply absent.
+    assert "## Scratch Space" not in prompt

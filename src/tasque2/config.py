@@ -90,6 +90,11 @@ class Settings(BaseSettings):
     # Memory TTL expiry: rows written with ttl_days are archived once it elapses.
     # Runs on the daemon on this interval; 0 disables the pass.
     memory_ttl_interval_seconds: int = Field(default=6 * 60 * 60)
+    # Per-run scratch directories (data/scratch/<attempt id>): the temp dir a
+    # provider run is told to use, so probe scripts, page dumps and drafts stop
+    # landing in the daemon's working directory. Swept on the artifact-retention
+    # interval; directories older than this many days are deleted, 0 disables.
+    scratch_retention_days: int = Field(default=7)
 
     @property
     def artifact_retention_kind_list(self) -> list[str]:
@@ -114,6 +119,10 @@ class Settings(BaseSettings):
     @property
     def resolved_extensions_dir(self) -> Path:
         return self.extensions_dir.expanduser().resolve()
+
+    @property
+    def resolved_scratch_dir(self) -> Path:
+        return self.resolved_data_dir / "scratch"
 
     @property
     def default_provider_name(self) -> str:

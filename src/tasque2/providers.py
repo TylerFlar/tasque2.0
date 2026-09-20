@@ -24,6 +24,7 @@ from tasque2.memory import MemoryBudgetExceeded, MemoryService
 from tasque2.memory_ingest import MemoryIngestService
 from tasque2.models import ProviderRun, WorkAttempt, WorkItem, utc_now
 from tasque2.repo import WorkRepository
+from tasque2.scratch import scratch_dir_for_attempt, scratch_environment
 from tasque2.worker_context import (
     WorkerContextBuilder,
     adaptive_memory_limit,
@@ -531,11 +532,17 @@ class ProviderRuntime:
             "result_token": result_token,
             "required": True,
         }
+        # One directory per attempt for every temporary file the run makes. It is
+        # named in the prompt and exported as the process tree's temp dir, so scratch
+        # stops landing in the daemon's working directory (see tasque2.scratch).
+        scratch_dir = scratch_dir_for_attempt(attempt.id)
+        context_packet["scratch_dir"] = str(scratch_dir)
         request = self._build_request(
             provider_name,
             work_item,
             context_packet=context_packet,
             result_token=result_token,
+            scratch_dir=scratch_dir,
         )
         now = utc_now()
         provider_run = ProviderRun(
@@ -803,6 +810,7 @@ class ProviderRuntime:
         *,
         context_packet: dict[str, Any],
         result_token: str,
+        scratch_dir: Path | None = None,
     ) -> ProviderRequest:
         contract = work_item.runtime_contract or {}
         context = work_item.context or {}
@@ -834,6 +842,9 @@ class ProviderRuntime:
         request_env = {str(key): str(value) for key, value in env.items()}
         request_env.setdefault("TASQUE2_RESULT_TOKEN", result_token)
         request_env.setdefault("TASQUE2_WORK_ITEM_ID", work_item.id)
+        if scratch_dir is not None:
+            for key, value in scratch_environment(scratch_dir).items():
+                request_env.setdefault(key, value)
         return ProviderRequest(
             provider=provider_name,
             prompt=prompt,
@@ -1324,7 +1335,55 @@ def _missing_result_error_message(response: ProviderResponse) -> str:
             "Provider did not deposit a structured result. Recent MCP tool failures: "
             f"{shown}."
         )
-    return "Provider did not call submit_worker_result; no structured result was deposited."
+    failed_servers = _failed_mcp_servers_at_init(response.stdout, response.raw_stream)
+    if TASQUE_MCP_SERVER_NAME in failed_servers:
+        # The worker never had submit_worker_result (or any Tasque tool) to call:
+        # the harness's own server did not come up. Say so instead of blaming the
+        # agent, so the retry and the DLQ post point at the real cause.
+        return (
+            f"The Tasque MCP server ({TASQUE_MCP_SERVER_NAME!r}) failed to connect at provider "
+            "startup, so submit_worker_result was never available to the worker."
+        )
+    message = "Provider did not call submit_worker_result; no structured result was deposited."
+    if failed_servers:
+        message += f" MCP servers that failed to connect at startup: {', '.join(failed_servers)}."
+    final_text = _one_line(extract_text_from_stream(response.stdout))
+    if final_text:
+        # The agent's closing words usually say why it stopped ("waiting for the
+        # background agents", "nothing to do today"); surface them for triage.
+        excerpt = final_text[:MISSING_RESULT_EXCERPT_CHARS]
+        if len(final_text) > MISSING_RESULT_EXCERPT_CHARS:
+            excerpt += "..."
+        message += f" Final assistant text: {excerpt!r}"
+    return message
+
+
+TASQUE_MCP_SERVER_NAME = "tasque2"
+MISSING_RESULT_EXCERPT_CHARS = 300
+
+
+def _failed_mcp_servers_at_init(*texts: str) -> list[str]:
+    """Names of MCP servers the provider reported as not connected at startup.
+
+    Claude's stream-json init event lists every configured server with a status;
+    a server that failed to start is simply absent from the tool list, which the
+    agent only discovers when its first call fails.
+    """
+    for text in texts:
+        for obj in _iter_json_objects(text):
+            if obj.get("type") != "system" or obj.get("subtype") != "init":
+                continue
+            servers = obj.get("mcp_servers")
+            if not isinstance(servers, list):
+                return []
+            return [
+                str(server.get("name"))
+                for server in servers
+                if isinstance(server, dict)
+                and server.get("name")
+                and str(server.get("status") or "connected") != "connected"
+            ]
+    return []
 
 
 def _mcp_tool_failures(*texts: str) -> list[dict[str, str]]:
@@ -1674,6 +1733,11 @@ def _normalize_stream_response(response: ProviderResponse, *, provider: str) -> 
     usage.update(extract_usage_from_stream(response.stdout))
     if response.status != "succeeded":
         error_summary = _stream_error_summary(response.stdout, response.raw_stream, response.stderr)
+        if error_summary is None and _iter_json_objects(response.stdout):
+            # A stream-json run that died without a terminal result event (killed,
+            # crashed) has nothing quotable; the generic summary would otherwise be
+            # the first stdout line, i.e. the raw init event JSON.
+            error_summary = _exit_without_result_summary(provider, response)
         return ProviderResponse(
             status=response.status,
             summary=error_summary or response.summary,
@@ -1700,6 +1764,18 @@ def _normalize_stream_response(response: ProviderResponse, *, provider: str) -> 
         usage=usage,
         exit_code=response.exit_code,
     )
+
+
+def _exit_without_result_summary(provider: str, response: ProviderResponse) -> str:
+    summary = f"{provider} exited with code {response.exit_code} before emitting a result event"
+    stderr_lines = [
+        line.strip()
+        for line in response.stderr.splitlines()
+        if line.strip() and not line.strip().startswith("[tasque]")
+    ]
+    if stderr_lines:
+        summary += f": {stderr_lines[-1][:300]}"
+    return summary + "."
 
 
 def _stream_error_summary(*texts: str) -> str | None:

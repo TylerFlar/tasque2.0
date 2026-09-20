@@ -335,8 +335,23 @@ def render_provider_prompt(
     context_packet: dict[str, Any],
     result_token: str,
 ) -> str:
+    scratch_dir = context_packet.get("scratch_dir")
+    scratch_section = (
+        "## Scratch Space\n"
+        f"- Scratch directory for this run: `{scratch_dir}` (also `$TASQUE2_SCRATCH_DIR`, and it "
+        "is `$TEMP`/`$TMP`/`$TMPDIR` for every process in this run).\n"
+        "- Write EVERY temporary file there -- probe scripts, page dumps, JSON scratch, drafts, "
+        "downloads -- using that absolute path in every shell. Never write scratch into the "
+        "working directory (it is the Tasque repository) and never use Bash's `/tmp`: on Windows "
+        "it is Git Bash's private mapping that Python and PowerShell cannot read back.\n"
+        "- Tasque deletes the directory a few days after the run. Anything that must outlive the "
+        "run goes through `artifact_capture_file` or a durable location the template names."
+        if isinstance(scratch_dir, str) and scratch_dir
+        else None
+    )
     return "\n\n".join(
-        [
+        section
+        for section in [
             (
                 "# Tasque WorkItem Coordinator\n\n"
                 "## Purpose\n"
@@ -363,8 +378,14 @@ def render_provider_prompt(
                 "submitted, Tasque may terminate the provider process tree. Do not leave dev servers, "
                 "watchers, browsers, or other long-running foreground children attached to this worker; "
                 "stop temporary helpers before submitting, or record the restart command/URL in the "
-                "report."
+                "report.\n"
+                "- This is a one-shot, non-interactive session: it ends the moment your turn ends, and "
+                "nothing resumes it. Background subagents (`Agent` with `run_in_background`) and "
+                "background shell commands do not survive it -- ending a turn \"to wait for them\" "
+                "fails this WorkItem with no result and re-runs it from scratch. Run delegated work in "
+                "the foreground (`run_in_background: false`), wait for it, then submit."
             ),
+            scratch_section,
             (
                 "## Standard Work Template Shape\n"
                 "There is no required schema. Prefer this compact shape when authoring new templates:\n"
@@ -530,6 +551,7 @@ def render_provider_prompt(
             "## Work Template\n" + task_instruction.strip(),
             "## Context Packet JSON\n" + render_worker_context_packet(context_packet),
         ]
+        if section
     )
 
 
