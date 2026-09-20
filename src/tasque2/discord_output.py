@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import mimetypes
 import tempfile
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -108,25 +109,32 @@ def _shrink_image_for_discord(path: Path, *, max_bytes: int) -> Path | None:
     return None
 
 
-def prepare_discord_uploads(
+DISCORD_MAX_FILES_PER_MESSAGE = 10
+
+
+def _fit_discord_uploads(
     attachments: Sequence[DiscordFileUpload],
     *,
-    max_file_bytes: int = DISCORD_MAX_FILE_BYTES,
-    max_request_bytes: int = DISCORD_MAX_REQUEST_BYTES,
-) -> tuple[list[DiscordFileUpload], list[str], list[Path]]:
-    """Fit uploads under Discord's payload caps; returns (sendable, notes, temp_paths).
+    max_file_bytes: int,
+    max_request_bytes: int,
+) -> tuple[list[DiscordFileUpload], list[str], list[Path], list[DiscordFileUpload]]:
+    """One message's worth of uploads: (sendable, notes, temp_paths, deferred).
 
     Oversized images are re-encoded to JPEG under the per-file cap; anything still
-    too big (or unreadable) is dropped with a note, as are files past the cumulative
-    request budget. Callers unlink the returned temp paths after sending. A 413 must
-    never reach Discord — it dead-ends the message and can take the output loop with
-    it.
+    too big (or unreadable) is dropped with a note. Files that only fail the
+    cumulative request budget (or the per-message file count) are *deferred*, not
+    dropped — the caller sends them in a continuation message.
     """
     sendable: list[DiscordFileUpload] = []
     notes: list[str] = []
     temps: list[Path] = []
+    deferred: list[DiscordFileUpload] = []
     total = 0
-    for upload in list(attachments)[:10]:
+    for original in list(attachments):
+        if len(sendable) >= DISCORD_MAX_FILES_PER_MESSAGE:
+            deferred.append(original)
+            continue
+        upload = original
         path = Path(upload.path)
         display = upload.filename or path.name
         try:
@@ -134,8 +142,8 @@ def prepare_discord_uploads(
         except OSError:
             notes.append(f"attachment unavailable: {display}")
             continue
+        shrunk: Path | None = None
         if size > max_file_bytes:
-            shrunk = None
             if path.suffix.lower() in _SHRINKABLE_SUFFIXES:
                 shrunk = _shrink_image_for_discord(path, max_bytes=max_file_bytes)
             if shrunk is None:
@@ -144,23 +152,89 @@ def prepare_discord_uploads(
                     f"kept as artifact {upload.artifact_id or upload.path}"
                 )
                 continue
-            temps.append(shrunk)
             size = shrunk.stat().st_size
             upload = DiscordFileUpload(
                 path=str(shrunk),
                 filename=(Path(display).stem or "image") + ".jpg",
                 artifact_id=upload.artifact_id,
             )
-            notes.append(f"{display} downscaled to fit Discord's upload cap")
-        if total + size > max_request_bytes:
-            notes.append(
-                f"{display} skipped (message attachment budget) — "
-                f"kept as artifact {upload.artifact_id or upload.path}"
-            )
+        if sendable and total + size > max_request_bytes:
+            # Over budget for THIS message: send it in the next one (re-shrunk there).
+            if shrunk is not None:
+                try:
+                    shrunk.unlink()
+                except OSError:
+                    pass
+            deferred.append(original)
             continue
+        if shrunk is not None:
+            temps.append(shrunk)
+            notes.append(f"{display} downscaled to fit Discord's upload cap")
         total += size
         sendable.append(upload)
+    return sendable, notes, temps, deferred
+
+
+def prepare_discord_uploads(
+    attachments: Sequence[DiscordFileUpload],
+    *,
+    max_file_bytes: int = DISCORD_MAX_FILE_BYTES,
+    max_request_bytes: int = DISCORD_MAX_REQUEST_BYTES,
+) -> tuple[list[DiscordFileUpload], list[str], list[Path]]:
+    """Fit uploads into ONE message: (sendable, notes, temp_paths).
+
+    Files past the cumulative request budget are left out with a note. Senders that
+    can post more than one message use :func:`batch_discord_uploads` instead, which
+    carries them into continuation messages. Callers unlink the returned temp paths
+    after sending. A 413 must never reach Discord — it dead-ends the message and can
+    take the output loop with it.
+    """
+    sendable, notes, temps, deferred = _fit_discord_uploads(
+        list(attachments)[:DISCORD_MAX_FILES_PER_MESSAGE],
+        max_file_bytes=max_file_bytes,
+        max_request_bytes=max_request_bytes,
+    )
+    for upload in deferred:
+        display = upload.filename or Path(upload.path).name
+        notes.append(
+            f"{display} skipped (message attachment budget) — "
+            f"kept as artifact {upload.artifact_id or upload.path}"
+        )
     return sendable, notes, temps
+
+
+def batch_discord_uploads(
+    attachments: Sequence[DiscordFileUpload],
+    *,
+    max_file_bytes: int = DISCORD_MAX_FILE_BYTES,
+    max_request_bytes: int = DISCORD_MAX_REQUEST_BYTES,
+) -> list[tuple[list[DiscordFileUpload], list[str], list[Path]]]:
+    """Split uploads into as many messages as Discord's caps require.
+
+    Every attachment that fits the per-file cap is sent — a set of six 4 MB renders
+    becomes two messages instead of five files and a "skipped" note. Returns one
+    (sendable, notes, temp_paths) triple per message, in order; empty input gives [].
+    """
+    batches: list[tuple[list[DiscordFileUpload], list[str], list[Path]]] = []
+    remaining = list(attachments)
+    while remaining:
+        sendable, notes, temps, deferred = _fit_discord_uploads(
+            remaining, max_file_bytes=max_file_bytes, max_request_bytes=max_request_bytes
+        )
+        if sendable or notes:
+            batches.append((sendable, notes, temps))
+        if not sendable and deferred:
+            # Nothing could go into this message yet something is deferred: a single
+            # file over the request budget. Drop it with a note rather than loop.
+            head, *deferred = deferred
+            display = head.filename or Path(head.path).name
+            note = (
+                f"{display} exceeds the message attachment budget — "
+                f"kept as artifact {head.artifact_id or head.path}"
+            )
+            batches.append(([], [note], []))
+        remaining = deferred
+    return batches
 
 
 class DiscordOutputGateway(Protocol):
@@ -320,32 +394,46 @@ class DiscordPyOutputGateway:
         channel = self.client.get_channel(int(channel_id))
         if channel is None:
             channel = await self.client.fetch_channel(int(channel_id))
-        uploads, notes, temp_paths = prepare_discord_uploads(attachments or [])
-        body = content[:DISCORD_MESSAGE_LIMIT]
-        if notes:
-            body = (content + "\n" + " · ".join(notes))[:DISCORD_MESSAGE_LIMIT]
-        try:
-            files = [discord.File(upload.path, filename=upload.filename) for upload in uploads]
+        batches = batch_discord_uploads(attachments or []) or [([], [], [])]
+        first_message = None
+        for index, (uploads, notes, temp_paths) in enumerate(batches):
+            if index == 0:
+                body = content
+            else:
+                names = ", ".join(upload.filename or Path(upload.path).name for upload in uploads)
+                plural = "s" if len(uploads) != 1 else ""
+                body = f"(continued — {len(uploads)} more attachment{plural}: {names})"
+            if notes:
+                body = body + "\n" + " · ".join(notes)
+            body = body[:DISCORD_MESSAGE_LIMIT]
+            message_view = view if index == 0 else None
             try:
-                message = await channel.send(body, view=view, files=files or None)
-            except discord.HTTPException as exc:
-                # Belt-and-braces: if a payload still 413s, the message must not
-                # become poison — deliver the text and point at the artifacts.
-                if not files or (getattr(exc, "status", None) != 413 and getattr(exc, "code", None) != 40005):
-                    raise
-                fallback = (
-                    content + "\n(attachments exceeded Discord's upload limit — kept as artifacts: "
-                    + ", ".join(upload.artifact_id or upload.path for upload in uploads)
-                    + ")"
-                )[:DISCORD_MESSAGE_LIMIT]
-                message = await channel.send(fallback, view=view)
-        finally:
-            for tmp in temp_paths:
+                files = [discord.File(upload.path, filename=upload.filename) for upload in uploads]
                 try:
-                    tmp.unlink()
-                except OSError:
-                    pass
-        return DiscordSentMessage(message_id=str(message.id), channel_id=str(channel.id))
+                    message = await channel.send(body, view=message_view, files=files or None)
+                except discord.HTTPException as exc:
+                    # Belt-and-braces: if a payload still 413s, the message must not
+                    # become poison — deliver the text and point at the artifacts.
+                    not_too_large = (
+                        getattr(exc, "status", None) != 413 and getattr(exc, "code", None) != 40005
+                    )
+                    if not files or not_too_large:
+                        raise
+                    fallback = (
+                        body + "\n(attachments exceeded Discord's upload limit — kept as artifacts: "
+                        + ", ".join(upload.artifact_id or upload.path for upload in uploads)
+                        + ")"
+                    )[:DISCORD_MESSAGE_LIMIT]
+                    message = await channel.send(fallback, view=message_view)
+            finally:
+                for tmp in temp_paths:
+                    try:
+                        tmp.unlink()
+                    except OSError:
+                        pass
+            if first_message is None:
+                first_message = message
+        return DiscordSentMessage(message_id=str(first_message.id), channel_id=str(channel.id))
 
     async def send_embed(
         self,
@@ -1217,9 +1305,14 @@ class DiscordOutputService:
         if not path.is_file():
             return None
         filename = Path(str(artifact.title)).name if artifact.title else path.name
+        filename = filename or path.name
+        # A title without the file's real extension ("Juniper — 1 Campus") reaches Discord
+        # as an extensionless blob that never renders inline; give it the stored file's suffix.
+        if path.suffix and mimetypes.guess_type(filename)[0] != mimetypes.guess_type(path.name)[0]:
+            filename = f"{filename}{path.suffix}"
         return DiscordFileUpload(
             path=str(path),
-            filename=filename or path.name,
+            filename=filename,
             artifact_id=artifact.id,
         )
 

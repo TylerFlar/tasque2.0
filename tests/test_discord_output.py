@@ -918,3 +918,54 @@ def test_discord_output_hidden_canceled_workflow_posts_nothing(fresh_db: Path) -
         assert posted == 0
         assert len(gateway.created_threads) == 0
         assert all("Canceled." not in message[1] for message in gateway.sent_messages)
+
+
+def test_batch_discord_uploads_continues_past_request_budget(tmp_path: Path) -> None:
+    from tasque2.discord_output import DiscordFileUpload, batch_discord_uploads
+
+    paths = []
+    for name in ("one.bin", "two.bin", "three.bin"):
+        path = tmp_path / name
+        path.write_bytes(b"x" * 900)
+        paths.append(path)
+
+    batches = batch_discord_uploads(
+        [DiscordFileUpload(path=str(path), filename=path.name) for path in paths],
+        max_file_bytes=1_000,
+        max_request_bytes=1_000,
+    )
+
+    assert [[upload.filename for upload in sendable] for sendable, _notes, _temps in batches] == [
+        ["one.bin"],
+        ["two.bin"],
+        ["three.bin"],
+    ]
+    assert all(not notes for _sendable, notes, _temps in batches)
+
+
+def test_discord_output_upload_filename_carries_the_file_extension(fresh_db: Path, tmp_path: Path) -> None:
+    """A worker titling a PNG "Juniper — 1 Campus" must not reach Discord as an extensionless blob."""
+    gateway = FakeDiscordOutputGateway()
+    source = tmp_path / "render.png"
+    source.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 64)
+    with session_scope() as session:
+        work = WorkRepository(session).create_work_item(
+            title="Render work",
+            task_instruction="Render the thing.",
+            worker_kind="function.echo",
+        )
+        WorkRunner(session).run_next()
+        artifact = ArtifactStore(tmp_path / "artifacts").capture_file(
+            session,
+            path=source,
+            kind="worker_file",
+            title="Juniper — 1 Campus (launch look)",
+            work_item_id=work.id,
+            tags=["discord_upload"],
+        )
+
+        posted = _post_pending(DiscordOutputService(session), gateway)
+
+        assert posted == 1
+        assert artifact.content_type == "image/png"
+        assert gateway.sent_attachments[-1][0].filename == "Juniper — 1 Campus (launch look).png"

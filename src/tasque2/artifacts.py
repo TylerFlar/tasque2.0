@@ -126,7 +126,9 @@ class ArtifactStore:
             work_item_id=work_item_id,
             attempt_id=attempt_id,
             workflow_run_id=workflow_run_id,
-            content_type=content_type or _guess_content_type(artifact_title),
+            content_type=content_type
+            or _guess_content_type(artifact_title)
+            or _guess_content_type(source_path.name),
             size_bytes=target.stat().st_size,
             sha256=digest.hexdigest(),
             tags=tags or [],
