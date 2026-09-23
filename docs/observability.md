@@ -114,14 +114,24 @@ TraceQL examples (Tempo):
 | `tasque.retention.pruned` | counter | kind |
 | `tasque.memory.operations` | counter | operation, namespace |
 
-In Prometheus the dots become underscores, counters gain `_total`, and units become suffixes:
+In Prometheus the dots become underscores, counters gain `_total`, and units become suffixes.
+
+Tasque's counters are sparse: a lane, tool or outcome may count a handful of events a day, and
+each daemon start begins new series. `increase()` never sees a series' first value (there is no
+earlier sample to subtract), so it drops the first event of every series. Count events in a range
+as the last value minus the value at the range's start, with 0 for a series born inside the range:
 
 ```promql
-sum by (tasque_work_lane) (increase(tasque_provider_cost_USD_total[7d]))
-sum by (tasque_work_lane, tasque_work_outcome) (increase(tasque_work_runs_total[1d]))
-histogram_quantile(0.9, sum by (le, tasque_work_lane) (rate(tasque_work_duration_seconds_bucket[1d])))
+# cost per lane over the last 7 days
+sum by (tasque_work_lane) (
+  last_over_time(tasque_provider_cost_USD_total[7d])
+  - (last_over_time(tasque_provider_cost_USD_total[7d] offset 7d)
+     or last_over_time(tasque_provider_cost_USD_total[7d]) * 0))
+# work ready right now
 max(tasque_work_queue_size{tasque_work_status="ready"})
 ```
+
+The Tasque dashboard uses this pattern in every counter and histogram panel.
 
 ## Worker telemetry
 

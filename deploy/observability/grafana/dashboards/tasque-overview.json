@@ -30,7 +30,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "sum(increase(tasque_provider_cost_USD_total{tasque_work_lane=~\"$lane\"}[$__range])) or vector(0)",
+          "expr": "sum((last_over_time(tasque_provider_cost_USD_total{tasque_work_lane=~\"$lane\"}[$__range]) - (last_over_time(tasque_provider_cost_USD_total{tasque_work_lane=~\"$lane\"}[$__range] offset $__range) or last_over_time(tasque_provider_cost_USD_total{tasque_work_lane=~\"$lane\"}[$__range]) * 0))) or vector(0)",
           "instant": true,
           "range": false
         }
@@ -91,7 +91,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "sum(increase(tasque_work_runs_total{tasque_work_lane=~\"$lane\"}[$__range])) or vector(0)",
+          "expr": "sum((last_over_time(tasque_work_runs_total{tasque_work_lane=~\"$lane\"}[$__range]) - (last_over_time(tasque_work_runs_total{tasque_work_lane=~\"$lane\"}[$__range] offset $__range) or last_over_time(tasque_work_runs_total{tasque_work_lane=~\"$lane\"}[$__range]) * 0))) or vector(0)",
           "instant": true,
           "range": false
         }
@@ -152,7 +152,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "sum(increase(tasque_work_runs_total{tasque_work_lane=~\"$lane\",tasque_work_outcome=~\"failed|dead_letter\"}[$__range])) or vector(0)",
+          "expr": "sum((last_over_time(tasque_work_runs_total{tasque_work_lane=~\"$lane\",tasque_work_outcome=~\"failed|dead_letter\"}[$__range]) - (last_over_time(tasque_work_runs_total{tasque_work_lane=~\"$lane\",tasque_work_outcome=~\"failed|dead_letter\"}[$__range] offset $__range) or last_over_time(tasque_work_runs_total{tasque_work_lane=~\"$lane\",tasque_work_outcome=~\"failed|dead_letter\"}[$__range]) * 0))) or vector(0)",
           "instant": true,
           "range": false
         }
@@ -217,7 +217,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "sum(increase(tasque_work_runs_total{tasque_work_lane=~\"$lane\",tasque_work_outcome=~\"blocked|awaiting_user\"}[$__range])) or vector(0)",
+          "expr": "sum((last_over_time(tasque_work_runs_total{tasque_work_lane=~\"$lane\",tasque_work_outcome=~\"blocked|awaiting_user\"}[$__range]) - (last_over_time(tasque_work_runs_total{tasque_work_lane=~\"$lane\",tasque_work_outcome=~\"blocked|awaiting_user\"}[$__range] offset $__range) or last_over_time(tasque_work_runs_total{tasque_work_lane=~\"$lane\",tasque_work_outcome=~\"blocked|awaiting_user\"}[$__range]) * 0))) or vector(0)",
           "instant": true,
           "range": false
         }
@@ -343,7 +343,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "sum(increase(tasque_provider_limit_stops_total{tasque_work_lane=~\"$lane\"}[$__range])) or vector(0)",
+          "expr": "sum((last_over_time(tasque_provider_limit_stops_total{tasque_work_lane=~\"$lane\"}[$__range]) - (last_over_time(tasque_provider_limit_stops_total{tasque_work_lane=~\"$lane\"}[$__range] offset $__range) or last_over_time(tasque_provider_limit_stops_total{tasque_work_lane=~\"$lane\"}[$__range]) * 0))) or vector(0)",
           "instant": true,
           "range": false
         }
@@ -410,7 +410,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "sum(increase(tasque_provider_cost_USD_total{tasque_work_lane=~\"$lane\"}[$__interval]))",
+          "expr": "sum((last_over_time(tasque_provider_cost_USD_total{tasque_work_lane=~\"$lane\"}[$__interval]) - (last_over_time(tasque_provider_cost_USD_total{tasque_work_lane=~\"$lane\"}[$__interval] offset $__interval) or last_over_time(tasque_provider_cost_USD_total{tasque_work_lane=~\"$lane\"}[$__interval]) * 0)))",
           "legendFormat": "Cost",
           "range": true
         }
@@ -469,7 +469,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "sort_desc(sum by (tasque_work_lane) (increase(tasque_provider_cost_USD_total{tasque_work_lane=~\"$lane\"}[$__range])))",
+          "expr": "sort_desc(sum by (tasque_work_lane) ((last_over_time(tasque_provider_cost_USD_total{tasque_work_lane=~\"$lane\"}[$__range]) - (last_over_time(tasque_provider_cost_USD_total{tasque_work_lane=~\"$lane\"}[$__range] offset $__range) or last_over_time(tasque_provider_cost_USD_total{tasque_work_lane=~\"$lane\"}[$__range]) * 0))))",
           "legendFormat": "{{tasque_work_lane}}",
           "instant": true,
           "range": false
@@ -527,7 +527,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "sort_desc(sum by (gen_ai_request_model) (increase(tasque_provider_cost_USD_total{tasque_work_lane=~\"$lane\"}[$__range])))",
+          "expr": "sort_desc(sum by (gen_ai_request_model) ((last_over_time(tasque_provider_cost_USD_total{tasque_work_lane=~\"$lane\"}[$__range]) - (last_over_time(tasque_provider_cost_USD_total{tasque_work_lane=~\"$lane\"}[$__range] offset $__range) or last_over_time(tasque_provider_cost_USD_total{tasque_work_lane=~\"$lane\"}[$__range]) * 0))))",
           "legendFormat": "{{gen_ai_request_model}}",
           "instant": true,
           "range": false
@@ -587,7 +587,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "sum by (outcome) (label_replace(label_replace(label_replace(label_replace(increase(tasque_work_runs_total{tasque_work_lane=~\"$lane\"}[$__interval]), \"outcome\", \"$1\", \"tasque_work_outcome\", \"(.*)\"), \"outcome\", \"waiting on you\", \"tasque_work_outcome\", \"blocked|awaiting_user\"), \"outcome\", \"gave up\", \"tasque_work_outcome\", \"dead_letter\"), \"outcome\", \"retried\", \"tasque_work_outcome\", \"retry\"))",
+          "expr": "sum by (outcome) (label_replace(label_replace(label_replace(label_replace((last_over_time(tasque_work_runs_total{tasque_work_lane=~\"$lane\"}[$__interval]) - (last_over_time(tasque_work_runs_total{tasque_work_lane=~\"$lane\"}[$__interval] offset $__interval) or last_over_time(tasque_work_runs_total{tasque_work_lane=~\"$lane\"}[$__interval]) * 0)), \"outcome\", \"$1\", \"tasque_work_outcome\", \"(.*)\"), \"outcome\", \"waiting on you\", \"tasque_work_outcome\", \"blocked|awaiting_user\"), \"outcome\", \"gave up\", \"tasque_work_outcome\", \"dead_letter\"), \"outcome\", \"retried\", \"tasque_work_outcome\", \"retry\"))",
           "legendFormat": "{{outcome}}",
           "range": true
         }
@@ -737,7 +737,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "sort_desc(sum by (tasque_work_lane) (increase(tasque_work_runs_total{tasque_work_lane=~\"$lane\"}[$__range])))",
+          "expr": "sort_desc(sum by (tasque_work_lane) ((last_over_time(tasque_work_runs_total{tasque_work_lane=~\"$lane\"}[$__range]) - (last_over_time(tasque_work_runs_total{tasque_work_lane=~\"$lane\"}[$__range] offset $__range) or last_over_time(tasque_work_runs_total{tasque_work_lane=~\"$lane\"}[$__range]) * 0))))",
           "legendFormat": "{{tasque_work_lane}}",
           "instant": true,
           "range": false
@@ -795,7 +795,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "sort_desc(histogram_quantile(0.9, sum by (le, tasque_work_lane) (increase(tasque_work_duration_seconds_bucket{tasque_work_lane=~\"$lane\"}[$__range]))))",
+          "expr": "sort_desc(histogram_quantile(0.9, sum by (le, tasque_work_lane) ((last_over_time(tasque_work_duration_seconds_bucket{tasque_work_lane=~\"$lane\"}[$__range]) - (last_over_time(tasque_work_duration_seconds_bucket{tasque_work_lane=~\"$lane\"}[$__range] offset $__range) or last_over_time(tasque_work_duration_seconds_bucket{tasque_work_lane=~\"$lane\"}[$__range]) * 0)))))",
           "legendFormat": "{{tasque_work_lane}}",
           "instant": true,
           "range": false
@@ -853,7 +853,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "sort_desc(topk(12, sum by (gen_ai_tool_name) (increase(tasque_worker_tool_calls_total{tasque_work_lane=~\"$lane\"}[$__range]))))",
+          "expr": "sort_desc(topk(12, sum by (gen_ai_tool_name) ((last_over_time(tasque_worker_tool_calls_total{tasque_work_lane=~\"$lane\"}[$__range]) - (last_over_time(tasque_worker_tool_calls_total{tasque_work_lane=~\"$lane\"}[$__range] offset $__range) or last_over_time(tasque_worker_tool_calls_total{tasque_work_lane=~\"$lane\"}[$__range]) * 0)))))",
           "legendFormat": "{{gen_ai_tool_name}}",
           "instant": true,
           "range": false
@@ -914,7 +914,7 @@
           "format": "table",
           "instant": true,
           "range": false,
-          "expr": "sum by (gen_ai_tool_name, error_type) (increase(mcp_server_operation_duration_seconds_count{error_type!=\"\"}[$__range])) > 0"
+          "expr": "sum by (gen_ai_tool_name, error_type) ((last_over_time(mcp_server_operation_duration_seconds_count{error_type!=\"\"}[$__range]) - (last_over_time(mcp_server_operation_duration_seconds_count{error_type!=\"\"}[$__range] offset $__range) or last_over_time(mcp_server_operation_duration_seconds_count{error_type!=\"\"}[$__range]) * 0))) > 0"
         }
       ],
       "transformations": [
