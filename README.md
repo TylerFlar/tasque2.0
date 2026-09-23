@@ -157,6 +157,28 @@ uv run tasque2 lanes
 uv run tasque2 usage --days 14
 ```
 
+### Reminders that cost nothing
+
+A worker that hears "remind me to pay the card on the 26th" calls `reminder_set`; the reminder is
+a one-shot schedule whose `function.notify` worker posts `Reminder: pay the card` into that thread
+at its time, with no model run. `reminder_list` shows what is coming (a morning brief can list
+today's), `reminder_cancel` drops one, and past reminders are pruned after a month.
+
+### Run a daily job only when it has something to do
+
+An extension registers a gate, and a schedule names it in its payload:
+
+```python
+registry.add_schedule_gate("finance_due", lambda session, schedule, when: None if bills_due(session) else "nothing due")
+```
+
+```powershell
+uv run tasque2 schedule-edit <schedule-id> --payload-json '{"gate": "finance_due", ...}'
+```
+
+When the gate returns a reason, the occurrence is recorded as skipped and no worker starts. A gate
+that fails lets the run go, and `schedule-fire-now` ignores gates.
+
 ### Trace a run end to end
 
 Point Tasque at any OTLP endpoint and every schedule fire, work run, model invocation and MCP
