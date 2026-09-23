@@ -120,6 +120,10 @@ class Settings(BaseSettings):
     telemetry: str = Field(default="auto")
     telemetry_worker_export: bool = Field(default=True)
     telemetry_worker_traces: bool = Field(default=False)
+    telemetry_stack: str | None = Field(default=None)
+    telemetry_stack_dashboard: str = Field(default="http://localhost:3000")
+    telemetry_stack_open: bool = Field(default=False)
+    telemetry_stack_timeout_seconds: int = Field(default=300)
 
     @property
     def resolved_data_dir(self) -> Path:

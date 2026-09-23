@@ -169,13 +169,19 @@ def _queue_counts() -> dict[str, int]:
         return work_status_counts(session)
 
 
-def serve(*, force: bool = False, discord: bool = True, max_claims: int | None = None) -> None:
-    """Run the daemon in the foreground until it is stopped."""
+def serve(*, force: bool = False, discord: bool = True, max_claims: int | None = None, stack: bool = True) -> None:
+    """Run the daemon in the foreground until it is stopped.
+
+    With ``stack`` (the default) a configured local observability stack is brought up first.
+    """
     from tasque2.logs import configure_logging
     from tasque2.migrations import upgrade_database
     from tasque2.telemetry import configure_telemetry
+    from tasque2.telemetry.stack import ensure_telemetry_stack
 
     configure_logging()
+    if stack:
+        ensure_telemetry_stack()
     configure_telemetry("daemon")
     upgrade_database()
     reason = control.live_daemon_reason()

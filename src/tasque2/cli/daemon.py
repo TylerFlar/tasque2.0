@@ -14,12 +14,15 @@ def daemon(
     force: Annotated[bool, typer.Option("--force", help="Start even if another daemon looks alive.")] = False,
     discord: Annotated[bool, typer.Option("--discord/--no-discord", help="Run the Discord bot too.")] = True,
     max_claims: Annotated[int | None, typer.Option("--max-claims", help="Work items claimed per tick.")] = None,
+    stack: Annotated[
+        bool, typer.Option("--stack/--no-stack", help="Bring up TASQUE2_TELEMETRY_STACK first, when one is set.")
+    ] = True,
 ) -> None:
     """Run the daemon: schedules, workflows, workers, retention, and Discord."""
     from tasque2.daemon import DaemonAlreadyRunning, serve
 
     try:
-        serve(force=force, discord=discord, max_claims=max_claims)
+        serve(force=force, discord=discord, max_claims=max_claims, stack=stack)
     except DaemonAlreadyRunning as exc:
         raise fail(str(exc)) from None
 

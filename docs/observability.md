@@ -17,6 +17,20 @@ uv run tasque2 daemon
 Open Grafana at http://localhost:3000 (admin / admin): traces are under Tempo, metrics under
 Prometheus, logs under Loki.
 
+To have the daemon do all of that on every start, put the compose file in `.env`:
+
+```
+TASQUE2_TELEMETRY_STACK=deploy/observability/docker-compose.yml
+TASQUE2_TELEMETRY_STACK_OPEN=true
+```
+
+`tasque2 daemon` then starts Docker Desktop if the engine isn't running, runs
+`docker compose up -d`, points the OTLP endpoint at `http://localhost:4318` unless one is set,
+waits until the stack answers, and opens the dashboard when it runs in a terminal. If Docker or
+the stack can't come up, the daemon logs why and runs without telemetry. `tasque2 daemon
+--no-stack` skips it for one run; `TASQUE2_TELEMETRY_STACK_TIMEOUT_SECONDS` (default 300) bounds
+the wait, which is longest the first time the image is pulled.
+
 Settings:
 
 - `TASQUE2_TELEMETRY`: `auto` (export when an OTLP endpoint is set), `otlp`, `console`, `off`.
