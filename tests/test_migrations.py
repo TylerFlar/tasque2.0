@@ -65,8 +65,18 @@ WORK_ITEMS_WITHOUT_LANE = [
 
 
 def _schema_differences() -> list[Any]:
+    # Extension models imported in the same session share Base.metadata; the core migrations answer
+    # for the core's own tables only.
+    core_tables = {
+        mapper.local_table.name for mapper in Base.registry.mappers if mapper.class_.__module__.startswith("tasque2.")
+    }
+
+    def in_core(obj: Any, name: str | None, type_: str, reflected: bool, compare_to: Any) -> bool:
+        return type_ != "table" or reflected or name in core_tables
+
     with get_engine().connect() as connection:
-        differences = compare_metadata(MigrationContext.configure(connection), Base.metadata)
+        context = MigrationContext.configure(connection, opts={"include_object": in_core})
+        differences = compare_metadata(context, Base.metadata)
     return [
         difference
         for difference in differences
