@@ -65,14 +65,31 @@ def test_a_date_alone_posts_late_morning_and_past_times_are_refused(fresh_db: Pa
 def test_reminders_list_cancel_and_prune(fresh_db: Path) -> None:
     with session_scope() as session:
         service = ReminderService(session)
-        soon = service.set("Email MS Advising about CSE 210", "2026-09-30", thread_id="t", now=NOW)
+        soon = service.set("Email the advisor", "2026-09-30", thread_id="t", now=NOW)
         later = service.set("Winter tuition", "2026-12-10", thread_id="t", now=NOW)
 
-        assert [r.text for r in service.list(days=10, now=NOW)] == ["Email MS Advising about CSE 210"]
+        assert [r.text for r in service.list(days=10, now=NOW)] == ["Email the advisor"]
         service.cancel(soon.id)
         assert [r.text for r in service.list(days=100, now=NOW)] == ["Winter tuition"]
         assert service.prune(now=NOW + timedelta(days=200)) == 1
         assert session.get(Schedule, later.id) is None
+
+
+def test_a_recurring_notice_is_neither_listed_nor_pruned_as_a_reminder(fresh_db: Path) -> None:
+    with session_scope() as session:
+        ScheduleService(session).create_schedule(
+            name="Monthly review notice",
+            schedule_type="interval",
+            expression="days=28",
+            worker_kind="function.notify",
+            payload={"title": "Review", "task_instruction": "Time for the monthly review", "discord_thread_id": "t"},
+        )
+        service = ReminderService(session)
+        service.set("Winter tuition", "2026-12-10", thread_id="t", now=NOW)
+
+        assert [r.text for r in service.list(days=100, now=NOW)] == ["Winter tuition"]
+        assert service.prune(now=NOW + timedelta(days=400)) == 1
+        assert session.scalar(select(Schedule).where(Schedule.schedule_type == "interval")) is not None
 
 
 def test_reminder_tools_default_to_the_thread_the_work_answers_in(

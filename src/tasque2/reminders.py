@@ -94,7 +94,12 @@ class ReminderService:
         return len(stale)
 
     def _schedules(self) -> list[Schedule]:
-        return list(self.session.scalars(select(Schedule).where(Schedule.worker_kind == NOTIFY_WORKER)).all())
+        """One-shot notices only: a recurring notify schedule is not a reminder and is never pruned."""
+        return list(
+            self.session.scalars(
+                select(Schedule).where(Schedule.worker_kind == NOTIFY_WORKER, Schedule.schedule_type == "date")
+            ).all()
+        )
 
     def _when(self, schedule: Schedule) -> datetime:
         return datetime.fromisoformat(schedule.expression).replace(tzinfo=ZoneInfo(schedule.timezone))
