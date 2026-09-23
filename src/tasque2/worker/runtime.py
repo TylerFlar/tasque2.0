@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from collections.abc import Mapping
 from typing import Any
@@ -272,6 +273,8 @@ def worker_telemetry_env(provider_name: str, work_item: WorkItem, attempt: WorkA
         "CLAUDE_CODE_ENABLE_TELEMETRY": "1",
         "OTEL_METRICS_EXPORTER": "otlp",
         "OTEL_LOGS_EXPORTER": "otlp",
+        # The agent CLI exports nothing until told the protocol; Tasque's own exporters speak OTLP over HTTP.
+        "OTEL_EXPORTER_OTLP_PROTOCOL": os.environ.get("OTEL_EXPORTER_OTLP_PROTOCOL", "").strip() or "http/protobuf",
         "OTEL_METRIC_EXPORT_INTERVAL": "10000",
         "OTEL_LOGS_EXPORT_INTERVAL": "2000",
         "OTEL_RESOURCE_ATTRIBUTES": ",".join(

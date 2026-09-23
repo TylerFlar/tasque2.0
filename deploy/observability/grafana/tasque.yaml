@@ -1,0 +1,12 @@
+# Grafana loads the Tasque dashboards from the mounted folder (see ../docker-compose.yml).
+apiVersion: 1
+
+providers:
+  - name: Tasque
+    folder: Tasque
+    type: file
+    allowUiUpdates: true
+    updateIntervalSeconds: 30
+    options:
+      path: /otel-lgtm/tasque-dashboards
+      foldersFromFilesStructure: false

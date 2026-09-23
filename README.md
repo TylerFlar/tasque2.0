@@ -194,6 +194,8 @@ Or let the daemon run the local stack itself: with
 `TASQUE2_TELEMETRY_STACK=deploy/observability/docker-compose.yml` in `.env`, `tasque2 daemon`
 starts Docker Desktop when it isn't running, brings the stack up, and sends everything to it
 (`TASQUE2_TELEMETRY_STACK_OPEN=true` also opens Grafana; `--no-stack` skips it for one run).
+Grafana opens on a Tasque dashboard: cost, runs and failures by lane, run times, tool calls, and
+the latest runs with their traces.
 
 ## Commands
 

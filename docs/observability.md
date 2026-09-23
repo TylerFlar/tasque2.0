@@ -14,8 +14,25 @@ uv run tasque2 telemetry-check      # prints the trace id of a test span
 uv run tasque2 daemon
 ```
 
-Open Grafana at http://localhost:3000 (admin / admin): traces are under Tempo, metrics under
-Prometheus, logs under Loki.
+Open Grafana at http://localhost:3000: it opens on the Tasque dashboard, and Explore has the raw
+traces (Tempo), metrics (Prometheus) and logs (Loki). The stack listens on this computer only
+(127.0.0.1) and lets local visitors in without a login.
+
+## The Tasque dashboard
+
+`deploy/observability/grafana/dashboards/tasque-overview.json` is provisioned into Grafana's
+"Tasque" folder and set as its home page. A Lane filter and the time picker at the top scope
+every panel:
+
+- **At a glance:** cost, runs, failed runs, runs waiting on you, work ready now, usage-limit stops.
+- **Cost:** per day, by lane, by model.
+- **Runs:** per day by outcome, by lane, and each lane's 90th-percentile run time.
+- **Tools:** the tools workers call most, and Tasque tool calls that returned errors.
+- **Recent activity:** the latest runs and the ones that failed, need you, or ran over 10 minutes
+  (click one for its full trace), and warning and error logs from Tasque and its workers.
+
+Edit the JSON file to change it for good; edits saved in the Grafana UI last until the file
+changes.
 
 To have the daemon do all of that on every start, put the compose file in `.env`:
 

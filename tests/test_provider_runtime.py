@@ -697,12 +697,21 @@ def test_worker_telemetry_env_tags_claude_exports_with_the_run(telemetry_on: Non
         "CLAUDE_CODE_ENABLE_TELEMETRY": "1",
         "OTEL_METRICS_EXPORTER": "otlp",
         "OTEL_LOGS_EXPORTER": "otlp",
+        "OTEL_EXPORTER_OTLP_PROTOCOL": "http/protobuf",
         "OTEL_METRIC_EXPORT_INTERVAL": "10000",
         "OTEL_LOGS_EXPORT_INTERVAL": "2000",
         "OTEL_RESOURCE_ATTRIBUTES": (
             "service.name=claude-code,tasque.work.id=work-1,tasque.work.lane=finance_daily,tasque.work.attempt=2"
         ),
     }
+
+
+def test_worker_telemetry_env_keeps_a_protocol_already_chosen(
+    telemetry_on: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_PROTOCOL", "grpc")
+
+    assert worker_telemetry_env("claude", *_work_and_attempt())["OTEL_EXPORTER_OTLP_PROTOCOL"] == "grpc"
 
 
 def test_worker_telemetry_env_marks_work_without_a_lane(telemetry_on: None) -> None:
