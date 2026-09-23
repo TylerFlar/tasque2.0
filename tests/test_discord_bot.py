@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -176,6 +177,18 @@ def test_bot_reads_its_channels_and_allowlist_from_settings() -> None:
 def test_bot_needs_every_output_channel() -> None:
     with pytest.raises(RuntimeError):
         TasqueBot(_settings(discord_chains_channel_id=None))
+
+
+def test_bot_starts_without_voice_library_warnings(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(discord.VoiceClient, "warn_nacl", True)
+    monkeypatch.setattr(discord.VoiceClient, "warn_dave", True)
+
+    with caplog.at_level(logging.WARNING, logger="discord.client"):
+        TasqueBot(_settings())
+
+    assert "voice will NOT be supported" not in caplog.text
 
 
 def test_intake_message_is_received_in_a_span_that_its_work_joins(fresh_db: Path, spans) -> None:

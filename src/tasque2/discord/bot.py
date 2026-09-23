@@ -45,6 +45,8 @@ def discord_configured(settings: Settings | None = None) -> bool:
 
 class TasqueBot(discord.Client):
     def __init__(self, settings: Settings | None = None) -> None:
+        # Tasque never joins voice, so discord.py's start-up warnings about missing voice libraries are noise.
+        discord.VoiceClient.warn_nacl = discord.VoiceClient.warn_dave = False
         intents = discord.Intents.default()
         intents.message_content = True
         super().__init__(intents=intents)
