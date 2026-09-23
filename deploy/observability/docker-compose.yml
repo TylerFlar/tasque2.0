@@ -12,7 +12,8 @@ services:
       - "127.0.0.1:4317:4317"
       - "127.0.0.1:4318:4318"
     environment:
-      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /otel-lgtm/tasque-dashboards/tasque-overview.json
+      # Home redirects to the provisioned dashboard, which reloads when its file changes.
+      GF_USERS_HOME_PAGE: /d/tasque-overview
     volumes:
       - lgtm-data:/data
       - ./grafana/tasque.yaml:/otel-lgtm/grafana/conf/provisioning/dashboards/tasque.yaml:ro

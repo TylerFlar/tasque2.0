@@ -410,7 +410,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "sum((last_over_time(tasque_provider_cost_USD_total{tasque_work_lane=~\"$lane\"}[$__interval]) - (last_over_time(tasque_provider_cost_USD_total{tasque_work_lane=~\"$lane\"}[$__interval] offset $__interval) or last_over_time(tasque_provider_cost_USD_total{tasque_work_lane=~\"$lane\"}[$__interval]) * 0)))",
+          "expr": "sum((last_over_time(tasque_provider_cost_USD_total{tasque_work_lane=~\"$lane\"}[$__interval] offset -$__interval) - (last_over_time(tasque_provider_cost_USD_total{tasque_work_lane=~\"$lane\"}[$__interval]) or last_over_time(tasque_provider_cost_USD_total{tasque_work_lane=~\"$lane\"}[$__interval] offset -$__interval) * 0)))",
           "legendFormat": "Cost",
           "range": true
         }
@@ -426,7 +426,7 @@
             "showPoints": "never",
             "axisSoftMin": 0,
             "gradientMode": "none",
-            "barAlignment": 0
+            "barAlignment": 1
           },
           "color": {
             "mode": "fixed",
@@ -587,7 +587,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "sum by (outcome) (label_replace(label_replace(label_replace(label_replace((last_over_time(tasque_work_runs_total{tasque_work_lane=~\"$lane\"}[$__interval]) - (last_over_time(tasque_work_runs_total{tasque_work_lane=~\"$lane\"}[$__interval] offset $__interval) or last_over_time(tasque_work_runs_total{tasque_work_lane=~\"$lane\"}[$__interval]) * 0)), \"outcome\", \"$1\", \"tasque_work_outcome\", \"(.*)\"), \"outcome\", \"waiting on you\", \"tasque_work_outcome\", \"blocked|awaiting_user\"), \"outcome\", \"gave up\", \"tasque_work_outcome\", \"dead_letter\"), \"outcome\", \"retried\", \"tasque_work_outcome\", \"retry\"))",
+          "expr": "sum by (outcome) (label_replace(label_replace(label_replace(label_replace((last_over_time(tasque_work_runs_total{tasque_work_lane=~\"$lane\"}[$__interval] offset -$__interval) - (last_over_time(tasque_work_runs_total{tasque_work_lane=~\"$lane\"}[$__interval]) or last_over_time(tasque_work_runs_total{tasque_work_lane=~\"$lane\"}[$__interval] offset -$__interval) * 0)), \"outcome\", \"$1\", \"tasque_work_outcome\", \"(.*)\"), \"outcome\", \"waiting on you\", \"tasque_work_outcome\", \"blocked|awaiting_user\"), \"outcome\", \"gave up\", \"tasque_work_outcome\", \"dead_letter\"), \"outcome\", \"retried\", \"tasque_work_outcome\", \"retry\"))",
           "legendFormat": "{{outcome}}",
           "range": true
         }
@@ -603,7 +603,7 @@
             "showPoints": "never",
             "axisSoftMin": 0,
             "gradientMode": "none",
-            "barAlignment": 0,
+            "barAlignment": 1,
             "stacking": {
               "mode": "normal",
               "group": "A"

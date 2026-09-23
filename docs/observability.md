@@ -131,7 +131,10 @@ sum by (tasque_work_lane) (
 max(tasque_work_queue_size{tasque_work_status="ready"})
 ```
 
-The Tasque dashboard uses this pattern in every counter and histogram panel.
+The Tasque dashboard uses this pattern in every counter and histogram panel. Its per-day panels
+turn it around, because Grafana stamps each daily point at the start of its day (midnight in the
+browser's time zone): the last value in the day ahead (`[1d] offset -1d`) minus the last value
+before it, so today's bar fills in as the day goes.
 
 ## Worker telemetry
 
