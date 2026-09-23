@@ -108,8 +108,11 @@ class DaemonTick:
         dispatched = finished = 0
         if self.pool is not None:
             finished = self.pool.reap()
-            if claim:
-                dispatched = self.pool.dispatch(limit=max_claims, lease_owner=LEASE_OWNER, lease_seconds=lease_seconds)
+            ready = queue.ready_count() if claim else 0
+            if ready:
+                dispatched = self.pool.dispatch(
+                    limit=min(max_claims, ready), lease_owner=LEASE_OWNER, lease_seconds=lease_seconds
+                )
         elif claim:
             finished = drain_synchronously(
                 max_items=max_claims, concurrency=settings.daemon_concurrency, lease_owner=LEASE_OWNER

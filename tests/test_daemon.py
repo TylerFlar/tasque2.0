@@ -390,7 +390,7 @@ def test_pool_tick_dispatches_without_waiting_for_the_work(fresh_db: Path, monke
         _wait_for(lambda: pool.in_flight_count() == 0)
         with session_scope() as session:
             refill = tick.run(session)
-        assert (refill.dispatched, refill.finished) == (2, 2)
+        assert (refill.dispatched, refill.finished) == (1, 2)
 
         _wait_for(lambda: pool.in_flight_count() == 0)
         with session_scope() as session:
@@ -516,3 +516,15 @@ def test_system_status_counts_work_by_status(fresh_db: Path) -> None:
     assert snapshot.work_items == {"ready": 1}
     assert snapshot.ready_work == 1
     assert snapshot.failed_work_unresolved == 0
+
+
+def test_idle_pool_tick_dispatches_nothing(fresh_db: Path) -> None:
+    pool = WorkPool(2)
+    try:
+        with session_scope() as session:
+            result = DaemonTick(pool=pool).run(session)
+        assert result.dispatched == 0
+        assert not result.has_activity
+        assert pool.in_flight_count() == 0
+    finally:
+        pool.shutdown(wait=True)

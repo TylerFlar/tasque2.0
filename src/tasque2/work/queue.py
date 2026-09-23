@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
 
-from sqlalchemy import or_, select, update
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.orm import Session
 
 from tasque2.events import record_event
@@ -90,6 +90,18 @@ class WorkQueue:
             )
             return ClaimedWork(work_item=work_item, attempt=attempt)
         return None
+
+    def ready_count(self, *, now: datetime | None = None) -> int:
+        """How many items are ready to claim now (dependencies and the capacity gate aside)."""
+        now = now or utc_now()
+        return int(
+            self.session.scalar(
+                select(func.count())
+                .select_from(WorkItem)
+                .where(WorkItem.status == "ready", or_(WorkItem.not_before.is_(None), WorkItem.not_before <= now))
+            )
+            or 0
+        )
 
     def heartbeat_running_attempts(
         self,
