@@ -10,7 +10,8 @@ directory (``TASQUE2_EXTENSIONS_DIR``, default ``extensions/``), each exposing
 - MCP tools served alongside the core tools;
 - context digests: code-computed state injected into matching work items' packets;
 - canonical-key resolvers that choose pinned documents per run;
-- attempt ingestors that run after every successfully completed attempt.
+- attempt ingestors that run after every successfully completed attempt;
+- schedule gates: code that decides, before a scheduled run is launched, whether it is needed.
 
 Extensions load once per process on first use. A broken extension raises: a daemon that
 silently lost its domain tools would corrupt runs far worse than a loud startup failure.
@@ -33,6 +34,7 @@ DigestWants = Callable[[dict[str, Any]], bool]
 DigestBuild = Callable[[Any], dict[str, Any]]
 AttemptIngestor = Callable[[Any, Any, Any], Any]
 CanonicalKeyResolver = Callable[[Any, dict[str, Any]], list[str]]
+ScheduleGate = Callable[[Any, Any, Any], "str | None"]
 
 
 class ExtensionError(RuntimeError):
@@ -48,6 +50,7 @@ class ExtensionRegistry:
     mcp_tools: list[Callable[..., str]] = field(default_factory=list)
     attempt_ingestors: list[tuple[str, AttemptIngestor]] = field(default_factory=list)
     migration_locations: list[Path] = field(default_factory=list)
+    schedule_gates: dict[str, ScheduleGate] = field(default_factory=dict)
     extension_names: list[str] = field(default_factory=list)
 
     def add_context_digest(self, key: str, wants: DigestWants, build: DigestBuild) -> None:
@@ -70,6 +73,15 @@ class ExtensionRegistry:
     def add_attempt_ingestor(self, name: str, ingestor: AttemptIngestor) -> None:
         """Run ``ingestor(session, work_item, attempt)`` after each attempt that completes successfully."""
         self.attempt_ingestors.append((name, ingestor))
+
+    def add_schedule_gate(self, name: str, gate: ScheduleGate) -> None:
+        """Let schedules whose payload names ``gate: name`` skip runs that are not needed.
+
+        ``gate(session, schedule, scheduled_for)`` returns None to launch the run, or a short
+        reason to skip it. A gate that raises lets the run launch: a missed check costs one run,
+        a wrong skip can cost a missed bill.
+        """
+        self.schedule_gates[name] = gate
 
     def add_migration_location(self, path: Path | str) -> None:
         """Add an Alembic version directory that upgrades together with the core one."""

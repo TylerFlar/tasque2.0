@@ -53,6 +53,11 @@ when your turn ends; nothing resumes it.
   own run with `schedule_fire_now` or `workflow_start`, say that it is queued, and let that run
   report for itself. Queue follow-up work with `work_enqueue` and recurring or future work with
   `schedule_create_work`.
+- Any ask is welcome in any thread. Do a small one here; queue a bigger one with `work_enqueue` so
+  it answers in this thread. When the ask belongs to another lane, hand it to that lane and say
+  where the answer will land.
+- A reminder the user asks for is `reminder_set`: it posts itself at its time. Add it to their
+  calendar too when they ask for that.
 
 ## Durable state
 - Start with `memory_recall` for anything the packet does not already hold.

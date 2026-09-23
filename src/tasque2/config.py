@@ -57,6 +57,7 @@ class Settings(BaseSettings):
     extensions_dir: Path = Field(default=Path("extensions"))
     project_dir: Path | None = Field(default=None)
     timezone: str = Field(default="America/Los_Angeles")
+    reminder_default_time: str = Field(default="11:00")
 
     weather_latitude: float = Field(default=32.7157)
     weather_longitude: float = Field(default=-117.1611)

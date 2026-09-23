@@ -43,6 +43,63 @@ def _echo_schedule(service: ScheduleService, **fields) -> Schedule:
     return service.create_schedule(**{**defaults, **fields})
 
 
+def _gate(monkeypatch: pytest.MonkeyPatch, name: str, gate) -> None:
+    from tasque2.extensions import registry
+
+    monkeypatch.setitem(registry().schedule_gates, name, gate)
+
+
+def test_a_gate_skips_a_run_that_is_not_needed(fresh_db: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    decisions = iter(["nothing due", None])
+    _gate(monkeypatch, "finance_due", lambda session, schedule, when: next(decisions))
+    with session_scope() as session:
+        service = ScheduleService(session)
+        schedule = _echo_schedule(
+            service, name="Gated", payload={"title": "Gated work", "task_instruction": "Pay.", "gate": "finance_due"}
+        )
+        schedule.created_at = schedule.last_evaluated_at = NOW - timedelta(minutes=1)
+
+        assert service.poll_due_schedules(now=NOW) == 0
+        assert service.poll_due_schedules(now=NOW + timedelta(minutes=1)) == 1
+
+        statuses = [
+            row.status for row in session.scalars(select(ScheduleOccurrence).order_by(ScheduleOccurrence.scheduled_for))
+        ]
+        assert statuses == ["skipped", "enqueued"]
+        assert session.scalar(select(func.count()).select_from(WorkItem)) == 1
+
+
+def test_a_broken_or_unknown_gate_lets_the_run_go(fresh_db: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def broken(session, schedule, when):
+        raise RuntimeError("no board")
+
+    _gate(monkeypatch, "broken", broken)
+    with session_scope() as session:
+        service = ScheduleService(session)
+        for name, gate in (("Broken gate", "broken"), ("Unknown gate", "missing")):
+            _echo_schedule(
+                service,
+                name=name,
+                schedule_type="date",
+                expression=(NOW - timedelta(minutes=1)).isoformat(),
+                payload={"task_instruction": "Run.", "gate": gate},
+            )
+
+        assert service.poll_due_schedules(now=NOW) == 2
+
+
+def test_firing_by_hand_ignores_the_gate(fresh_db: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _gate(monkeypatch, "never", lambda session, schedule, when: "nothing due")
+    with session_scope() as session:
+        service = ScheduleService(session)
+        schedule = _echo_schedule(service, name="By hand", payload={"task_instruction": "Run.", "gate": "never"})
+
+        occurrence = service.fire_schedule_now(schedule.id, now=NOW)
+
+        assert occurrence.status == "enqueued"
+        assert occurrence.work_item_id is not None
+
+
 def test_date_schedule_enqueues_work_once(fresh_db: Path) -> None:
     with session_scope() as session:
         service = ScheduleService(session)

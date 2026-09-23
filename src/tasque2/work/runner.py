@@ -83,6 +83,7 @@ def default_function_registry() -> FunctionWorkerRegistry:
     registry.register("manual", _manual_worker)
     registry.register("function.noop", _noop_worker)
     registry.register("function.echo", _echo_worker)
+    registry.register("function.notify", _notify_worker)
     return registry
 
 
@@ -95,6 +96,11 @@ def _manual_worker(work_item: WorkItem) -> WorkerResult:
 
 def _noop_worker(work_item: WorkItem) -> WorkerResult:
     return WorkerResult(summary=f"No-op worker completed: {work_item.title}", produces={"work_item_id": work_item.id})
+
+
+def _notify_worker(work_item: WorkItem) -> WorkerResult:
+    """Post the work's own text as its message: reminders and other notices that need no model."""
+    return WorkerResult(summary=work_item.task_instruction.strip(), produces={"notice": True})
 
 
 def _echo_worker(work_item: WorkItem) -> WorkerResult:

@@ -17,6 +17,7 @@ from tasque2.mcp.tools.memory import (
     memory_update,
     memory_upsert_canonical,
 )
+from tasque2.mcp.tools.reminders import reminder_cancel, reminder_list, reminder_set
 from tasque2.mcp.tools.schedules import (
     schedule_create_work,
     schedule_delete,
@@ -68,6 +69,9 @@ CORE_TOOLS = (
     workflow_list,
     workflow_start,
     discord_history,
+    reminder_set,
+    reminder_list,
+    reminder_cancel,
     weather_now,
     system_status,
     submit_worker_result,

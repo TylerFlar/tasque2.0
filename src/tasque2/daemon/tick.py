@@ -15,6 +15,7 @@ from tasque2.config import get_settings
 from tasque2.daemon.pool import WorkPool, drain_synchronously
 from tasque2.memory import expire_ttl_memories
 from tasque2.models import utc_now
+from tasque2.reminders import ReminderService
 from tasque2.schedules import ScheduleService
 from tasque2.scratch import prune_scratch_dirs
 from tasque2.telemetry import instruments
@@ -167,6 +168,13 @@ class DaemonTick:
                 metrics.retention_pruned.add(scratch, {"tasque.retention.kind": "scratch"})
         except Exception:  # noqa: BLE001
             logger.exception("Scratch retention failed")
+        try:
+            reminders = ReminderService(session).prune()
+            if reminders:
+                logger.info("Reminder retention: removed %s past reminders", reminders)
+                metrics.retention_pruned.add(reminders, {"tasque.retention.kind": "reminder"})
+        except Exception:  # noqa: BLE001
+            logger.exception("Reminder retention failed")
         return artifacts, scratch
 
     def _expire_memories(self, session: Session, settings) -> int:

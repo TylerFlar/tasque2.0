@@ -178,7 +178,7 @@ class ScheduleService:
 
     def fire_schedule_now(self, schedule_id: str, *, now: datetime | None = None) -> ScheduleOccurrence:
         schedule = self._get(schedule_id)
-        occurrence = self.enqueue_occurrence(schedule, _aware(now or utc_now()))
+        occurrence = self.enqueue_occurrence(schedule, _aware(now or utc_now()), gated=False)
         if occurrence is None:
             raise ValueError("Schedule occurrence already exists for this fire time.")
         self._event(
@@ -205,7 +205,8 @@ class ScheduleService:
         for schedule in schedules:
             try:
                 for scheduled_for in self.due_times(schedule, now=now):
-                    if self.enqueue_occurrence(schedule, scheduled_for) is not None:
+                    occurrence = self.enqueue_occurrence(schedule, scheduled_for)
+                    if occurrence is not None and occurrence.status != "skipped":
                         enqueued += 1
             except Exception:  # noqa: BLE001 - one broken schedule must not stop the rest
                 logger.exception("Schedule %s (%s) could not fire; it stays due", schedule.name, schedule.id)
@@ -248,16 +249,35 @@ class ScheduleService:
         upcoming = croniter(schedule.expression, now.astimezone(tz)).get_next(datetime)
         return upcoming if upcoming.tzinfo is not None else upcoming.replace(tzinfo=tz)
 
-    def enqueue_occurrence(self, schedule: Schedule, scheduled_for: datetime) -> ScheduleOccurrence | None:
+    def enqueue_occurrence(
+        self, schedule: Schedule, scheduled_for: datetime, *, gated: bool = True
+    ) -> ScheduleOccurrence | None:
         """Launch one occurrence; None when that fire time already has one.
 
         The work or workflow is resolved (template read, payload checked, definition found)
-        before anything is written, so a launch that fails leaves no occurrence behind.
+        before anything is written, so a launch that fails leaves no occurrence behind. A
+        schedule whose payload names a ``gate`` asks it first; a gate that finds nothing to do
+        records the occurrence as skipped. Firing a schedule by hand ignores its gate.
         """
         scheduled_for = _aware(scheduled_for)
         dedupe_key = _dedupe_key(schedule.id, scheduled_for)
         if self.session.scalar(select(ScheduleOccurrence).where(ScheduleOccurrence.dedupe_key == dedupe_key)):
             return None
+        reason = self._gate_reason(schedule, scheduled_for) if gated else None
+        if reason:
+            occurrence = self._new_occurrence(schedule, scheduled_for, dedupe_key)
+            occurrence.status = "skipped"
+            self._event(
+                "schedule.occurrence_skipped",
+                schedule,
+                summary=f"Skipped {schedule.name}: {reason}",
+                payload={
+                    "schedule_occurrence_id": occurrence.id,
+                    "scheduled_for": scheduled_for.isoformat(),
+                    "reason": reason,
+                },
+            )
+            return occurrence
         is_workflow = schedule.worker_kind in WORKFLOW_SCHEDULE_TARGETS
         with span(
             "tasque.schedule.fire",
@@ -281,6 +301,23 @@ class ScheduleService:
             1, {"tasque.schedule.name": schedule.name, "tasque.schedule.target": "workflow" if is_workflow else "work"}
         )
         return occurrence
+
+    def _gate_reason(self, schedule: Schedule, scheduled_for: datetime) -> str | None:
+        name = _optional_str((schedule.payload or {}).get("gate"))
+        if not name:
+            return None
+        from tasque2.extensions import registry
+
+        gate = registry().schedule_gates.get(name)
+        if gate is None:
+            logger.warning("Schedule %s names unknown gate %r; running it", schedule.name, name)
+            return None
+        try:
+            reason = gate(self.session, schedule, scheduled_for)
+        except Exception:  # noqa: BLE001 - a broken gate must not cost a needed run
+            logger.exception("Gate %r failed for schedule %s; running it", name, schedule.name)
+            return None
+        return str(reason) if reason else None
 
     def _new_occurrence(self, schedule: Schedule, scheduled_for: datetime, dedupe_key: str) -> ScheduleOccurrence:
         occurrence = ScheduleOccurrence(
