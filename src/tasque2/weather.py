@@ -1,14 +1,7 @@
-"""Local weather for outfit decisions, via the Open-Meteo forecast API.
+"""Current conditions and a daily forecast for the configured home location (Open-Meteo, no key).
 
-The stylist factors the actual day (temperature, feels-like, rain chance,
-evening cool-off) into looks instead of guessing from the season. Exposed as
-the ``weather_now`` MCP tool; any worker may call it. Open-Meteo needs no API
-key. Coordinates default to San Diego and are configurable via
-``TASQUE2_WEATHER_LATITUDE`` / ``TASQUE2_WEATHER_LONGITUDE`` /
-``TASQUE2_WEATHER_LOCATION_LABEL``.
-
-:func:`shape_forecast` is a pure payload -> report function so the shaping
-logic is testable without the network.
+Coordinates come from ``TASQUE2_WEATHER_LATITUDE`` / ``TASQUE2_WEATHER_LONGITUDE``; the
+label from ``TASQUE2_WEATHER_LOCATION_LABEL``.
 """
 
 from __future__ import annotations
@@ -20,7 +13,7 @@ from tasque2.config import get_settings
 OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
 MAX_FORECAST_DAYS = 7
 
-# WMO weather interpretation codes -> short text.
+# WMO weather interpretation codes.
 _WEATHER_CODES = {
     0: "clear",
     1: "mostly clear",
@@ -108,11 +101,6 @@ def shape_forecast(payload: dict[str, Any], *, label: str) -> dict[str, Any]:
         },
         "today": days[0] if days else None,
         "upcoming": days[1:],
-        "note": (
-            "Dress for feels-like, not the number: sun and humidity read warmer, "
-            "wind and coastal evenings cooler. Check today's low + sunset for an "
-            "evening-layer call."
-        ),
     }
 
 
@@ -126,8 +114,7 @@ def fetch_local_weather(*, days: int = 3) -> dict[str, Any]:
         "latitude": settings.weather_latitude,
         "longitude": settings.weather_longitude,
         "current": (
-            "temperature_2m,apparent_temperature,relative_humidity_2m,"
-            "precipitation,weather_code,wind_speed_10m"
+            "temperature_2m,apparent_temperature,relative_humidity_2m,precipitation,weather_code,wind_speed_10m"
         ),
         "daily": (
             "temperature_2m_max,temperature_2m_min,apparent_temperature_max,"

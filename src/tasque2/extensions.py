@@ -1,24 +1,19 @@
 """Discovery and registry for local extension packages.
 
-Tasque's core is generic: work queue, schedules, workflows, memory,
-artifacts, Discord, providers. Personal domains (a workout ledger, a pantry
-tracker, ...) plug in as *extensions*: plain Python packages dropped into the
-``extensions/`` directory (gitignored, ``TASQUE2_EXTENSIONS_DIR`` to
-relocate). Each package exposes ``register(registry)`` and may contribute:
+The core is generic: queue, schedules, workflows, memory, artifacts, providers, Discord,
+MCP. Personal domains plug in as extensions: plain Python packages under the extensions
+directory (``TASQUE2_EXTENSIONS_DIR``, default ``extensions/``), each exposing
+``register(registry)``. An extension may contribute:
 
-- SQLAlchemy models on the core ``Base`` (import them inside ``register``),
-- an Alembic migration directory (``add_migration_location``) whose revisions
-  chain off any core revision — core and extension histories upgrade together,
-- MCP tools (``add_mcp_tools``) served alongside the core tools,
-- worker-context digests (``add_context_digest``): code-computed state blocks
-  injected into matching work items' context packets,
-- attempt ingestors (``add_attempt_ingestor``): fallback hooks that run after
-  every finished attempt to recover structured state from ``produces``.
+- SQLAlchemy models on the core ``Base`` (import them inside ``register``);
+- an Alembic migration directory whose revisions chain off a core revision;
+- MCP tools served alongside the core tools;
+- context digests: code-computed state injected into matching work items' packets;
+- canonical-key resolvers that choose pinned documents per run;
+- attempt ingestors that run after every successfully completed attempt.
 
-Loading is lazy and happens once per process, triggered by the first caller
-(migrations, the MCP server, the worker-context builder, or the runtime). A
-broken extension raises: a daemon silently missing its domain tools would
-corrupt runs far worse than a loud startup failure.
+Extensions load once per process on first use. A broken extension raises: a daemon that
+silently lost its domain tools would corrupt runs far worse than a loud startup failure.
 """
 
 from __future__ import annotations
@@ -34,18 +29,14 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-# wants(context) -> bool, build(session) -> digest payload
 DigestWants = Callable[[dict[str, Any]], bool]
 DigestBuild = Callable[[Any], dict[str, Any]]
-# ingest(session, work_item, attempt) -> Any; must be safe to run on every attempt
 AttemptIngestor = Callable[[Any, Any, Any], Any]
-
-# resolve(session, context) -> list[str] of canonical keys, chosen per run.
 CanonicalKeyResolver = Callable[[Any, dict[str, Any]], list[str]]
 
 
 class ExtensionError(RuntimeError):
-    """Raised when an extension package cannot be loaded or registered."""
+    """An extension package failed to import or register."""
 
 
 @dataclass
@@ -53,41 +44,35 @@ class ExtensionRegistry:
     """Everything the loaded extension packages contributed to the core."""
 
     context_digests: list[tuple[str, DigestWants, DigestBuild]] = field(default_factory=list)
-    canonical_key_resolvers: list[tuple[DigestWants, CanonicalKeyResolver]] = field(
-        default_factory=list
-    )
+    canonical_key_resolvers: list[tuple[DigestWants, CanonicalKeyResolver]] = field(default_factory=list)
     mcp_tools: list[Callable[..., str]] = field(default_factory=list)
     attempt_ingestors: list[tuple[str, AttemptIngestor]] = field(default_factory=list)
     migration_locations: list[Path] = field(default_factory=list)
     extension_names: list[str] = field(default_factory=list)
 
     def add_context_digest(self, key: str, wants: DigestWants, build: DigestBuild) -> None:
-        """Inject ``build(session)`` as ``packet[key]`` when ``wants(context)`` is true."""
+        """Inject ``build(session)`` as ``packet[key]`` whenever ``wants(context)`` is true."""
         self.context_digests.append((key, wants, build))
 
     def add_canonical_keys(self, wants: DigestWants, resolve: CanonicalKeyResolver) -> None:
-        """Pin canonical docs chosen PER RUN, not from a static context list.
+        """Pin canonical documents chosen per run instead of from a static context list.
 
-        ``resolve(session, context)`` returns canonical keys to load alongside
-        the context's own ``memory_canonical_keys``. It exists for pinned sets
-        where only one member is ever relevant to a given run — a per-focus
-        ledger, say — so the packet carries the one that matters instead of the
-        whole family. A resolver MUST fail safe: if it cannot decide, it returns
-        the full set rather than nothing, because a silently missing ledger is
-        far worse than an oversized packet.
+        ``resolve(session, context)`` returns keys to load next to the context's own
+        ``memory_canonical_keys``. It must fail safe: when it cannot decide, return the
+        full set, because a silently missing document is worse than a large packet.
         """
         self.canonical_key_resolvers.append((wants, resolve))
 
     def add_mcp_tools(self, *tools: Callable[..., str]) -> None:
-        """Serve these callables as MCP tools (name/docstring become the schema)."""
+        """Serve these callables as MCP tools; name and docstring become the schema."""
         self.mcp_tools.extend(tools)
 
     def add_attempt_ingestor(self, name: str, ingestor: AttemptIngestor) -> None:
-        """Run ``ingestor(session, work_item, attempt)`` after each finished attempt."""
+        """Run ``ingestor(session, work_item, attempt)`` after each attempt that completes successfully."""
         self.attempt_ingestors.append((name, ingestor))
 
     def add_migration_location(self, path: Path | str) -> None:
-        """Add an Alembic version directory scanned together with the core one."""
+        """Add an Alembic version directory that upgrades together with the core one."""
         self.migration_locations.append(Path(path))
 
 
@@ -112,7 +97,7 @@ def registry() -> ExtensionRegistry:
 
 
 def reset_registry() -> None:
-    """Forget loaded extensions (tests only; modules stay imported)."""
+    """Forget loaded extensions (modules stay imported)."""
     global _registry
     with _lock:
         _registry = None
@@ -137,13 +122,12 @@ def _load() -> ExtensionRegistry:
         register = getattr(module, "register", None)
         if not callable(register):
             raise ExtensionError(
-                f"Extension '{child.name}' has no register(registry) function; "
-                "expose one in its __init__.py."
+                f"Extension '{child.name}' has no register(registry) function; expose one in its __init__.py."
             )
         try:
             register(reg)
         except Exception as exc:
             raise ExtensionError(f"Extension '{child.name}' failed to register: {exc}") from exc
         reg.extension_names.append(child.name)
-        logger.info("Loaded Tasque extension: %s", child.name)
+        logger.info("Loaded extension: %s", child.name)
     return reg

@@ -73,6 +73,7 @@ class WorkItem(TimestampMixin, Base):
         Index("ix_work_items_ready", "status", "not_before", "priority", "created_at"),
         Index("ix_work_items_source", "source_kind", "source_id"),
         Index("ix_work_items_workflow_node", "workflow_run_id", "workflow_node_id"),
+        Index("ix_work_items_lane", "lane", "created_at"),
         UniqueConstraint("idempotency_key", name="uq_work_items_idempotency_key"),
     )
 
@@ -113,6 +114,8 @@ class WorkItem(TimestampMixin, Base):
     schedule_occurrence_id: Mapped[str | None] = mapped_column(String(36))
     discord_thread_id: Mapped[str | None] = mapped_column(String(80))
     visible: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    lane: Mapped[str | None] = mapped_column(String(120))
+    traceparent: Mapped[str | None] = mapped_column(String(64))
 
     attempts: Mapped[list[WorkAttempt]] = relationship(
         back_populates="work_item",
@@ -206,6 +209,7 @@ class WorkEvent(Base):
         Index("ix_work_events_work_item", "work_item_id", "created_at"),
         Index("ix_work_events_workflow", "workflow_run_id", "created_at"),
         Index("ix_work_events_type", "event_type", "created_at"),
+        Index("ix_work_events_type_entity", "event_type", "entity_id"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -390,7 +394,6 @@ class ProviderRun(Base):
     env_keys: Mapped[list[str]] = mapped_column("env_keys_json", JSON, default=list, nullable=False)
     status: Mapped[str] = mapped_column(String(32), default="running", nullable=False)
     provider_session_id: Mapped[str | None] = mapped_column(String(160))
-    raw_stream_artifact_id: Mapped[str | None] = mapped_column(String(36))
     stdout_artifact_id: Mapped[str | None] = mapped_column(String(36))
     stderr_artifact_id: Mapped[str | None] = mapped_column(String(36))
     usage: Mapped[dict[str, Any]] = mapped_column("usage_json", JSON, default=dict, nullable=False)
@@ -406,7 +409,7 @@ class ProviderRun(Base):
 
 
 class AgentResult(Base):
-    """Transient inbox for provider-submitted structured results."""
+    """Inbox for structured results a worker submits through the MCP server."""
 
     __tablename__ = "agent_results"
     __table_args__ = (Index("ix_agent_results_kind_created", "agent_kind", "created_at"),)
@@ -444,9 +447,7 @@ class WorkflowDefinition(TimestampMixin, Base):
 
 class WorkflowRun(TimestampMixin, Base):
     __tablename__ = "workflow_runs"
-    __table_args__ = (
-        Index("ix_workflow_runs_status", "status", "created_at"),
-    )
+    __table_args__ = (Index("ix_workflow_runs_status", "status", "created_at"),)
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     workflow_definition_id: Mapped[str] = mapped_column(
@@ -463,6 +464,7 @@ class WorkflowRun(TimestampMixin, Base):
     lease_expires_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
     started_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
     ended_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
+    traceparent: Mapped[str | None] = mapped_column(String(64))
 
     definition: Mapped[WorkflowDefinition] = relationship(back_populates="runs")
     nodes: Mapped[list[WorkflowNode]] = relationship(
@@ -563,22 +565,18 @@ class Memory(TimestampMixin, Base):
     archived_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
     pinned: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     ttl_days: Mapped[int | None] = mapped_column(Integer)
-    # Optional 1-5 salience used to weight retrieval ranking (None = neutral).
     importance: Mapped[int | None] = mapped_column(Integer)
 
 
 class MemoryEmbedding(TimestampMixin, Base):
     """Vector embedding for a :class:`Memory`, stored as packed float32 bytes.
 
-    Kept in a side table so embeddings can be (re)built without touching the
-    authoritative memory rows, and so superseded rows can be cheaply skipped.
+    Keyed by memory id without a foreign key: the memory service owns the
+    lifecycle, and retrieval joins only active memory rows.
     """
 
     __tablename__ = "memory_embeddings"
 
-    # Plain satellite keyed by memory id (no FK): MemoryService owns the lifecycle
-    # so parent/child delete ordering and DB-cascade vs ORM double-deletes never
-    # collide. Orphans are harmless — retrieval joins only active memory rows.
     memory_id: Mapped[str] = mapped_column(String(36), primary_key=True)
     namespace: Mapped[str] = mapped_column(String(160), nullable=False, index=True)
     model: Mapped[str] = mapped_column(String(120), nullable=False)

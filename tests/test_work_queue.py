@@ -1,72 +1,170 @@
 from __future__ import annotations
 
-import json
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
+import pytest
 from sqlalchemy import select
 
-from tasque2 import result_inbox
 from tasque2.db import session_scope
-from tasque2.models import (
-    AgentResult,
-    FailedWork,
-    ProviderRun,
-    WorkAttempt,
-    WorkEvent,
-    WorkItem,
-    utc_now,
-)
-from tasque2.queue import (
+from tasque2.models import FailedWork, ProviderRun, WorkAttempt, WorkDependency, WorkEvent, WorkItem, utc_now
+from tasque2.telemetry import span
+from tasque2.work.queue import WorkQueue
+from tasque2.work.repository import WorkRepository
+from tasque2.work.retry import (
+    CAPACITY_GATE_MAX_SECONDS,
+    LIMIT_RETRY_BUFFER_SECONDS,
+    LIMIT_RETRY_FALLBACK_SECONDS,
     LIMIT_RETRY_FLOOR,
     TRANSIENT_RETRY_DELAY_SECONDS,
     TRANSIENT_RETRY_FLOOR,
-    WorkQueue,
-    note_provider_limit_stop,
-    provider_limit_gate_until,
-    reset_provider_limit_gate,
+    capacity_gate,
+    decide_retry,
+    limit_retry_delay_seconds,
 )
-from tasque2.repo import WorkRepository
-from tasque2.runtime import FunctionWorkerRegistry, WorkerResult, WorkRunner
+from tasque2.work.runner import WorkRunner
+
+SESSION_LIMIT = "You've hit your session limit · resets 11:40am (America/Los_Angeles)"
 
 
-def test_claim_next_ready_work_creates_attempt_and_lease(fresh_db: Path) -> None:
+def _create(session, title: str = "Work", **fields) -> WorkItem:
+    fields.setdefault("task_instruction", f"Do {title}.")
+    fields.setdefault("worker_kind", "manual")
+    return WorkRepository(session).create_work_item(title=title, **fields)
+
+
+def _events(session, work_item_id: str, event_type: str) -> list[WorkEvent]:
+    return list(
+        session.scalars(
+            select(WorkEvent).where(WorkEvent.work_item_id == work_item_id, WorkEvent.event_type == event_type)
+        ).all()
+    )
+
+
+def _counted(points, **attributes) -> int:
+    return sum(
+        point.value for point in points if all(point.attributes.get(key) == value for key, value in attributes.items())
+    )
+
+
+def test_an_item_claimed_by_another_process_during_a_claim_is_skipped(
+    fresh_db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     with session_scope() as session:
-        repo = WorkRepository(session)
-        low = repo.create_work_item(
-            title="Low",
-            task_instruction="Low priority.",
-            worker_kind="manual",
-            priority=0,
+        work_id = (
+            WorkRepository(session)
+            .create_work_item(title="Contended", task_instruction="Run once.", worker_kind="function.noop")
+            .id
         )
-        high = repo.create_work_item(
-            title="High",
-            task_instruction="High priority.",
-            worker_kind="manual",
-            priority=10,
+    original = WorkQueue._has_unsatisfied_dependency
+    competed = []
+
+    def claim_elsewhere_first(self, work_item):
+        if not competed:
+            competed.append(True)
+            with session_scope() as other:
+                assert WorkQueue(other).claim_next_ready_work(lease_owner="other") is not None
+        return original(self, work_item)
+
+    monkeypatch.setattr(WorkQueue, "_has_unsatisfied_dependency", claim_elsewhere_first)
+    with session_scope() as session:
+        assert WorkQueue(session).claim_next_ready_work(lease_owner="first") is None
+
+    with session_scope() as session:
+        attempts = session.scalars(select(WorkAttempt).where(WorkAttempt.work_item_id == work_id)).all()
+        assert [attempt.lease_owner for attempt in attempts] == ["other"]
+        assert session.get(WorkItem, work_id).attempt_count == 1
+
+
+def test_explicit_lane_wins_over_context_and_parent(fresh_db: Path) -> None:
+    with session_scope() as session:
+        parent = _create(session, "Parent", lane="parent-lane")
+        child = _create(
+            session,
+            "Child",
+            lane="explicit-lane",
+            context={"lane": "context-lane", "parent_work_item_id": parent.id},
         )
 
-        claimed = WorkQueue(session).claim_next_ready_work(
-            lease_owner="test-worker",
-            lease_seconds=30,
-        )
+        assert child.lane == "explicit-lane"
+
+
+def test_lane_comes_from_the_context_before_the_parent(fresh_db: Path) -> None:
+    with session_scope() as session:
+        parent = _create(session, "Parent", lane="parent-lane")
+        child = _create(session, "Child", context={"lane": "  context-lane  ", "parent_work_item_id": parent.id})
+
+        assert child.lane == "context-lane"
+
+
+def test_lane_is_inherited_from_the_parent_work_item(fresh_db: Path) -> None:
+    with session_scope() as session:
+        parent = _create(session, "Parent", lane="finance-daily")
+        child = _create(session, "Follow-up", context={"lane": "   ", "parent_work_item_id": parent.id})
+        grandchild = _create(session, "Reply", context={"parent_work_item_id": child.id})
+
+        assert child.lane == "finance-daily"
+        assert grandchild.lane == "finance-daily"
+
+
+def test_lane_is_empty_without_a_source(fresh_db: Path) -> None:
+    with session_scope() as session:
+        orphan = _create(session, "Orphan", context={"parent_work_item_id": "no-such-work-item"})
+        plain = _create(session, "Plain")
+
+        assert orphan.lane is None
+        assert plain.lane is None
+
+
+def test_created_event_records_the_lane(fresh_db: Path) -> None:
+    with session_scope() as session:
+        work = _create(session, "Laned", lane="kitchen")
+
+        [created] = _events(session, work.id, "work.created")
+        assert created.payload["lane"] == "kitchen"
+
+
+def test_traceparent_defaults_to_the_active_span(fresh_db: Path) -> None:
+    with span("enqueue") as current, session_scope() as session:
+        traceparent = _create(session, "Traced").traceparent
+
+    context = current.get_span_context()
+    version, trace_id, span_id, _flags = traceparent.split("-")
+    assert (version, trace_id, span_id) == ("00", f"{context.trace_id:032x}", f"{context.span_id:016x}")
+
+
+def test_traceparent_is_empty_outside_a_trace(fresh_db: Path) -> None:
+    with session_scope() as session:
+        assert _create(session, "Untraced").traceparent is None
+
+
+def test_explicit_traceparent_is_kept(fresh_db: Path) -> None:
+    stored = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"
+    with span("enqueue"), session_scope() as session:
+        assert _create(session, "Linked", traceparent=stored).traceparent == stored
+
+
+def test_claim_takes_the_highest_priority_and_creates_a_leased_attempt(fresh_db: Path) -> None:
+    with session_scope() as session:
+        _create(session, "Low", priority=0)
+        high = _create(session, "High", priority=10)
+
+        claimed = WorkQueue(session).claim_next_ready_work(lease_owner="test-worker", lease_seconds=30)
 
         assert claimed is not None
         assert claimed.work_item.id == high.id
-        assert claimed.work_item.id != low.id
         assert claimed.work_item.status == "running"
+        assert claimed.work_item.attempt_count == 1
         assert claimed.attempt.attempt_number == 1
         assert claimed.attempt.lease_owner == "test-worker"
-        assert claimed.attempt.lease_expires_at is not None
+        assert claimed.attempt.lease_expires_at == claimed.attempt.started_at + timedelta(seconds=30)
+        assert len(_events(session, high.id, "work.claimed")) == 1
 
 
-def test_claim_next_ready_work_has_no_default_lease_expiry(fresh_db: Path) -> None:
+def test_claim_has_no_lease_expiry_by_default(fresh_db: Path) -> None:
     with session_scope() as session:
-        work = WorkRepository(session).create_work_item(
-            title="No default lease timeout",
-            task_instruction="Run as long as needed.",
-            worker_kind="manual",
-        )
+        work = _create(session, "No default lease timeout")
 
         claimed = WorkQueue(session).claim_next_ready_work(lease_owner="test-worker")
 
@@ -75,90 +173,94 @@ def test_claim_next_ready_work_has_no_default_lease_expiry(fresh_db: Path) -> No
         assert claimed.attempt.lease_expires_at is None
 
 
-def test_function_runner_succeeds_and_records_output(fresh_db: Path) -> None:
+def test_claim_skips_work_that_is_not_due_yet(fresh_db: Path) -> None:
+    now = utc_now()
     with session_scope() as session:
-        repo = WorkRepository(session)
-        work = repo.create_work_item(
-            title="Echo",
-            task_instruction="Echo this instruction.",
-            worker_kind="function.echo",
-            context={"kind": "test"},
-        )
+        work = _create(session, "Later", not_before=now + timedelta(hours=1))
+        queue = WorkQueue(session)
 
-        outcome = WorkRunner(session, lease_owner="test-runner").run_next()
+        assert queue.claim_next_ready_work(lease_owner="daemon", now=now) is None
+        claimed = queue.claim_next_ready_work(lease_owner="daemon", now=now + timedelta(hours=2))
 
-        assert outcome is not None
-        assert outcome.status == "succeeded"
-        assert outcome.work_item_id == work.id
-
-        attempt = session.scalar(select(WorkAttempt).where(WorkAttempt.work_item_id == work.id))
-        assert attempt is not None
-        assert attempt.status == "succeeded"
-        assert attempt.produces["context"] == {"kind": "test"}
-
-        event_types = [
-            event.event_type
-            for event in session.scalars(
-                select(WorkEvent)
-                .where(WorkEvent.work_item_id == work.id)
-                .order_by(WorkEvent.id)
-            )
-        ]
-        assert event_types == ["work.created", "work.claimed", "work.succeeded"]
+        assert claimed is not None
+        assert claimed.work_item.id == work.id
 
 
-def test_worker_failure_retries_until_dead_letter(fresh_db: Path) -> None:
-    registry = FunctionWorkerRegistry()
-
-    def failing_worker(_work_item: WorkItem) -> WorkerResult:
-        raise RuntimeError("boom")
-
-    registry.register("function.fail", failing_worker)
-
+def test_claim_waits_for_unfinished_dependencies(fresh_db: Path) -> None:
     with session_scope() as session:
-        repo = WorkRepository(session)
-        work = repo.create_work_item(
-            title="Retry me",
-            task_instruction="Fail twice.",
-            worker_kind="function.fail",
-            max_attempts=2,
-        )
-        runner = WorkRunner(session, registry=registry, lease_owner="test-runner")
+        upstream = _create(session, "Upstream")
+        blocked = _create(session, "Blocked", priority=10)
+        node_blocked = _create(session, "Waits on a workflow node", priority=5)
+        session.add(WorkDependency(blocked_work_item_id=blocked.id, dependency_work_item_id=upstream.id))
+        session.add(WorkDependency(blocked_work_item_id=node_blocked.id, dependency_workflow_node_id="node-1"))
+        session.flush()
+        queue = WorkQueue(session)
 
-        first = runner.run_next()
+        first = queue.claim_next_ready_work(lease_owner="daemon")
         assert first is not None
-        assert first.status == "ready"
-        assert session.get(WorkItem, work.id).attempt_count == 1
+        assert first.work_item.id == upstream.id
+        assert queue.claim_next_ready_work(lease_owner="daemon") is None
 
-        second = runner.run_next()
+        queue.complete_attempt(first.attempt.id, summary="Upstream done.")
+        second = queue.claim_next_ready_work(lease_owner="daemon")
+
         assert second is not None
-        assert second.status == "dead_letter"
+        assert second.work_item.id == blocked.id
+        assert queue.claim_next_ready_work(lease_owner="daemon") is None
+        assert session.get(WorkItem, node_blocked.id).status == "ready"
 
-        failed = session.scalar(select(FailedWork).where(FailedWork.work_item_id == work.id))
+
+def test_claim_expires_overdue_work_instead_of_running_it(fresh_db: Path) -> None:
+    now = utc_now()
+    with session_scope() as session:
+        overdue = _create(
+            session,
+            "Stale",
+            worker_kind="provider.default",
+            deadline_at=now - timedelta(hours=1),
+            priority=10,
+        )
+        fresh = _create(session, "Fresh", priority=0)
+
+        claimed = WorkQueue(session).claim_next_ready_work(lease_owner="daemon", now=now)
+
+        assert claimed is not None
+        assert claimed.work_item.id == fresh.id
+        assert session.get(WorkItem, overdue.id).status == "dead_letter"
+        failed = session.scalar(select(FailedWork).where(FailedWork.work_item_id == overdue.id))
         assert failed is not None
-        assert failed.error_type == "RuntimeError"
-        assert failed.error_message == "boom"
+        assert failed.error_type == "DeadlineExceeded"
+        assert failed.attempt_id is None
+        assert len(_events(session, overdue.id, "work.deadline_exceeded")) == 1
+
+
+def test_expire_overdue_work_only_touches_passed_deadlines(fresh_db: Path) -> None:
+    now = utc_now()
+    with session_scope() as session:
+        overdue = _create(session, "Past deadline", deadline_at=now - timedelta(minutes=1))
+        paused = _create(session, "Paused past deadline", deadline_at=now - timedelta(minutes=1))
+        future = _create(session, "Future deadline", deadline_at=now + timedelta(hours=2))
+        no_deadline = _create(session, "No deadline")
+        queue = WorkQueue(session)
+        queue.pause_work(paused.id)
+
+        expired = queue.expire_overdue_work(now=now)
+
+        assert expired == 2
+        assert session.get(WorkItem, overdue.id).status == "dead_letter"
+        assert session.get(WorkItem, paused.id).status == "dead_letter"
+        assert session.get(WorkItem, future.id).status == "ready"
+        assert session.get(WorkItem, no_deadline.id).status == "ready"
 
 
 def test_transient_provider_error_retries_past_max_attempts(fresh_db: Path) -> None:
-    # A single-attempt work item should still be retried when it fails for a
-    # transient/infra reason (e.g. a dropped API socket), up to the transient
-    # retry floor, rather than dead-lettering on the first blip.
     with session_scope() as session:
-        work = WorkRepository(session).create_work_item(
-            title="Transient blip",
-            task_instruction="Provider socket dropped before submit.",
-            worker_kind="provider.default",
-            max_attempts=1,
-        )
+        work = _create(session, "Transient blip", worker_kind="provider.default", max_attempts=1)
         queue = WorkQueue(session)
-
-        # Advance the clock each round so the transient backoff (not_before) has
-        # elapsed and the requeued item is claimable again.
         base = utc_now()
         statuses = []
-        for i in range(TRANSIENT_RETRY_FLOOR):
-            now = base + timedelta(minutes=i)
+        for index in range(TRANSIENT_RETRY_FLOOR):
+            now = base + timedelta(minutes=index)
             claimed = queue.claim_next_ready_work(lease_owner="daemon", now=now)
             assert claimed is not None
             queue.fail_attempt(
@@ -169,337 +271,381 @@ def test_transient_provider_error_retries_past_max_attempts(fresh_db: Path) -> N
             )
             statuses.append(session.get(WorkItem, work.id).status)
 
-        # First (FLOOR - 1) failures requeue; the last exhausts the floor.
-        assert statuses[:-1] == ["ready"] * (TRANSIENT_RETRY_FLOOR - 1)
-        assert statuses[-1] == "dead_letter"
-
-        retry_events = session.scalars(
-            select(WorkEvent).where(
-                WorkEvent.work_item_id == work.id,
-                WorkEvent.event_type == "work.retry_scheduled",
-            )
-        ).all()
-        assert len(retry_events) == TRANSIENT_RETRY_FLOOR - 1
-        assert all(event.payload.get("transient") is True for event in retry_events)
-        assert all(
-            event.payload.get("delay_seconds") >= TRANSIENT_RETRY_DELAY_SECONDS
-            for event in retry_events
-        )
+        assert statuses == ["ready"] * (TRANSIENT_RETRY_FLOOR - 1) + ["dead_letter"]
+        retries = _events(session, work.id, "work.retry_scheduled")
+        assert len(retries) == TRANSIENT_RETRY_FLOOR - 1
+        assert all(event.payload["transient"] is True for event in retries)
+        assert all(event.payload["delay_seconds"] >= TRANSIENT_RETRY_DELAY_SECONDS for event in retries)
 
 
-def test_claim_expires_overdue_work_instead_of_running_it(fresh_db: Path) -> None:
-    # A work item whose deadline_at has passed must not be claimed and run late
-    # (e.g. a daily trading step resuming after the daemon was down). It is
-    # dead-lettered, and the claim returns the next still-runnable item instead.
-    now = utc_now()
+def test_reported_failure_dead_letters_on_the_first_attempt(fresh_db: Path) -> None:
     with session_scope() as session:
-        repo = WorkRepository(session)
-        overdue = repo.create_work_item(
-            title="Stale",
-            task_instruction="Should not run after its deadline.",
-            worker_kind="provider.default",
-            deadline_at=now - timedelta(hours=1),
-            priority=10,  # higher priority: it is considered first
-        )
-        fresh = repo.create_work_item(
-            title="Fresh",
-            task_instruction="Still runnable.",
-            worker_kind="manual",
-            priority=0,
-        )
-
-        claimed = WorkQueue(session).claim_next_ready_work(lease_owner="daemon", now=now)
-
-        assert claimed is not None
-        assert claimed.work_item.id == fresh.id
-
-        stale = session.get(WorkItem, overdue.id)
-        assert stale.status == "dead_letter"
-        failed = session.scalar(select(FailedWork).where(FailedWork.work_item_id == overdue.id))
-        assert failed is not None
-        assert failed.error_type == "DeadlineExceeded"
-        event = session.scalar(
-            select(WorkEvent).where(
-                WorkEvent.work_item_id == overdue.id,
-                WorkEvent.event_type == "work.deadline_exceeded",
-            )
-        )
-        assert event is not None
-
-
-def test_expire_overdue_work_sweep_only_touches_passed_deadlines(fresh_db: Path) -> None:
-    now = utc_now()
-    with session_scope() as session:
-        repo = WorkRepository(session)
-        overdue = repo.create_work_item(
-            title="Past deadline",
-            task_instruction="Deadline already passed.",
-            worker_kind="manual",
-            deadline_at=now - timedelta(minutes=1),
-        )
-        future = repo.create_work_item(
-            title="Future deadline",
-            task_instruction="Deadline still ahead.",
-            worker_kind="manual",
-            deadline_at=now + timedelta(hours=2),
-        )
-        no_deadline = repo.create_work_item(
-            title="No deadline",
-            task_instruction="Runs whenever.",
-            worker_kind="manual",
-        )
-
-        expired = WorkQueue(session).expire_overdue_work(now=now)
-
-        assert expired == 1
-        assert session.get(WorkItem, overdue.id).status == "dead_letter"
-        assert session.get(WorkItem, future.id).status == "ready"
-        assert session.get(WorkItem, no_deadline.id).status == "ready"
-
-
-def test_agent_reported_failure_dead_letters_on_first_attempt(fresh_db: Path) -> None:
-    # A genuine agent-reported failure is NOT transient: a max_attempts=1 item
-    # dead-letters immediately and is not retried by the transient floor.
-    with session_scope() as session:
-        work = WorkRepository(session).create_work_item(
-            title="Genuine failure",
-            task_instruction="Agent reported it could not complete the task.",
-            worker_kind="provider.default",
-            max_attempts=1,
-        )
+        work = _create(session, "Genuine failure", worker_kind="provider.default", max_attempts=1)
         queue = WorkQueue(session)
         claimed = queue.claim_next_ready_work(lease_owner="daemon")
         assert claimed is not None
+
         queue.fail_attempt(
             claimed.attempt.id,
             error_type="ProviderExecutionError",
             error_message="Task is impossible as specified.",
         )
 
-        assert session.get(WorkItem, work.id).status == "dead_letter"
-        assert session.get(WorkItem, work.id).attempt_count == 1
+        refreshed = session.get(WorkItem, work.id)
+        assert refreshed.status == "dead_letter"
+        assert refreshed.attempt_count == 1
+        failed = session.scalar(select(FailedWork).where(FailedWork.work_item_id == work.id))
+        assert failed.attempt_id == claimed.attempt.id
+        assert failed.retry_count == 1
+
+
+def test_retry_policy_delay_postpones_the_next_attempt(fresh_db: Path) -> None:
+    now = utc_now()
+    with session_scope() as session:
+        work = _create(session, "Backoff", max_attempts=2, retry_policy={"delay_seconds": 120})
+        queue = WorkQueue(session)
+        claimed = queue.claim_next_ready_work(lease_owner="daemon", now=now)
+        assert claimed is not None
+
+        queue.fail_attempt(claimed.attempt.id, error_type="RuntimeError", error_message="boom", now=now)
+
+        refreshed = session.get(WorkItem, work.id)
+        assert refreshed.status == "ready"
+        assert refreshed.not_before == now + timedelta(seconds=120)
+        assert queue.claim_next_ready_work(lease_owner="daemon", now=now + timedelta(seconds=60)) is None
+        assert queue.claim_next_ready_work(lease_owner="daemon", now=now + timedelta(seconds=121)) is not None
+
+
+def test_decide_retry_budgets_by_failure_kind() -> None:
+    reported = decide_retry(error_type="RuntimeError", error_message="boom", attempt_number=1, max_attempts=1)
+    assert (reported.retry, reported.transient, reported.limit_stop) == (False, False, False)
+
+    reported_retry = decide_retry(
+        error_type="RuntimeError", error_message="boom", attempt_number=1, max_attempts=3, base_delay_seconds=45
+    )
+    assert (reported_retry.retry, reported_retry.delay_seconds) == (True, 45)
+
+    transient = decide_retry(
+        error_type="TransientProviderError", error_message="socket closed", attempt_number=1, max_attempts=1
+    )
+    assert (transient.retry, transient.transient, transient.delay_seconds) == (
+        True,
+        True,
+        TRANSIENT_RETRY_DELAY_SECONDS,
+    )
+
+    exhausted = decide_retry(
+        error_type="TransientProviderError",
+        error_message="socket closed",
+        attempt_number=TRANSIENT_RETRY_FLOOR,
+        max_attempts=1,
+    )
+    assert exhausted.retry is False
+
+    limited = decide_retry(
+        error_type="TransientProviderError",
+        error_message="You've hit your session limit",
+        attempt_number=TRANSIENT_RETRY_FLOOR,
+        max_attempts=1,
+    )
+    assert (limited.retry, limited.limit_stop, limited.delay_seconds) == (True, True, LIMIT_RETRY_FALLBACK_SECONDS)
+
+    limit_exhausted = decide_retry(
+        error_type="TransientProviderError",
+        error_message="session limit reached",
+        attempt_number=LIMIT_RETRY_FLOOR,
+        max_attempts=1,
+    )
+    assert (limit_exhausted.retry, limit_exhausted.limit_stop) == (False, True)
+
+    reported_limit_text = decide_retry(
+        error_type="ProviderExecutionError",
+        error_message="You've hit your session limit",
+        attempt_number=1,
+        max_attempts=1,
+    )
+    assert (reported_limit_text.retry, reported_limit_text.limit_stop) == (False, False)
+
+
+def test_limit_retry_delay_parses_the_stated_reset() -> None:
+    tz = ZoneInfo("America/Los_Angeles")
+
+    assert limit_retry_delay_seconds(SESSION_LIMIT, now=datetime(2026, 7, 8, 10, 7, tzinfo=tz)) == (
+        93 * 60 + LIMIT_RETRY_BUFFER_SECONDS
+    )
+    assert (
+        limit_retry_delay_seconds(
+            "session limit reached - resets 3am",
+            now=datetime(2026, 7, 8, 23, 30, tzinfo=tz),
+            default_timezone="America/Los_Angeles",
+        )
+        == int(3.5 * 3600) + LIMIT_RETRY_BUFFER_SECONDS
+    )
+    assert (
+        limit_retry_delay_seconds(
+            "You've hit your weekly limit · resets Aug 19, 11pm (America/Los_Angeles)",
+            now=datetime(2026, 8, 18, 15, 17, tzinfo=tz),
+        )
+        == 31 * 3600 + 43 * 60 + LIMIT_RETRY_BUFFER_SECONDS
+    )
+    assert (
+        limit_retry_delay_seconds(
+            "weekly limit · resets Jan 2, 9am (America/Los_Angeles)",
+            now=datetime(2026, 12, 31, 12, 0, tzinfo=tz),
+        )
+        == 45 * 3600 + LIMIT_RETRY_BUFFER_SECONDS
+    )
+
+
+def test_limit_retry_delay_falls_back_by_the_window_scope() -> None:
+    assert limit_retry_delay_seconds("You've hit your weekly limit - resets Jul 15, 2026") == 6 * 3600
+    assert limit_retry_delay_seconds("You've hit your session limit") == LIMIT_RETRY_FALLBACK_SECONDS
+    assert limit_retry_delay_seconds("You've hit your monthly spend limit · raise it at claude.ai/settings/usage") == (
+        12 * 3600
+    )
+
+
+def test_limit_retry_delay_ignores_other_errors() -> None:
+    assert limit_retry_delay_seconds("API Error: socket closed unexpectedly") is None
+    assert limit_retry_delay_seconds("") is None
+    assert limit_retry_delay_seconds(None) is None
+
+
+def test_session_limit_failure_waits_for_the_stated_reset(fresh_db: Path) -> None:
+    with session_scope() as session:
+        work = _create(session, "Limit-stopped apply", worker_kind="provider.default", max_attempts=1)
+        queue = WorkQueue(session)
+        now = utc_now()
+        claimed = queue.claim_next_ready_work(lease_owner="daemon", now=now)
+        assert claimed is not None
+
+        queue.fail_attempt(
+            claimed.attempt.id, error_type="TransientProviderError", error_message=SESSION_LIMIT, now=now
+        )
+
+        refreshed = session.get(WorkItem, work.id)
+        assert refreshed.status == "ready"
+        delay = (refreshed.not_before - now).total_seconds()
+        assert LIMIT_RETRY_BUFFER_SECONDS <= delay <= 24 * 3600 + LIMIT_RETRY_BUFFER_SECONDS + 60
+
+
+def test_limit_stops_get_their_own_retry_floor(fresh_db: Path) -> None:
+    now = datetime(2026, 9, 1, 19, 0, tzinfo=UTC)
+    with session_scope() as session:
+        work = _create(session, "Weekly-limited apply", worker_kind="provider.default", max_attempts=1)
+        queue = WorkQueue(session)
+        for attempt_number in range(1, LIMIT_RETRY_FLOOR + 1):
+            capacity_gate.reset()
+            refreshed = session.get(WorkItem, work.id)
+            refreshed.not_before = None
+            session.flush()
+            claimed = queue.claim_next_ready_work(lease_owner="daemon", now=now)
+            assert claimed is not None, f"not claimable on attempt {attempt_number}"
+            queue.fail_attempt(
+                claimed.attempt.id,
+                error_type="TransientProviderError",
+                error_message="You've hit your weekly limit · resets Sep 3, 11pm (America/Los_Angeles)",
+                now=now,
+            )
+            refreshed = session.get(WorkItem, work.id)
+            if attempt_number < LIMIT_RETRY_FLOOR:
+                assert refreshed.status == "ready", f"dead-lettered on attempt {attempt_number}"
+                assert refreshed.not_before == now + timedelta(hours=59, seconds=LIMIT_RETRY_BUFFER_SECONDS)
+
+        assert refreshed.attempt_count == LIMIT_RETRY_FLOOR
+        assert refreshed.status == "dead_letter"
+
+
+def test_session_limit_gates_other_provider_claims(fresh_db: Path) -> None:
+    with session_scope() as session:
+        first = _create(session, "Apply 1", worker_kind="provider.default")
+        _create(session, "Apply 2", worker_kind="provider.default")
+        local = _create(session, "Local bookkeeping")
+        queue = WorkQueue(session)
+        now = utc_now()
+        claimed = queue.claim_next_ready_work(lease_owner="daemon", now=now)
+        assert claimed is not None
+        assert claimed.work_item.id == first.id
+
+        queue.fail_attempt(
+            claimed.attempt.id, error_type="TransientProviderError", error_message=SESSION_LIMIT, now=now
+        )
+
+        assert capacity_gate.is_closed(now)
+        nxt = queue.claim_next_ready_work(lease_owner="daemon", now=now)
+        assert nxt is not None
+        assert nxt.work_item.id == local.id
+        assert queue.claim_next_ready_work(lease_owner="daemon", now=now) is None
+
+
+def test_limit_gate_releases_after_the_reset_passes(fresh_db: Path) -> None:
+    with session_scope() as session:
+        work = _create(session, "Apply", worker_kind="provider.default")
+        queue = WorkQueue(session)
+        now = utc_now()
+        capacity_gate.hold_until(now + timedelta(minutes=30))
+
+        assert queue.claim_next_ready_work(lease_owner="daemon", now=now) is None
+        claimed = queue.claim_next_ready_work(lease_owner="daemon", now=now + timedelta(minutes=31))
+
+        assert claimed is not None
+        assert claimed.work_item.id == work.id
+
+
+def test_capacity_gate_only_extends_and_is_capped() -> None:
+    now = utc_now()
+    capacity_gate.hold_until(now + timedelta(minutes=30))
+    capacity_gate.hold_until(now + timedelta(minutes=10))
+    assert capacity_gate.until() == now + timedelta(minutes=30)
+
+    capacity_gate.hold_until(now + timedelta(days=3))
+    until = capacity_gate.until()
+    assert now + timedelta(hours=5) < until <= utc_now() + timedelta(seconds=CAPACITY_GATE_MAX_SECONDS)
+    assert capacity_gate.is_closed(now)
+    assert not capacity_gate.is_closed(until + timedelta(seconds=1))
+
+    capacity_gate.reset()
+    assert capacity_gate.until() is None
+    assert not capacity_gate.is_closed()
+
+
+def test_limit_stops_are_counted_per_lane(fresh_db: Path, metric_points) -> None:
+    lane = "queue-test-limit-lane"
+    with session_scope() as session:
+        _create(session, "Limited", worker_kind="provider.default", lane=lane)
+        queue = WorkQueue(session)
+        claimed = queue.claim_next_ready_work(lease_owner="daemon")
+        queue.fail_attempt(claimed.attempt.id, error_type="TransientProviderError", error_message=SESSION_LIMIT)
+
+    assert _counted(metric_points("tasque.provider.limit_stops"), **{"tasque.work.lane": lane}) == 1
+
+
+def test_failed_attempts_are_counted_by_outcome(fresh_db: Path, metric_points) -> None:
+    lane = "queue-test-outcome-lane"
+    with session_scope() as session:
+        _create(session, "Fails twice", max_attempts=2, lane=lane)
+        queue = WorkQueue(session)
+        for _ in range(2):
+            claimed = queue.claim_next_ready_work(lease_owner="daemon")
+            queue.fail_attempt(claimed.attempt.id, error_type="RuntimeError", error_message="boom")
+
+    points = metric_points("tasque.work.runs")
+    assert _counted(points, **{"tasque.work.lane": lane, "tasque.work.outcome": "retry"}) == 1
+    assert _counted(points, **{"tasque.work.lane": lane, "tasque.work.outcome": "dead_letter"}) == 1
+    durations = [
+        point for point in metric_points("tasque.work.duration") if point.attributes.get("tasque.work.lane") == lane
+    ]
+    assert sum(point.count for point in durations) == 2
 
 
 def test_expired_lease_requeues_retryable_work(fresh_db: Path) -> None:
     now = utc_now()
     with session_scope() as session:
-        repo = WorkRepository(session)
-        work = repo.create_work_item(
-            title="Recover lease",
-            task_instruction="Lease should expire.",
-            worker_kind="manual",
-            max_attempts=2,
-        )
+        work = _create(session, "Recover lease", max_attempts=2)
         queue = WorkQueue(session)
         claimed = queue.claim_next_ready_work(
-            lease_owner="lost-worker",
-            lease_seconds=1,
-            now=now - timedelta(minutes=5),
+            lease_owner="lost-worker", lease_seconds=1, now=now - timedelta(minutes=5)
         )
         assert claimed is not None
 
-        recovered = queue.recover_expired_leases(now=now)
+        assert queue.recover_expired_leases(now=now) == 1
 
-        assert recovered == 1
         assert session.get(WorkItem, work.id).status == "ready"
-        assert session.get(WorkAttempt, claimed.attempt.id).status == "expired"
+        attempt = session.get(WorkAttempt, claimed.attempt.id)
+        assert attempt.status == "expired"
+        assert attempt.error_type == "LeaseExpired"
+        assert len(_events(session, work.id, "work.lease_expired")) == 1
 
 
-def test_orphaned_attempt_requeues_without_worker_timeout(fresh_db: Path) -> None:
+def test_expired_lease_closes_its_provider_run(fresh_db: Path) -> None:
+    with session_scope() as session:
+        _create(session, "Leased apply", worker_kind="provider.default")
+        queue = WorkQueue(session)
+        now = utc_now()
+        claimed = queue.claim_next_ready_work(lease_owner="daemon", lease_seconds=60, now=now)
+        run = ProviderRun(attempt_id=claimed.attempt.id, provider="claude", status="running", started_at=now)
+        session.add(run)
+        session.flush()
+
+        queue.recover_expired_leases(now=now + timedelta(seconds=120))
+
+        refreshed = session.get(ProviderRun, run.id)
+        assert refreshed.status == "orphaned"
+        assert refreshed.ended_at is not None
+        assert refreshed.usage["lease_expired"] is True
+
+
+def test_heartbeat_refreshes_only_running_attempts(fresh_db: Path) -> None:
+    now = utc_now()
+    later = now + timedelta(minutes=5)
+    with session_scope() as session:
+        _create(session, "Long run")
+        _create(session, "Finished run")
+        queue = WorkQueue(session)
+        running = queue.claim_next_ready_work(lease_owner="daemon", lease_seconds=60, now=now)
+        finished = queue.claim_next_ready_work(lease_owner="daemon", lease_seconds=60, now=now)
+        queue.complete_attempt(finished.attempt.id, summary="Done.")
+
+        refreshed = queue.heartbeat_running_attempts(
+            [running.attempt.id, finished.attempt.id, ""], lease_seconds=600, now=later
+        )
+
+        assert refreshed == 1
+        assert running.attempt.heartbeat_at == later
+        assert running.attempt.lease_expires_at == later + timedelta(seconds=600)
+        assert finished.attempt.heartbeat_at == now
+        assert queue.heartbeat_running_attempts([], lease_seconds=600) == 0
+
+
+def test_orphaned_attempt_requeues_without_a_worker_timeout(fresh_db: Path) -> None:
     now = utc_now()
     with session_scope() as session:
-        repo = WorkRepository(session)
-        work = repo.create_work_item(
-            title="Recover orphan",
-            task_instruction="Daemon vanished mid-run.",
-            worker_kind="provider.default",
-            max_attempts=1,
-        )
+        work = _create(session, "Recover orphan", worker_kind="provider.default", max_attempts=1)
         queue = WorkQueue(session)
-        claimed = queue.claim_next_ready_work(
-            lease_owner="daemon",
-            now=now - timedelta(minutes=10),
-        )
-        assert claimed is not None
+        claimed = queue.claim_next_ready_work(lease_owner="daemon", now=now - timedelta(minutes=10))
         provider_run = ProviderRun(
-            attempt_id=claimed.attempt.id,
-            provider="codex",
-            status="running",
-            started_at=claimed.attempt.started_at,
+            attempt_id=claimed.attempt.id, provider="codex", status="running", started_at=claimed.attempt.started_at
         )
         session.add(provider_run)
         session.flush()
 
-        recovered = queue.recover_orphaned_attempts(
-            lease_owner="daemon",
-            orphaned_before=now,
-            now=now,
-        )
+        recovered = queue.recover_orphaned_attempts(lease_owner="daemon", orphaned_before=now, now=now)
 
         assert recovered == 1
-        assert session.get(WorkItem, work.id).status == "ready"
-        assert session.get(WorkItem, work.id).max_attempts == 2
+        refreshed = session.get(WorkItem, work.id)
+        assert refreshed.status == "ready"
+        assert refreshed.max_attempts == 2
         assert session.get(WorkAttempt, claimed.attempt.id).status == "orphaned"
         assert session.get(ProviderRun, provider_run.id).status == "orphaned"
-        event = session.scalar(
-            select(WorkEvent).where(
-                WorkEvent.work_item_id == work.id,
-                WorkEvent.event_type == "work.orphaned_attempt_recovered",
-            )
-        )
-        assert event is not None
+        [event] = _events(session, work.id, "work.orphaned_attempt_recovered")
+        assert event.payload["provider_run_ids"] == [provider_run.id]
 
 
-def _deposit_on(
-    session,
-    *,
-    token: str,
-    work_item_id: str,
-    summary: str,
-    report: str,
-    produces: dict | None = None,
-) -> None:
-    """Write a worker result deposit on the caller's session."""
-    session.add(
-        AgentResult(
-            result_token=token,
-            agent_kind="worker",
-            payload_json=json.dumps(
-                {
-                    "status": "succeeded",
-                    "report": report,
-                    "summary": summary,
-                    "produces": produces or {},
-                    "error": None,
-                    "work_item_id": work_item_id,
-                }
-            ),
-        )
-    )
-    session.flush()
-
-
-def test_deposited_result_is_adopted_instead_of_rerunning_the_work(fresh_db: Path) -> None:
-    # A provider subprocess outlives the daemon that spawned it, so it can still
-    # submit its result after the parent dies -- the in-memory result_token is
-    # gone, but the deposit names its work item. Re-running instead of adopting
-    # it is what resubmitted a real job application on 2026-08-03.
+def test_orphan_recovery_leaves_leased_foreign_and_live_attempts_alone(fresh_db: Path) -> None:
     now = utc_now()
     with session_scope() as session:
-        repo = WorkRepository(session)
-        work = repo.create_work_item(
-            title="Apply: Example Corp",
-            task_instruction="Submit the application.",
-            worker_kind="provider.default",
-            max_attempts=2,
-        )
+        for title in ("Leased", "Foreign", "Live"):
+            _create(session, title)
         queue = WorkQueue(session)
-        claimed = queue.claim_next_ready_work(
-            lease_owner="daemon",
-            now=now - timedelta(minutes=10),
-        )
-        assert claimed is not None
-        provider_run = ProviderRun(
-            attempt_id=claimed.attempt.id,
-            provider="claude",
-            status="running",
-            started_at=claimed.attempt.started_at,
-        )
-        session.add(provider_run)
-        session.flush()
-        claimed.attempt.provider_run_id = provider_run.id
-        session.flush()
+        leased = queue.claim_next_ready_work(lease_owner="daemon", lease_seconds=3600, now=now - timedelta(minutes=10))
+        foreign = queue.claim_next_ready_work(lease_owner="cli", now=now - timedelta(minutes=10))
+        live = queue.claim_next_ready_work(lease_owner="daemon", now=now + timedelta(seconds=1))
 
-        # Deposited by the surviving subprocess (a different process in
-        # production, so written here on the test's own session).
-        _deposit_on(
-            session,
-            token="tok-late",
-            work_item_id=work.id,
-            summary="Applied to Example Corp",
-            report="Applied to Example Corp. Confirmation received.",
-            produces={"applied": True},
-        )
-
-        adopted = WorkRunner(session, lease_owner="daemon").recover_deposited_results(
-            orphaned_before=now,
-        )
-        assert adopted == 1
-
-        # Completed, not requeued -- the application is not submitted twice.
-        assert session.get(WorkItem, work.id).status == "succeeded"
-        assert session.get(WorkAttempt, claimed.attempt.id).status == "succeeded"
-        assert session.get(WorkAttempt, claimed.attempt.id).summary == "Applied to Example Corp"
-
-        # And the payload is consumed, so a later tick cannot adopt it again.
-        assert result_inbox.consume_for_work_item(session, work.id) is None
-
-        # Orphan recovery now has nothing left to requeue.
-        assert (
-            queue.recover_orphaned_attempts(
-                lease_owner="daemon",
-                orphaned_before=now,
-                now=now,
-            )
-            == 0
-        )
+        assert queue.recover_orphaned_attempts(lease_owner="daemon", orphaned_before=now, now=now) == 0
+        assert {claimed.attempt.status for claimed in (leased, foreign, live)} == {"running"}
 
 
-def test_deposited_result_recovery_leaves_in_flight_attempts_alone(fresh_db: Path) -> None:
-    # An attempt heartbeating after `orphaned_before` belongs to the live
-    # daemon; its result must be consumed by the running poll loop, not stolen
-    # by recovery.
+def test_late_orphaned_completion_closes_the_replacement_attempt(fresh_db: Path) -> None:
     now = utc_now()
     with session_scope() as session:
-        work = WorkRepository(session).create_work_item(
-            title="Still running",
-            task_instruction="In flight.",
-            worker_kind="provider.default",
-        )
+        work = _create(session, "Late finish race", worker_kind="provider.default", max_attempts=1)
         queue = WorkQueue(session)
-        claimed = queue.claim_next_ready_work(lease_owner="daemon", now=now)
-        assert claimed is not None
-        session.flush()
-
-        _deposit_on(session, token="tok-live", work_item_id=work.id, summary="s", report="r")
-
-        adopted = WorkRunner(session, lease_owner="daemon").recover_deposited_results(
-            orphaned_before=now - timedelta(minutes=5),
-        )
-        assert adopted == 0
-        assert session.get(WorkItem, work.id).status == "running"
-        # The live runtime can still claim its own result.
-        assert result_inbox.consume_for_work_item(session, work.id) is not None
-
-
-def test_late_orphaned_completion_closes_replacement_attempt(fresh_db: Path) -> None:
-    now = utc_now()
-    with session_scope() as session:
-        work = WorkRepository(session).create_work_item(
-            title="Late finish race",
-            task_instruction="Original provider finishes after recovery.",
-            worker_kind="provider.default",
-            max_attempts=1,
-        )
-        queue = WorkQueue(session)
-        original = queue.claim_next_ready_work(
-            lease_owner="daemon",
-            now=now - timedelta(minutes=10),
-        )
-        assert original is not None
-
-        queue.recover_orphaned_attempts(
-            lease_owner="daemon",
-            orphaned_before=now,
-            now=now,
-        )
+        original = queue.claim_next_ready_work(lease_owner="daemon", now=now - timedelta(minutes=10))
+        queue.recover_orphaned_attempts(lease_owner="daemon", orphaned_before=now, now=now)
         replacement = queue.claim_next_ready_work(lease_owner="daemon", now=now)
         assert replacement is not None
         provider_run = ProviderRun(
-            attempt_id=replacement.attempt.id,
-            provider="codex",
-            status="running",
-            started_at=now,
+            attempt_id=replacement.attempt.id, provider="codex", status="running", started_at=now
         )
         session.add(provider_run)
         session.flush()
@@ -508,29 +654,23 @@ def test_late_orphaned_completion_closes_replacement_attempt(fresh_db: Path) -> 
 
         assert session.get(WorkItem, work.id).status == "succeeded"
         assert session.get(WorkAttempt, original.attempt.id).status == "succeeded"
-        assert session.get(WorkAttempt, replacement.attempt.id).status == "orphaned"
-        assert session.get(ProviderRun, provider_run.id).status == "orphaned"
-        event = session.scalar(
-            select(WorkEvent).where(
-                WorkEvent.work_item_id == work.id,
-                WorkEvent.event_type == "work.sibling_attempt_superseded",
-            )
-        )
-        assert event is not None
+        superseded = session.get(WorkAttempt, replacement.attempt.id)
+        assert superseded.status == "orphaned"
+        assert superseded.error_type == "SupersededAttempt"
+        run = session.get(ProviderRun, provider_run.id)
+        assert run.status == "orphaned"
+        assert run.usage["superseded_by_attempt_id"] == original.attempt.id
+        assert len(_events(session, work.id, "work.sibling_attempt_superseded")) == 1
 
 
 def test_cancel_pause_resume_and_retry_dead_letter(fresh_db: Path) -> None:
     with session_scope() as session:
-        repo = WorkRepository(session)
-        work = repo.create_work_item(
-            title="Control me",
-            task_instruction="Exercise controls.",
-            worker_kind="unknown",
-        )
+        work = _create(session, "Control me", worker_kind="unknown")
         queue = WorkQueue(session)
 
         queue.pause_work(work.id)
         assert session.get(WorkItem, work.id).status == "paused"
+        assert queue.claim_next_ready_work(lease_owner="daemon") is None
         queue.resume_work(work.id)
         assert session.get(WorkItem, work.id).status == "ready"
 
@@ -544,294 +684,76 @@ def test_cancel_pause_resume_and_retry_dead_letter(fresh_db: Path) -> None:
         assert session.get(WorkItem, work.id).status == "canceled"
 
 
-def test_running_attempt_failure_honors_external_cancel(fresh_db: Path) -> None:
+def test_retry_dead_letter_resolves_failed_work_and_grants_an_attempt(fresh_db: Path) -> None:
+    with session_scope() as session:
+        work = _create(session, "Retry me", max_attempts=1)
+        queue = WorkQueue(session)
+        claimed = queue.claim_next_ready_work(lease_owner="daemon")
+        queue.fail_attempt(claimed.attempt.id, error_type="RuntimeError", error_message="boom")
+
+        queue.retry_dead_letter(work.id)
+
+        refreshed = session.get(WorkItem, work.id)
+        assert (refreshed.status, refreshed.max_attempts, refreshed.not_before) == ("ready", 2, None)
+        failed = session.scalar(select(FailedWork).where(FailedWork.work_item_id == work.id))
+        assert failed.status == "retrying"
+        assert failed.resolved_at is not None
+        assert len(_events(session, work.id, "work.retry_requested")) == 1
+        retried = queue.claim_next_ready_work(lease_owner="daemon")
+        assert retried is not None
+        assert retried.attempt.attempt_number == 2
+
+
+def test_controls_leave_terminal_work_alone(fresh_db: Path) -> None:
+    with session_scope() as session:
+        work = _create(session, "Finished")
+        WorkRunner(session).run_next()
+        queue = WorkQueue(session)
+
+        for control in (queue.pause_work, queue.resume_work, queue.request_cancel, queue.retry_dead_letter):
+            assert control(work.id).status == "succeeded"
+        with pytest.raises(KeyError):
+            queue.request_cancel("no-such-work-item")
+
+
+def test_cancel_of_running_work_waits_for_the_attempt(fresh_db: Path) -> None:
+    with session_scope() as session:
+        work = _create(session, "Running")
+        queue = WorkQueue(session)
+        queue.claim_next_ready_work(lease_owner="daemon")
+
+        assert queue.request_cancel(work.id).status == "cancel_requested"
+        assert len(_events(session, work.id, "work.cancel_requested")) == 1
+
+
+def test_running_attempt_failure_honors_an_external_cancel(fresh_db: Path) -> None:
     with session_scope() as runner_session:
-        work = WorkRepository(runner_session).create_work_item(
-            title="Cancel race",
-            task_instruction="Provider is still running.",
-            worker_kind="provider.default",
-        )
+        work = _create(runner_session, "Cancel race", worker_kind="provider.default")
         claimed = WorkQueue(runner_session).claim_next_ready_work(lease_owner="daemon")
-        assert claimed is not None
         runner_session.commit()
 
         with session_scope() as control_session:
             WorkQueue(control_session).request_cancel(work.id)
 
         WorkQueue(runner_session).fail_attempt(
-            claimed.attempt.id,
-            error_type="ProviderKilled",
-            error_message="Provider process was stopped.",
+            claimed.attempt.id, error_type="ProviderKilled", error_message="Provider process was stopped."
         )
 
         assert runner_session.get(WorkItem, work.id).status == "canceled"
         assert runner_session.get(WorkAttempt, claimed.attempt.id).status == "canceled"
-        failed = runner_session.scalar(select(FailedWork).where(FailedWork.work_item_id == work.id))
-        assert failed is None
+        assert runner_session.scalar(select(FailedWork).where(FailedWork.work_item_id == work.id)) is None
 
 
-def test_running_attempt_completion_honors_external_cancel(fresh_db: Path) -> None:
+def test_running_attempt_completion_honors_an_external_cancel(fresh_db: Path) -> None:
     with session_scope() as runner_session:
-        work = WorkRepository(runner_session).create_work_item(
-            title="Cancel complete race",
-            task_instruction="Provider finishes after cancel.",
-            worker_kind="provider.default",
-        )
+        work = _create(runner_session, "Cancel complete race", worker_kind="provider.default")
         claimed = WorkQueue(runner_session).claim_next_ready_work(lease_owner="daemon")
-        assert claimed is not None
         runner_session.commit()
 
         with session_scope() as control_session:
             WorkQueue(control_session).request_cancel(work.id)
 
-        WorkQueue(runner_session).complete_attempt(
-            claimed.attempt.id,
-            summary="Provider finished late.",
-        )
+        WorkQueue(runner_session).complete_attempt(claimed.attempt.id, summary="Provider finished late.")
 
         assert runner_session.get(WorkItem, work.id).status == "canceled"
         assert runner_session.get(WorkAttempt, claimed.attempt.id).status == "canceled"
-
-
-def test_limit_retry_delay_parses_reset_time() -> None:
-    from datetime import datetime
-    from zoneinfo import ZoneInfo
-
-    from tasque2.queue import (
-        LIMIT_RETRY_BUFFER_SECONDS,
-        LIMIT_RETRY_FALLBACK_SECONDS,
-        limit_retry_delay_seconds,
-    )
-
-    tz = ZoneInfo("America/Los_Angeles")
-    # The exact banner that dead-lettered a career-apply child on 2026-07-08.
-    delay = limit_retry_delay_seconds(
-        "You've hit your session limit · resets 11:40am (America/Los_Angeles)",
-        now=datetime(2026, 7, 8, 10, 7, tzinfo=tz),
-    )
-    assert delay == 93 * 60 + LIMIT_RETRY_BUFFER_SECONDS  # 10:07 -> 11:40
-
-    # A reset time already past today rolls over to tomorrow.
-    delay = limit_retry_delay_seconds(
-        "session limit reached - resets 3am",
-        now=datetime(2026, 7, 8, 23, 30, tzinfo=tz),
-        default_timezone="America/Los_Angeles",
-    )
-    assert delay == int(3.5 * 3600) + LIMIT_RETRY_BUFFER_SECONDS
-
-    # Limit-shaped message without a parseable clock time backs off a fallback
-    # scaled to the window's scope, not the 30-second transient cadence.
-    assert (
-        limit_retry_delay_seconds("You've hit your weekly limit - resets Jul 15, 2026")
-        == 6 * 3600
-    )
-    assert limit_retry_delay_seconds("You've hit your session limit") == LIMIT_RETRY_FALLBACK_SECONDS
-    # A spend cap states no reset at all; 30 minutes would just burn attempts.
-    assert (
-        limit_retry_delay_seconds(
-            "You've hit your monthly spend limit · raise it at claude.ai/settings/usage"
-        )
-        == 12 * 3600
-    )
-
-    # A weekly window states a date as well as a time; the retry must wait for
-    # the actual reset rather than falling through to the short fallback.
-    delay = limit_retry_delay_seconds(
-        "You've hit your weekly limit · resets Aug 19, 11pm (America/Los_Angeles)",
-        now=datetime(2026, 8, 18, 15, 17, tzinfo=tz),
-    )
-    # 08-18 15:17 -> 08-19 23:00 is 31h43m.
-    assert delay == 31 * 3600 + 43 * 60 + LIMIT_RETRY_BUFFER_SECONDS
-
-    # An unstated year resolves forward, so a New Year reset does not land in
-    # the past and collapse to the fallback.
-    delay = limit_retry_delay_seconds(
-        "weekly limit · resets Jan 2, 9am (America/Los_Angeles)",
-        now=datetime(2026, 12, 31, 12, 0, tzinfo=tz),
-    )
-    assert delay == 45 * 3600 + LIMIT_RETRY_BUFFER_SECONDS  # Dec 31 12:00 -> Jan 2 09:00
-
-    # Ordinary transient messages keep the normal cadence.
-    assert limit_retry_delay_seconds("API Error: socket closed unexpectedly") is None
-    assert limit_retry_delay_seconds(None) is None
-
-
-def test_session_limit_transient_failure_waits_for_reset(fresh_db: Path) -> None:
-    # A provider stopped by a subscription session limit must not burn the
-    # transient retry floor on the 30-second cadence while the limit is still
-    # in force: the retry is scheduled for the reset time in the message.
-    with session_scope() as session:
-        work = WorkRepository(session).create_work_item(
-            title="Limit-stopped apply",
-            task_instruction="Provider hit the session limit mid-run.",
-            worker_kind="provider.default",
-            max_attempts=1,
-        )
-        queue = WorkQueue(session)
-        now = utc_now()
-        claimed = queue.claim_next_ready_work(lease_owner="daemon", now=now)
-        assert claimed is not None
-        queue.fail_attempt(
-            claimed.attempt.id,
-            error_type="TransientProviderError",
-            error_message="You've hit your session limit · resets 11:40am (America/Los_Angeles)",
-            now=now,
-        )
-        refreshed = session.get(WorkItem, work.id)
-        assert refreshed.status == "ready"
-        delay = (refreshed.not_before - now).total_seconds()
-        # Reset-aware: at least the buffer, never the 30s cadence, and bounded
-        # by a day regardless of what wall-clock time the test runs at -- a
-        # time-only reset can be at most tomorrow at the stated hour.
-        assert delay >= 300
-        assert delay > TRANSIENT_RETRY_DELAY_SECONDS
-        assert delay <= 24 * 3600 + 360
-
-
-def test_expired_lease_closes_its_provider_run(fresh_db: Path) -> None:
-    # The subprocess behind an expired lease is gone with it. Leaving the
-    # ProviderRun row "running" made it phantom in-flight work in status output
-    # forever -- four such rows were still open weeks later in 2026-08.
-    with session_scope() as session:
-        repo = WorkRepository(session)
-        repo.create_work_item(
-            title="Leased apply",
-            task_instruction="Apply.",
-            worker_kind="provider.default",
-        )
-        queue = WorkQueue(session)
-        now = utc_now()
-        claimed = queue.claim_next_ready_work(
-            lease_owner="daemon", lease_seconds=60, now=now
-        )
-        assert claimed is not None
-        run = ProviderRun(
-            attempt_id=claimed.attempt.id,
-            provider="claude",
-            model="claude-sonnet-5",
-            status="running",
-            started_at=now,
-        )
-        session.add(run)
-        session.flush()
-        run_id = run.id
-
-        queue.recover_expired_leases(now=now + timedelta(seconds=120))
-
-        refreshed = session.get(ProviderRun, run_id)
-        assert refreshed.status == "orphaned"
-        assert refreshed.ended_at is not None
-
-
-def test_limit_stops_do_not_burn_the_transient_retry_floor(fresh_db: Path) -> None:
-    # A limit stop ran no task -- it means "no capacity right now". Three
-    # attempts is enough for a dropped socket but nowhere near a weekly window,
-    # so limit stops get their own larger floor. Before this, a weekly limit
-    # spent the whole transient floor inside an hour and dead-lettered the work
-    # (that is how the 2026-08-18 career-apply run died).
-    with session_scope() as session:
-        work = WorkRepository(session).create_work_item(
-            title="Weekly-limited apply",
-            task_instruction="Apply.",
-            worker_kind="provider.default",
-            max_attempts=1,
-        )
-        work_id = work.id
-        queue = WorkQueue(session)
-
-        for attempt_number in range(1, LIMIT_RETRY_FLOOR + 1):
-            reset_provider_limit_gate()  # the gate is not what is under test here
-            refreshed = session.get(WorkItem, work_id)
-            refreshed.not_before = None
-            session.flush()
-            claimed = queue.claim_next_ready_work(lease_owner="daemon", now=utc_now())
-            assert claimed is not None, f"work was not claimable on attempt {attempt_number}"
-            queue.fail_attempt(
-                claimed.attempt.id,
-                error_type="TransientProviderError",
-                error_message=(
-                    "You've hit your weekly limit · resets Dec 30, 11pm (America/Los_Angeles)"
-                ),
-                now=utc_now(),
-            )
-            refreshed = session.get(WorkItem, work_id)
-            if attempt_number < LIMIT_RETRY_FLOOR:
-                # Notably still alive at TRANSIENT_RETRY_FLOOR, where it used to die.
-                assert refreshed.status == "ready", f"died on attempt {attempt_number}"
-                # And each retry waits for the stated reset, not the 30s cadence.
-                assert (refreshed.not_before - utc_now()).total_seconds() > 3600
-
-        # Exhausting the limit floor still dead-letters, so nothing retries forever.
-        assert refreshed.attempt_count == LIMIT_RETRY_FLOOR
-        assert refreshed.status == "dead_letter"
-
-
-def test_session_limit_gates_other_provider_claims(fresh_db: Path) -> None:
-    # A session limit is account-wide. Once one run reports it, claiming the
-    # other ready provider items would spend a real attempt each on a
-    # guaranteed instant failure (8 of 10 career applies died that way on
-    # 2026-08-03), so provider work is held until the stated reset.
-    with session_scope() as session:
-        repo = WorkRepository(session)
-        first = repo.create_work_item(
-            title="Apply 1",
-            task_instruction="Apply.",
-            worker_kind="provider.default",
-            max_attempts=1,
-        )
-        repo.create_work_item(
-            title="Apply 2",
-            task_instruction="Apply.",
-            worker_kind="provider.default",
-            max_attempts=1,
-        )
-        function_work = repo.create_work_item(
-            title="Local bookkeeping",
-            task_instruction="No provider needed.",
-            worker_kind="manual",
-        )
-        session.flush()
-
-        queue = WorkQueue(session)
-        now = utc_now()
-        claimed = queue.claim_next_ready_work(lease_owner="daemon", now=now)
-        assert claimed is not None
-        assert claimed.work_item.id == first.id
-        queue.fail_attempt(
-            claimed.attempt.id,
-            error_type="TransientProviderError",
-            error_message="You've hit your session limit · resets 11:40am (America/Los_Angeles)",
-            now=now,
-        )
-
-        assert provider_limit_gate_until() is not None
-
-        # The sibling provider item is ready and due, but must not be claimed.
-        # Non-provider work is unaffected -- the limit is a provider quota, so
-        # the queue skips past the gated apply and claims the local item.
-        nxt = queue.claim_next_ready_work(lease_owner="daemon", now=now)
-        assert nxt is not None
-        assert nxt.work_item.id == function_work.id
-
-        # With only gated provider work left, there is nothing to claim at all.
-        assert queue.claim_next_ready_work(lease_owner="daemon", now=now) is None
-
-
-def test_limit_gate_releases_after_the_reset_passes(fresh_db: Path) -> None:
-    with session_scope() as session:
-        work = WorkRepository(session).create_work_item(
-            title="Apply",
-            task_instruction="Apply.",
-            worker_kind="provider.default",
-        )
-        session.flush()
-        queue = WorkQueue(session)
-        now = utc_now()
-        note_provider_limit_stop(now + timedelta(minutes=30))
-
-        assert queue.claim_next_ready_work(lease_owner="daemon", now=now) is None
-
-        after_reset = now + timedelta(minutes=31)
-        claimed = queue.claim_next_ready_work(lease_owner="daemon", now=after_reset)
-        assert claimed is not None
-        assert claimed.work_item.id == work.id

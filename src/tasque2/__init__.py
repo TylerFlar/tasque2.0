@@ -1,3 +1,3 @@
-"""Tasque 2.0 local orchestration package."""
+"""Tasque: a local-first runner for scheduled and on-demand model-backed work."""
 
-__version__ = "0.1.1"
+__version__ = "0.2.0"

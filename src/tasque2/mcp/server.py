@@ -1,114 +1,123 @@
+"""The Tasque stdio MCP server: core tools plus extension tools, every call traced.
+
+A provider run starts this server as a child of the agent CLI. Each tool call becomes an
+OpenTelemetry span (``tools/call {name}``) parented to the run's ``invoke_agent`` span
+through ``TRACEPARENT``, and is exported before the call returns because the process tree
+is shut down as soon as the worker submits its result.
+"""
+
 from __future__ import annotations
 
+import functools
+import json
+import os
+import time
+from collections.abc import Callable
+from typing import Any
+
+from opentelemetry.trace import SpanKind, Status, StatusCode
+
 from tasque2.extensions import registry as extension_registry
-from tasque2.mcp import tools
+from tasque2.mcp.tools import CORE_TOOLS
+from tasque2.telemetry import (
+    clean_attributes,
+    configure_telemetry,
+    context_from_env,
+    flush_telemetry,
+    get_tracer,
+    instruments,
+)
+
+INSTRUCTIONS = (
+    "Tasque tools for workers: durable memory, artifacts, images, work items, schedules and "
+    "workflows. Read tools take an optional intent string describing why you are reading. "
+    "Every tool returns JSON: {ok: true, ...} or {ok: false, error, error_type}. "
+    "End every run by calling submit_worker_result exactly once with the result_token from the prompt."
+)
 
 
 def build_server():
-    """Build the Tasque stdio MCP server.
-
-    Imports FastMCP lazily so normal Tasque imports do not require MCP unless the
-    server is actually used.
-    """
     from mcp.server.fastmcp import FastMCP
 
-    mcp = FastMCP(
-        "tasque2",
-        instructions=(
-            "Local-first Tasque tools for workers. Use read tools with an intent string before "
-            "acting; use memory/artifact/work tools for durable state instead of hand-building "
-            "database JSON. Use normal work items and workflows for orchestration. "
-            "End provider runs by calling "
-            "submit_worker_result exactly once with the result_token from the prompt. "
-            "Mutations return {ok:true,...} or "
-            "{ok:false,error:...} JSON strings."
-        ),
-    )
+    server = FastMCP("tasque2", instructions=INSTRUCTIONS)
+    for tool in (*CORE_TOOLS, *extension_registry().mcp_tools):
+        server.tool()(traced(tool))
+    return server
 
-    mcp.tool()(tools.memory_search)
-    mcp.tool()(tools.memory_search_any)
-    mcp.tool()(tools.memory_list)
-    mcp.tool()(tools.memory_get)
-    mcp.tool()(tools.memory_get_canonical)
-    mcp.tool()(tools.memory_recall)
-    mcp.tool()(tools.memory_create)
-    mcp.tool()(tools.memory_upsert_canonical)
-    mcp.tool()(tools.memory_update)
-    mcp.tool()(tools.memory_supersede)
-    mcp.tool()(tools.memory_archive)
-    mcp.tool()(tools.memory_delete)
-    mcp.tool()(tools.memory_ingest_text)
-    mcp.tool()(tools.memory_ingest_artifact)
-    mcp.tool()(tools.memory_ingest_pending)
-    mcp.tool()(tools.todo_write)
-    mcp.tool()(tools.ask_user)
 
-    mcp.tool()(tools.artifact_list)
-    mcp.tool()(tools.artifact_get)
-    mcp.tool()(tools.artifact_read_text)
-    mcp.tool()(tools.artifact_capture_file)
-    mcp.tool()(tools.artifact_archive)
+def traced(tool: Callable[..., str]) -> Callable[..., str]:
+    """Wrap a tool so each call records an MCP server span and duration metric."""
+    name = tool.__name__
 
-    mcp.tool()(tools.image_crop)
-    mcp.tool()(tools.image_fetch)
-    mcp.tool()(tools.image_save)
-    mcp.tool()(tools.image_find)
-    mcp.tool()(tools.image_send)
-    mcp.tool()(tools.image_compose)
-    mcp.tool()(tools.image_edit)
-    mcp.tool()(tools.photoshop_status)
-    mcp.tool()(tools.photoshop_edit)
+    @functools.wraps(tool)
+    def call(*args: Any, **kwargs: Any) -> str:
+        attributes = clean_attributes(
+            {
+                "mcp.method.name": "tools/call",
+                "gen_ai.operation.name": "execute_tool",
+                "gen_ai.tool.name": name,
+                "network.transport": "pipe",
+                "tasque.work_item.id": os.environ.get("TASQUE2_WORK_ITEM_ID") or None,
+            }
+        )
+        started = time.perf_counter()
+        error_type: str | None = None
+        try:
+            with get_tracer().start_as_current_span(
+                f"tools/call {name}",
+                context=context_from_env(),
+                kind=SpanKind.SERVER,
+                attributes=attributes,
+                record_exception=False,
+                set_status_on_exception=False,
+            ) as span:
+                try:
+                    result = tool(*args, **kwargs)
+                    error_type = _tool_error(result)
+                except Exception as exc:
+                    error_type = type(exc).__name__
+                    span.record_exception(exc)
+                    raise
+                finally:
+                    if error_type:
+                        span.set_attribute("error.type", error_type)
+                        span.set_status(Status(StatusCode.ERROR))
+                    _record_duration(started, attributes, error_type)
+            return result
+        finally:
+            flush_telemetry(timeout_millis=2000)
 
-    mcp.tool()(tools.work_enqueue)
-    mcp.tool()(tools.work_list)
-    mcp.tool()(tools.work_get)
-    mcp.tool()(tools.work_events)
-    mcp.tool()(tools.work_pause)
-    mcp.tool()(tools.work_resume)
-    mcp.tool()(tools.work_cancel)
-    mcp.tool()(tools.work_retry)
+    return call
 
-    mcp.tool()(tools.schedule_create_work)
-    mcp.tool()(tools.schedule_list)
-    mcp.tool()(tools.schedule_get)
-    mcp.tool()(tools.schedule_update)
-    mcp.tool()(tools.schedule_set_enabled)
-    mcp.tool()(tools.schedule_delete)
-    mcp.tool()(tools.schedule_fire_now)
 
-    mcp.tool()(tools.workflow_list)
-    mcp.tool()(tools.workflow_start)
+def _record_duration(started: float, attributes: dict[str, Any], error_type: str | None) -> None:
+    metric_attributes = {key: value for key, value in attributes.items() if key != "tasque.work_item.id"}
+    if error_type:
+        metric_attributes["error.type"] = error_type
+    instruments().mcp_operation_duration.record(time.perf_counter() - started, metric_attributes)
 
-    mcp.tool()(tools.weather_now)
 
-    mcp.tool()(tools.android_status)
-    mcp.tool()(tools.android_reconnect)
-    mcp.tool()(tools.android_unlock)
-    mcp.tool()(tools.android_screenshot)
-    mcp.tool()(tools.android_ui)
-    mcp.tool()(tools.android_apps)
-    mcp.tool()(tools.android_tap)
-    mcp.tool()(tools.android_swipe)
-    mcp.tool()(tools.android_type)
-    mcp.tool()(tools.android_key)
-    mcp.tool()(tools.android_launch)
-    mcp.tool()(tools.android_push_photo)
-
-    mcp.tool()(tools.system_status)
-    mcp.tool()(tools.submit_worker_result)
-    mcp.tool()(tools.submit_result)
-
-    for tool in extension_registry().mcp_tools:
-        mcp.tool()(tool)
-    return mcp
+def _tool_error(result: Any) -> str | None:
+    """The error type a tool reported in its JSON envelope, if it reported one."""
+    if not isinstance(result, str) or '"ok": false' not in result:
+        return None
+    try:
+        payload = json.loads(result)
+    except ValueError:
+        return None
+    if isinstance(payload, dict) and payload.get("ok") is False:
+        return str(payload.get("error_type") or "tool_error")
+    return None
 
 
 def run_stdio() -> None:
-    """Run the Tasque MCP server over stdio."""
+    from tasque2.logs import configure_logging
     from tasque2.migrations import upgrade_database
 
+    configure_logging()
+    configure_telemetry("mcp")
     upgrade_database()
     build_server().run("stdio")
 
 
-__all__ = ["build_server", "run_stdio"]
+__all__ = ["INSTRUCTIONS", "build_server", "run_stdio", "traced"]

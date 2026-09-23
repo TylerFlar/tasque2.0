@@ -1,3 +1,5 @@
+"""Artifact storage: files under ``data/artifacts`` with a metadata row per file."""
+
 from __future__ import annotations
 
 import hashlib
@@ -12,12 +14,13 @@ from sqlalchemy.orm import Session
 
 from tasque2.config import get_settings
 from tasque2.models import Artifact, new_id, utc_now
-from tasque2.repo import WorkRepository
+
+_LIST_SCAN_BATCH = 500
 
 
 class ArtifactStore:
     def __init__(self, base_dir: Path | None = None) -> None:
-        self.base_dir = base_dir or (get_settings().resolved_data_dir / "artifacts")
+        self.base_dir = base_dir or get_settings().resolved_artifact_dir
 
     def write_text(
         self,
@@ -34,22 +37,21 @@ class ArtifactStore:
         source_kind: str | None = None,
         source_id: str | None = None,
     ) -> Artifact:
-        self.base_dir.mkdir(parents=True, exist_ok=True)
-        artifact_id = new_id()
-        path = self.base_dir / f"{artifact_id}{suffix}"
         encoded = content.encode("utf-8")
+        path = self._new_path(suffix)
         path.write_bytes(encoded)
-        return WorkRepository(session).record_artifact(
+        return self._record(
+            session,
             kind=kind,
             title=title,
-            local_path=str(path),
+            path=path,
+            size=len(encoded),
+            sha256=hashlib.sha256(encoded).hexdigest(),
+            content_type="text/markdown; charset=utf-8" if suffix == ".md" else "text/plain; charset=utf-8",
             work_item_id=work_item_id,
             attempt_id=attempt_id,
             workflow_run_id=workflow_run_id,
-            content_type="text/plain; charset=utf-8",
-            size_bytes=len(encoded),
-            sha256=hashlib.sha256(encoded).hexdigest(),
-            tags=tags or [],
+            tags=tags,
             source_kind=source_kind,
             source_id=source_id,
         )
@@ -70,21 +72,20 @@ class ArtifactStore:
         source_kind: str | None = None,
         source_id: str | None = None,
     ) -> Artifact:
-        self.base_dir.mkdir(parents=True, exist_ok=True)
-        artifact_id = new_id()
-        path = self.base_dir / f"{artifact_id}{_safe_suffix(suffix or Path(title).suffix)}"
+        path = self._new_path(suffix or Path(title).suffix)
         path.write_bytes(content)
-        return WorkRepository(session).record_artifact(
+        return self._record(
+            session,
             kind=kind,
             title=title,
-            local_path=str(path),
+            path=path,
+            size=len(content),
+            sha256=hashlib.sha256(content).hexdigest(),
+            content_type=content_type or mimetypes.guess_type(title)[0],
             work_item_id=work_item_id,
             attempt_id=attempt_id,
             workflow_run_id=workflow_run_id,
-            content_type=content_type or _guess_content_type(title),
-            size_bytes=len(content),
-            sha256=hashlib.sha256(content).hexdigest(),
-            tags=tags or [],
+            tags=tags,
             source_kind=source_kind,
             source_id=source_id,
         )
@@ -104,49 +105,57 @@ class ArtifactStore:
         source_kind: str | None = None,
         source_id: str | None = None,
     ) -> Artifact:
-        source_path = Path(path).expanduser().resolve()
-        if not source_path.is_file():
-            raise FileNotFoundError(f"Artifact source file does not exist: {source_path}")
-
-        self.base_dir.mkdir(parents=True, exist_ok=True)
-        artifact_id = new_id()
-        artifact_title = title or source_path.name
-        target = self.base_dir / f"{artifact_id}{_safe_suffix(source_path.suffix)}"
+        source = Path(path).expanduser().resolve()
+        if not source.is_file():
+            raise FileNotFoundError(f"Artifact source file does not exist: {source}")
+        artifact_title = title or source.name
+        target = self._new_path(source.suffix)
         digest = hashlib.sha256()
-        with source_path.open("rb") as source, target.open("wb") as destination:
-            while chunk := source.read(1024 * 1024):
+        with source.open("rb") as reader, target.open("wb") as writer:
+            while chunk := reader.read(1024 * 1024):
                 digest.update(chunk)
-                destination.write(chunk)
-        shutil.copystat(source_path, target)
-
-        return WorkRepository(session).record_artifact(
+                writer.write(chunk)
+        shutil.copystat(source, target)
+        return self._record(
+            session,
             kind=kind,
             title=artifact_title,
-            local_path=str(target),
+            path=target,
+            size=target.stat().st_size,
+            sha256=digest.hexdigest(),
+            content_type=content_type
+            or mimetypes.guess_type(artifact_title)[0]
+            or mimetypes.guess_type(source.name)[0],
             work_item_id=work_item_id,
             attempt_id=attempt_id,
             workflow_run_id=workflow_run_id,
-            content_type=content_type
-            or _guess_content_type(artifact_title)
-            or _guess_content_type(source_path.name),
-            size_bytes=target.stat().st_size,
-            sha256=digest.hexdigest(),
-            tags=tags or [],
+            tags=tags,
             source_kind=source_kind,
             source_id=source_id,
         )
 
+    def _new_path(self, suffix: str | None) -> Path:
+        self.base_dir.mkdir(parents=True, exist_ok=True)
+        return self.base_dir / f"{new_id()}{_safe_suffix(suffix)}"
 
-def _safe_suffix(value: str | None) -> str:
-    if not value:
-        return ""
-    suffix = value if value.startswith(".") else f".{value}"
-    suffix = "".join(character for character in suffix if character.isalnum() or character in {".", "_", "-"})
-    return suffix[:40]
-
-
-def _guess_content_type(title: str) -> str | None:
-    return mimetypes.guess_type(title)[0]
+    def _record(self, session: Session, *, path: Path, size: int, sha256: str, **fields) -> Artifact:
+        artifact = Artifact(
+            local_path=str(path),
+            size_bytes=size,
+            sha256=sha256,
+            kind=fields["kind"],
+            title=fields["title"],
+            content_type=fields.get("content_type"),
+            work_item_id=fields.get("work_item_id"),
+            attempt_id=fields.get("attempt_id"),
+            workflow_run_id=fields.get("workflow_run_id"),
+            tags=list(fields.get("tags") or []),
+            source_kind=fields.get("source_kind"),
+            source_id=fields.get("source_id"),
+        )
+        session.add(artifact)
+        session.flush()
+        return artifact
 
 
 class ArtifactService:
@@ -164,7 +173,7 @@ class ArtifactService:
         include_archived: bool = False,
         limit: int = 20,
     ) -> list[Artifact]:
-        statement = select(Artifact).order_by(Artifact.created_at.desc()).limit(limit * 4)
+        statement = select(Artifact).order_by(Artifact.created_at.desc(), Artifact.id)
         if not include_archived:
             statement = statement.where(Artifact.archived_at.is_(None))
         if kind is not None:
@@ -173,37 +182,32 @@ class ArtifactService:
             statement = statement.where(Artifact.work_item_id == work_item_id)
         if source_kind is not None:
             statement = statement.where(Artifact.source_kind == source_kind)
-
-        rows = list(self.session.scalars(statement).all())
-        if tag:
-            wanted = set(tag)
-            rows = [artifact for artifact in rows if wanted.issubset(set(artifact.tags or []))]
-        if query:
-            needle = query.casefold()
-            rows = [
-                artifact
-                for artifact in rows
-                if needle in artifact.title.casefold()
-                or needle in artifact.kind.casefold()
-                or needle in artifact.local_path.casefold()
-                or needle in " ".join(artifact.tags or []).casefold()
-                or needle in str(artifact.summary or "").casefold()
-            ]
-        return rows[:limit]
-
-    def archive_artifact(self, artifact_id: str) -> Artifact:
-        from tasque2.models import utc_now
-
-        artifact = self.get_artifact(artifact_id)
-        if artifact.archived_at is None:
-            artifact.archived_at = utc_now()
-            self.session.flush()
-        return artifact
+        if not tag and not query:
+            return list(self.session.scalars(statement.limit(limit)).all())
+        # Tags and free text are matched here, so scan newest-first in pages until enough rows match.
+        wanted = set(tag or [])
+        needle = (query or "").casefold()
+        matches: list[Artifact] = []
+        offset = 0
+        while len(matches) < limit:
+            rows = self.session.scalars(statement.offset(offset).limit(_LIST_SCAN_BATCH)).all()
+            matches.extend(artifact for artifact in rows if _matches(artifact, wanted, needle))
+            if len(rows) < _LIST_SCAN_BATCH:
+                break
+            offset += _LIST_SCAN_BATCH
+        return matches[:limit]
 
     def get_artifact(self, artifact_id: str) -> Artifact:
         artifact = self.session.get(Artifact, artifact_id)
         if artifact is None:
             raise KeyError(f"Unknown artifact: {artifact_id}")
+        return artifact
+
+    def archive_artifact(self, artifact_id: str) -> Artifact:
+        artifact = self.get_artifact(artifact_id)
+        if artifact.archived_at is None:
+            artifact.archived_at = utc_now()
+            self.session.flush()
         return artifact
 
 
@@ -226,47 +230,52 @@ def prune_artifacts(
 ) -> PruneResult:
     """Delete the files of aged-out artifacts and archive their rows.
 
-    Only the bytes go: the row survives (archived) so the record of which run
-    produced what is never lost, and read paths already skip archived rows. Rows
-    with no file left on disk are archived too, so a partially-cleaned store
-    converges instead of being rescanned every pass.
+    Rows survive, archived, as the record of what each run produced; rows whose file is
+    already gone are archived too, so the store converges instead of being rescanned.
     """
     settings = get_settings()
     window = settings.artifact_retention_days if older_than_days is None else older_than_days
-    if window <= 0:
-        return PruneResult(pruned=0, bytes_freed=0)
     target_kinds = kinds if kinds is not None else settings.artifact_retention_kind_list
-    if not target_kinds:
+    if window <= 0 or not target_kinds:
         return PruneResult(pruned=0, bytes_freed=0)
-
     cutoff = utc_now() - timedelta(days=window)
     rows = session.scalars(
         select(Artifact)
-        .where(
-            Artifact.kind.in_(target_kinds),
-            Artifact.archived_at.is_(None),
-            Artifact.created_at < cutoff,
-        )
+        .where(Artifact.kind.in_(target_kinds), Artifact.archived_at.is_(None), Artifact.created_at < cutoff)
         .order_by(Artifact.created_at.asc())
         .limit(limit)
     ).all()
-
-    pruned = 0
     freed = 0
     now = utc_now()
     for artifact in rows:
-        if artifact.local_path:
-            path = Path(artifact.local_path)
+        path = Path(artifact.local_path) if artifact.local_path else None
+        if path is not None:
             try:
                 if path.is_file():
                     freed += path.stat().st_size
                     path.unlink()
             except OSError:
-                # A file held open or already gone is not a reason to stall the
-                # pass; the row is archived either way so it is not retried.
                 pass
         artifact.archived_at = now
-        pruned += 1
-    if pruned:
+    if rows:
         session.flush()
-    return PruneResult(pruned=pruned, bytes_freed=freed)
+    return PruneResult(pruned=len(rows), bytes_freed=freed)
+
+
+def _matches(artifact: Artifact, wanted_tags: set[str], needle: str) -> bool:
+    tags = artifact.tags or []
+    if not wanted_tags.issubset(tags):
+        return False
+    if not needle:
+        return True
+    return any(
+        needle in text.casefold()
+        for text in (artifact.title, artifact.kind, artifact.local_path, " ".join(tags), artifact.summary or "")
+    )
+
+
+def _safe_suffix(value: str | None) -> str:
+    if not value:
+        return ""
+    suffix = value if value.startswith(".") else f".{value}"
+    return "".join(ch for ch in suffix if ch.isalnum() or ch in {".", "_", "-"})[:40]
