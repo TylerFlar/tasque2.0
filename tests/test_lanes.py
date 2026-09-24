@@ -143,7 +143,7 @@ def test_manifest_sets_the_servers_and_tool_bans_a_schedule_runs_with(fresh_db: 
 
         changes = apply_lane_tiers(session, manifest)
         again = apply_lane_tiers(session, manifest)
-        apply_lane_tiers(session, {"schedules": {"finance-daily": {"mcp_servers": []}}})
+        emptied = apply_lane_tiers(session, {"schedules": {"finance-daily": {"mcp_servers": []}}})
 
         assert schedule.runtime_contract == {
             "model_profile": "high",
@@ -159,6 +159,10 @@ def test_manifest_sets_the_servers_and_tool_bans_a_schedule_runs_with(fresh_db: 
         ("disallowed_tools", "mcp__tasque2__memory_delete"),
     ]
     assert not any(change.changed for change in again)
+    # an empty list means no servers, which reads differently from the configured default
+    assert [(change.old, change.new) for change in emptied if change.field == "mcp_servers"] == [
+        ("autopilot, google-workspace", "none")
+    ]
 
 
 def test_manifest_errors_name_what_is_wrong(fresh_db: Path) -> None:

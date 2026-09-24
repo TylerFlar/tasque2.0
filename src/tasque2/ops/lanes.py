@@ -189,8 +189,8 @@ def _set_list(target: str, key: str, contract: dict[str, Any], value: Any) -> La
     return LaneChange(
         target=target,
         field=key,
-        old=", ".join(old) if isinstance(old, list) else None,
-        new=", ".join(value),
+        old=(", ".join(old) or "none") if isinstance(old, list) else None,
+        new=", ".join(value) or "none",
     )
 
 
