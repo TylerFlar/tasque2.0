@@ -602,6 +602,24 @@ class DiscordThread(TimestampMixin, Base):
     status: Mapped[str] = mapped_column(String(32), default="active", nullable=False)
 
 
+class DiscordSticky(TimestampMixin, Base):
+    """A thread's sticky note: notes a worker keeps for the user, shown above the thread's upcoming runs."""
+
+    __tablename__ = "discord_stickies"
+    __table_args__ = (UniqueConstraint("discord_thread_id", name="uq_discord_sticky_thread"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    discord_thread_id: Mapped[str] = mapped_column(String(80), nullable=False)
+    notes: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    notes_updated_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
+    notes_work_item_id: Mapped[str | None] = mapped_column(String(36))
+    status: Mapped[str] = mapped_column(String(32), default="on", nullable=False)
+    discord_message_id: Mapped[str | None] = mapped_column(String(80))
+    signature: Mapped[str | None] = mapped_column(Text)
+    pinned_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
+    pin_retry_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
+
+
 class DiscordMessage(Base):
     __tablename__ = "discord_messages"
     __table_args__ = (

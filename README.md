@@ -164,6 +164,22 @@ a one-shot schedule whose `function.notify` worker posts `Reminder: pay the card
 at its time, with no model run. `reminder_list` shows what is coming (a morning brief can list
 today's), `reminder_cancel` drops one, and past reminders are pruned after a month.
 
+### A sticky note in each lane thread
+
+Each lane thread gets a sticky note: one short message Tasque posts once (without a notification),
+pins, and then edits in place. Under "Coming up" it lists the next run of every enabled schedule
+that posts into the thread, reminders included, marked "if needed" when a gate may skip it. Above
+that, workers keep notes for you with `sticky_set`: replies or emails you owe, things to do, a
+decision waiting on you. The notes may stay empty. The run that posts into a thread sees its sticky
+note in the packet (`thread_sticky`), so it can drop what is done. Delete a sticky note's message
+and it stays off in that thread; ask in the thread to bring it back. Pinning needs the bot's Pin
+Messages permission: until Discord allows it, the note works unpinned and the pin is tried again
+every 10 minutes (a note you pin by hand counts as pinned).
+
+```powershell
+uv run tasque2 stickies   # every sticky note as Discord shows it
+```
+
 ### Run a daily job only when it has something to do
 
 An extension registers a gate, and a schedule names it in its payload:
@@ -207,7 +223,7 @@ the latest runs with their traces.
 | Workflows | `workflow-register`, `workflow-validate`, `workflow-start`, `workflow-list`, `workflow-runs`, `workflow-show`, `workflow-answer`, `workflow-cancel` |
 | Memory | `memory-add`, `memory-search`, `memory-show`, `memory-archive`, `memory-delete`, `memory-ingest-text`, `memory-embed`, `memory-prune`, `doctrine-export`, `doctrine-apply` |
 | Artifacts | `artifact-list`, `artifact-capture`, `artifact-archive` |
-| Operations | `doctor`, `status`, `usage`, `lanes`, `lanes-apply`, `smoke`, `provider-smoke`, `telemetry-check`, `discord-output-simulate`, `migrate`, `db-status`, `backup-create`, `backup-restore`, `reset-jobs` |
+| Operations | `doctor`, `status`, `usage`, `lanes`, `lanes-apply`, `stickies`, `smoke`, `provider-smoke`, `telemetry-check`, `discord-output-simulate`, `migrate`, `db-status`, `backup-create`, `backup-restore`, `reset-jobs` |
 
 `uv run tasque2 <command> --help` shows each command's options.
 

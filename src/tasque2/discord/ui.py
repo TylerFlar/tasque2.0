@@ -1,4 +1,4 @@
-"""Discord embeds and buttons: the ops panel, workflow status panels, and work controls."""
+"""Discord embeds and buttons: the ops panel, workflow status panels, sticky notes, and work controls."""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 from tasque2.models import WorkflowNode, WorkflowRun, WorkItem
 from tasque2.ops.reports import ReportService
 from tasque2.ops.status import SystemStatus
+from tasque2.sticky import StickyView
 from tasque2.work.queue import WorkQueue
 from tasque2.workflows import WorkflowService
 
@@ -18,6 +19,7 @@ CUSTOM_ID_PREFIX = "t2"
 CONTROL_PANEL_ENTITY_ID = "discord-control-panel"
 CONTROL_PANEL_VERSION = 3
 EMBED_DESCRIPTION_LIMIT = 4096
+EMBED_FIELD_LIMIT = 1024
 COLOR_OK = 0x2ECC71
 COLOR_WARN = 0xF1C40F
 COLOR_ALERT = 0xE74C3C
@@ -168,6 +170,22 @@ def build_workflow_status_panel_embed(run: WorkflowRun, nodes: list[WorkflowNode
         "color": color,
         "fields": fields,
     }
+
+
+def build_sticky_embed(view: StickyView) -> dict[str, Any]:
+    """A thread's sticky note: the notes kept for the user, then the thread's upcoming runs."""
+    embed: dict[str, Any] = {"title": "Sticky note", "color": COLOR_IDLE}
+    lines = view.lines()
+    if view.notes:
+        embed["description"] = view.notes[:EMBED_DESCRIPTION_LIMIT]
+    elif not lines:
+        embed["description"] = "_(nothing here)_"
+    if lines:
+        embed["fields"] = [{"name": "Coming up", "value": "\n".join(lines)[:EMBED_FIELD_LIMIT], "inline": False}]
+    if view.notes_updated_at is not None:
+        embed["footer"] = {"text": "notes updated"}
+        embed["timestamp"] = view.notes_updated_at.isoformat()
+    return embed
 
 
 class DiscordUIService:

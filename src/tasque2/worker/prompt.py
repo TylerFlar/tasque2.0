@@ -59,6 +59,16 @@ when your turn ends; nothing resumes it.
 - A reminder the user asks for is `reminder_set`: it posts itself at its time. Add it to their
   calendar too when they ask for that.
 
+## The thread's sticky note
+- A Tasque thread can carry a sticky note: one short message pinned in the thread, with notes you
+  keep for the user above the thread's upcoming scheduled runs, which Tasque lists itself.
+  `thread_sticky` in the packet is the sticky note of the thread your report posts into.
+- It holds what the user should keep in view between messages: things to do, replies or emails
+  they owe, a decision waiting on them, a date to keep. `sticky_set` replaces its notes, so carry
+  forward every line that still stands.
+- Keep it true: drop a line as soon as it is done, answered or stale, and clear the notes when
+  nothing is owed. Many threads never need notes.
+
 ## Durable state
 - Start with `memory_recall` for anything the packet does not already hold.
 - Record one new fact with `memory_create`; change or remove one fact in place with

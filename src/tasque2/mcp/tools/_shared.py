@@ -39,6 +39,17 @@ def calling_work_item(session: Session) -> WorkItem | None:
     return session.get(WorkItem, work_item_id) if work_item_id else None
 
 
+def calling_thread(session: Session) -> str | None:
+    """The Discord thread the calling work answers in: its own, else the nearest parent's."""
+    work = calling_work_item(session)
+    while work is not None:
+        if work.discord_thread_id:
+            return work.discord_thread_id
+        parent_id = (work.context or {}).get("parent_work_item_id")
+        work = session.get(WorkItem, parent_id) if parent_id and parent_id != work.id else None
+    return None
+
+
 def inherit_reply_config(
     context: dict[str, Any], caller: WorkItem | None, *, parent_pointer: bool = False
 ) -> dict[str, Any]:

@@ -17,7 +17,7 @@ from sqlalchemy.orm import Session
 from tasque2.artifacts import ArtifactStore
 from tasque2.db import session_scope
 from tasque2.discord import gateway as gateway_module
-from tasque2.discord.gateway import DiscordPyGateway, FakeDiscordGateway
+from tasque2.discord.gateway import DiscordMessageGone, DiscordPyGateway, FakeDiscordGateway
 from tasque2.discord.output import DiscordOutputService, OutputChannels, split_markdown
 from tasque2.discord.routing import DiscordService
 from tasque2.discord.ui import make_custom_id
@@ -975,3 +975,96 @@ def test_gateway_falls_back_to_naming_artifacts_when_discord_rejects_the_upload(
     assert message["content"] == (
         "Report attached.\n(attachments exceeded Discord's upload limit — kept as artifacts: art-0, art-1)"
     )
+
+
+class _EditableMessage:
+    def __init__(self, message_id: int = 0, *, pinned: bool = False) -> None:
+        self.id = message_id
+        self.pinned = pinned
+        self.pin_calls = 0
+        self.edits: list[dict[str, Any]] = []
+
+    async def edit(self, **kwargs) -> None:
+        self.edits.append(kwargs)
+
+    async def pin(self) -> None:
+        self.pin_calls += 1
+        self.pinned = True
+
+
+class _PinnableThread:
+    """A thread that can be archived and holds the messages sent to it, to edit and pin."""
+
+    def __init__(self, channel_id: int, *, archived: bool = False, messages: dict[int, _EditableMessage] | None = None):
+        self.id = channel_id
+        self.archived = archived
+        self.locked = False
+        self.messages = messages or {}
+        self.sent: list[dict[str, Any]] = []
+
+    async def send(self, content=None, *, embed=None, view=None, silent=False):
+        self.sent.append({"embed": embed, "view": view, "silent": silent})
+        message = _EditableMessage(500 + len(self.sent))
+        self.messages[message.id] = message
+        return message
+
+    async def edit(self, *, archived: bool) -> None:
+        self.archived = archived
+
+    async def fetch_message(self, message_id: int) -> _EditableMessage:
+        if message_id not in self.messages:
+            raise discord.NotFound(SimpleNamespace(status=404, reason="Not Found"), "Unknown Message")
+        return self.messages[message_id]
+
+
+def test_gateway_unarchives_a_quiet_thread_before_editing_its_sticky_note(
+    event_loop_thread: asyncio.AbstractEventLoop,
+) -> None:
+    message = _EditableMessage()
+    channel = _PinnableThread(77, archived=True, messages={501: message})
+
+    DiscordPyGateway(_FakeClient(channel), event_loop_thread).edit_message(
+        channel_id="77", message_id="501", embed={"title": "Sticky note"}
+    )
+
+    assert channel.archived is False
+    [edit] = message.edits
+    assert edit["embed"].title == "Sticky note"
+    assert edit["view"] is None
+
+
+def test_gateway_reports_a_deleted_message_as_gone(event_loop_thread: asyncio.AbstractEventLoop) -> None:
+    gateway = DiscordPyGateway(_FakeClient(_PinnableThread(78)), event_loop_thread)
+
+    with pytest.raises(DiscordMessageGone):
+        gateway.edit_message(channel_id="78", message_id="999", embed={"title": "Sticky note"})
+    with pytest.raises(DiscordMessageGone):
+        gateway.pin_message(channel_id="78", message_id="999")
+
+
+def test_gateway_posts_a_sticky_note_silently_and_pins_it(event_loop_thread: asyncio.AbstractEventLoop) -> None:
+    channel = _PinnableThread(79)
+    gateway = DiscordPyGateway(_FakeClient(channel), event_loop_thread)
+
+    sent = gateway.send_embed(channel_id="79", embed={"title": "Sticky note"}, silent=True)
+    gateway.pin_message(channel_id="79", message_id=sent.message_id)
+    gateway.pin_message(channel_id="79", message_id=sent.message_id)
+
+    assert [message["silent"] for message in channel.sent] == [True]
+    message = channel.messages[int(sent.message_id)]
+    assert message.pinned is True and message.pin_calls == 1
+
+
+def test_gateway_counts_a_note_the_user_pinned_as_pinned_and_unarchives_to_pin(
+    event_loop_thread: asyncio.AbstractEventLoop,
+) -> None:
+    by_hand = _EditableMessage(601, pinned=True)
+    unpinned = _EditableMessage(602)
+    channel = _PinnableThread(80, archived=True, messages={601: by_hand, 602: unpinned})
+    gateway = DiscordPyGateway(_FakeClient(channel), event_loop_thread)
+
+    gateway.pin_message(channel_id="80", message_id="601")
+    assert channel.archived is True and by_hand.pin_calls == 0
+    gateway.pin_message(channel_id="80", message_id="602")
+
+    assert channel.archived is False and unpinned.pin_calls == 1

@@ -3,8 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from tasque2.db import session_scope
-from tasque2.mcp.tools._shared import calling_work_item, optional_string, required, run_json
-from tasque2.models import WorkItem
+from tasque2.mcp.tools._shared import calling_thread, optional_string, required, run_json
 from tasque2.reminders import ReminderService
 
 
@@ -27,7 +26,7 @@ def reminder_cancel(reminder_id: str) -> str:
 
 def _set(text: str, at: str, thread_id: str | None) -> dict[str, Any]:
     with session_scope() as session:
-        thread = optional_string(thread_id) or _calling_thread(session)
+        thread = optional_string(thread_id) or calling_thread(session)
         if not thread:
             raise ValueError("This work has no Discord thread; pass thread_id for where the reminder should post.")
         reminder = ReminderService(session).set(required(text, "text"), required(at, "at"), thread_id=thread)
@@ -43,13 +42,3 @@ def _cancel(reminder_id: str) -> dict[str, Any]:
     with session_scope() as session:
         ReminderService(session).cancel(required(reminder_id, "reminder_id"))
         return {"ok": True, "canceled": reminder_id}
-
-
-def _calling_thread(session) -> str | None:
-    work = calling_work_item(session)
-    while work is not None:
-        if work.discord_thread_id:
-            return work.discord_thread_id
-        parent_id = (work.context or {}).get("parent_work_item_id")
-        work = session.get(WorkItem, parent_id) if parent_id and parent_id != work.id else None
-    return None

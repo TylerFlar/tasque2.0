@@ -1,9 +1,9 @@
 """The context packet: the state a worker starts from, assembled per run.
 
 The packet carries the work item, its task context, pinned and relevant memories,
-related artifacts, the workflow neighborhood, the parent work for replies, and any
-code-computed domain digests an extension contributes. It is a starting map: workers
-fetch anything else through the Tasque MCP tools.
+related artifacts, the workflow neighborhood, the parent work for replies, the sticky note
+of the thread the work posts into, and any code-computed domain digests an extension
+contributes. It is a starting map: workers fetch anything else through the Tasque MCP tools.
 """
 
 from __future__ import annotations
@@ -19,6 +19,7 @@ from tasque2.extensions import registry as extension_registry
 from tasque2.memory import MemoryService, canonical_budget
 from tasque2.memory.excerpt import select_relevant_excerpt
 from tasque2.models import Artifact, Memory, WorkAttempt, WorkflowEdge, WorkflowNode, WorkflowRun, WorkItem
+from tasque2.sticky import StickyService
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +69,13 @@ class WorkerContextBuilder:
             )
         if run is not None:
             packet["workflow"] = self._workflow_data(run, work_item)
+        try:
+            sticky = self._thread_sticky(work_item)
+        except Exception:  # noqa: BLE001 - a sticky note that cannot be read must not fail the run
+            logger.exception("Failed to read the thread's sticky note for %s", work_item.id)
+            sticky = None
+        if sticky is not None:
+            packet["thread_sticky"] = sticky
         for key, wants, build in extension_registry().context_digests:
             if not wants(context):
                 continue
@@ -225,6 +233,16 @@ class WorkerContextBuilder:
             .where(WorkAttempt.work_item_id == work_item_id)
             .order_by(WorkAttempt.attempt_number.desc(), WorkAttempt.created_at.desc())
         )
+
+    def _thread_sticky(self, work_item: WorkItem) -> dict[str, Any] | None:
+        """The sticky note of the thread this work posts into: work outside a workflow, or a run's final step."""
+        if not work_item.discord_thread_id:
+            return None
+        if work_item.workflow_node_id is not None and self.session.scalar(
+            select(WorkflowEdge.id).where(WorkflowEdge.from_node_id == work_item.workflow_node_id).limit(1)
+        ):
+            return None
+        return StickyService(self.session).packet_view(work_item.discord_thread_id)
 
 
 def packet_limits(work_item: WorkItem) -> dict[str, int | None]:

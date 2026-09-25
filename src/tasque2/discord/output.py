@@ -1,29 +1,33 @@
-"""Outbound Discord: post finished work and workflow results, keep status panels current.
+"""Outbound Discord: post finished work and workflow results, keep status panels and sticky notes current.
 
 Posting state lives in the event log (``discord.*_posted`` events), so every post happens
 once per status and survives restarts. Work that carries a thread Tasque already owns posts
 into that thread; other work opens a new thread under the jobs channel (dead letters under
-the DLQ channel); intake work answers in the intake channel.
+the DLQ channel); intake work answers in the intake channel. A thread's sticky note is posted
+once, pinned, and edited in place; its message id, last rendering and pin state live on its row.
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import mimetypes
 from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from tasque2.discord.gateway import MESSAGE_LIMIT, DiscordGateway, DiscordSentMessage
+from tasque2.discord.gateway import MESSAGE_LIMIT, DiscordGateway, DiscordMessageGone, DiscordSentMessage
 from tasque2.discord.routing import DiscordService
 from tasque2.discord.ui import (
     CONTROL_PANEL_ENTITY_ID,
     CONTROL_PANEL_VERSION,
     build_ops_embed,
+    build_sticky_embed,
     build_work_controls_view,
     build_workflow_controls_view,
     build_workflow_status_panel_embed,
@@ -40,13 +44,18 @@ from tasque2.models import (
     WorkflowNode,
     WorkflowRun,
     WorkItem,
+    utc_now,
 )
 from tasque2.ops.status import get_system_status
+from tasque2.sticky import StickyService
+
+logger = logging.getLogger(__name__)
 
 WORK_OUTPUT_STATUSES = {"succeeded", "dead_letter", "canceled"}
 ACTIVE_RUN_STATUSES = {"active", "awaiting_input", "paused"}
 TERMINAL_RUN_STATUSES = {"completed", "failed", "canceled"}
 TEXT_SUFFIXES = {".md", ".txt", ".json", ".log"}
+STICKY_PIN_RETRY = timedelta(minutes=10)
 
 
 @dataclass(frozen=True)
@@ -72,6 +81,7 @@ class DiscordOutputService:
             channel_id = channels.dlq if work_item.status == "dead_letter" else channels.jobs
             self.post_work_result(work_item_id=work_item.id, channel_id=channel_id, gateway=gateway)
             posted += 1
+        self.refresh_stickies(gateway=gateway)
         return posted
 
     def ensure_control_panel(self, *, channel_id: str, gateway: DiscordGateway) -> DiscordSentMessage | None:
@@ -169,6 +179,63 @@ class DiscordOutputService:
             }
             event.summary = f"Updated workflow status panel: {run.status}"
             written += 1
+        return written
+
+    def refresh_stickies(self, *, gateway: DiscordGateway, now: datetime | None = None) -> int:
+        """Post each thread's sticky note once (silently), keep it pinned, and edit it in place when it changes.
+
+        A sticky note whose message was deleted is turned off, so the user's delete keeps it gone. A pin
+        Discord refuses is tried again every ``STICKY_PIN_RETRY``; a note pinned by hand counts as pinned.
+        """
+        now = now or utc_now()
+        stickies = StickyService(self.session)
+        written = 0
+        refused: list[str] = []
+        reason = ""
+        for view in stickies.showable(now=now):
+            embed = build_sticky_embed(view)
+            signature = json.dumps(embed, sort_keys=True, default=str)
+            sticky = stickies.sticky(view.thread_id)
+            if sticky is None or not sticky.discord_message_id:
+                try:
+                    sent = gateway.send_embed(channel_id=view.thread_id, embed=embed, silent=True)
+                except Exception:  # noqa: BLE001 - nothing is recorded, so the next pass posts it again
+                    continue
+                sticky = stickies.record_posted(view.thread_id, message_id=sent.message_id, signature=signature)
+                written += 1
+            elif sticky.signature != signature:
+                try:
+                    gateway.edit_message(channel_id=view.thread_id, message_id=sticky.discord_message_id, embed=embed)
+                except DiscordMessageGone:
+                    stickies.turn_off(view.thread_id)
+                    continue
+                except Exception:  # noqa: BLE001 - the stored signature is unchanged, so the next pass retries the edit
+                    continue
+                sticky.signature = signature
+                written += 1
+            if sticky.pinned_at is not None or (sticky.pin_retry_at is not None and sticky.pin_retry_at > now):
+                continue
+            try:
+                gateway.pin_message(channel_id=view.thread_id, message_id=sticky.discord_message_id)
+            except DiscordMessageGone:
+                stickies.turn_off(view.thread_id)
+                continue
+            except Exception as exc:  # noqa: BLE001 - an unpinned sticky note still works; the pin is tried again
+                if sticky.pin_retry_at is None:
+                    refused.append(view.thread_id)
+                    reason = str(exc)
+                sticky.pin_retry_at = now + STICKY_PIN_RETRY
+                continue
+            sticky.pinned_at, sticky.pin_retry_at = now, None
+        if refused:
+            logger.warning(
+                "Could not pin %d sticky note(s) (%s); a pin needs the bot's Pin Messages permission, and it is "
+                "tried again every %d minutes. Threads: %s",
+                len(refused),
+                reason,
+                STICKY_PIN_RETRY.total_seconds() // 60,
+                ", ".join(refused),
+            )
         return written
 
     def post_work_result(

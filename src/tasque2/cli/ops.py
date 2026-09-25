@@ -23,7 +23,16 @@ from tasque2.cli._common import (
 )
 from tasque2.config import Settings, get_settings
 from tasque2.daemon import control
-from tasque2.models import ProviderRun, Schedule, WorkAttempt, WorkflowDefinition, WorkItem
+from tasque2.models import (
+    DiscordSticky,
+    DiscordThread,
+    ProviderRun,
+    Schedule,
+    WorkAttempt,
+    WorkflowDefinition,
+    WorkflowRun,
+    WorkItem,
+)
 from tasque2.ops.status import get_system_status
 from tasque2.ops.usage import usage_by_lane
 from tasque2.schedules import WORKFLOW_SCHEDULE_TARGETS, ScheduleService
@@ -151,6 +160,29 @@ def lanes() -> None:
                 columns = _lane_columns(_node_worker_kind(node), node.get("runtime_contract") or {}, settings)
                 table.add_row(f"{definition.name}/{node.get('key')}", cadence or "on demand", *columns)
         console.print(table)
+
+
+@app.command("stickies")
+def stickies(as_json: Annotated[bool, typer.Option("--json")] = False) -> None:
+    """Each thread's sticky note as Discord shows it: the notes kept for the user, then the thread's upcoming runs."""
+    from tasque2.sticky import STICKY_OFF, StickyService
+
+    with cli_session_scope() as session:
+        views = StickyService(session).showable()
+        off = session.scalars(
+            select(DiscordSticky.discord_thread_id)
+            .where(DiscordSticky.status == STICKY_OFF)
+            .order_by(DiscordSticky.discord_thread_id)
+        ).all()
+        if as_json:
+            emit_json({"stickies": [view.data() for view in views], "off": list(off)})
+            return
+        for view in views:
+            echo(f"== {view.thread_id} ({_thread_label(session, view.thread_id)})\n{view.text()}\n")
+        for thread_id in off:
+            echo(f"== {thread_id} ({_thread_label(session, thread_id)}): off, its message was deleted")
+        if not views and not off:
+            echo("No thread has a sticky note.")
 
 
 @app.command("smoke")
@@ -385,6 +417,16 @@ def _starts_workflow(schedule: Schedule, definition: WorkflowDefinition) -> bool
         payload.get("workflow_name") == definition.name
         and str(payload.get("workflow_version", "1")) == definition.version
     )
+
+
+def _thread_label(session: Session, thread_id: str) -> str:
+    """The lane or title of the work (or workflow run) a thread belongs to."""
+    binding = session.scalar(select(DiscordThread).where(DiscordThread.discord_thread_id == thread_id))
+    owner = session.get(WorkItem, binding.work_item_id) if binding is not None and binding.work_item_id else None
+    if owner is not None:
+        return owner.lane or owner.title
+    run = session.get(WorkflowRun, binding.workflow_run_id) if binding is not None and binding.workflow_run_id else None
+    return run.name if run is not None else "unbound"
 
 
 def _refuse_while_daemon_alive(session: Session) -> None:

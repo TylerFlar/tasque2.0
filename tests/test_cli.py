@@ -17,6 +17,7 @@ from tasque2.cli import app
 from tasque2.config import reset_settings
 from tasque2.daemon import control
 from tasque2.db import session_scope
+from tasque2.discord.routing import DiscordService
 from tasque2.memory import MemoryService
 from tasque2.models import (
     Artifact,
@@ -31,6 +32,7 @@ from tasque2.models import (
     WorkItem,
     utc_now,
 )
+from tasque2.sticky import StickyService
 from tasque2.work.repository import WorkRepository
 from tasque2.work.runner import WorkRunner
 
@@ -888,6 +890,37 @@ def test_lanes_lists_schedule_and_workflow_node_tiers(fresh_db: Path, tmp_path: 
     assert not any("Cleanup daily" in line for line in lines)
 
 
+def test_stickies_prints_each_sticky_note_as_discord_shows_it(fresh_db: Path) -> None:
+    with session_scope() as session:
+        opener = WorkRepository(session).create_work_item(
+            title="Career opener", task_instruction="Open.", worker_kind="manual", lane="career"
+        )
+        DiscordService(session).bind_thread(
+            purpose="work", discord_channel_id="jobs", discord_thread_id="t-career", work_item_id=opener.id
+        )
+        StickyService(session).set_notes("t-career", "- Reply to Anthony (Leidos) on LinkedIn")
+    cli(
+        "schedule-create",
+        "career-review",
+        "--type",
+        "cron",
+        "--expr",
+        "0 12 * * SUN",
+        "--task",
+        "Review.",
+        "--thread",
+        "t-career",
+    )
+
+    output = cli("stickies").output
+    data = json.loads(cli("stickies", "--json").output)
+
+    assert "== t-career (career)\n- Reply to Anthony (Leidos) on LinkedIn\n\nComing up\n" in output
+    assert "· career-review" in output
+    assert [sticky["notes"] for sticky in data["stickies"]] == ["- Reply to Anthony (Leidos) on LinkedIn"]
+    assert data["off"] == []
+
+
 def test_lanes_shows_a_bad_contract_in_its_row(fresh_db: Path) -> None:
     with session_scope() as session:
         session.add(
@@ -926,7 +959,7 @@ def test_doctor_json_without_migrating(fresh_db: Path) -> None:
         "queue",
     }
     assert checks["database.migrations"]["status"] == "ok"
-    assert checks["database.migrations"]["details"]["current"] == "core_0001"
+    assert checks["database.migrations"]["details"]["current"] == "core_0003"
 
 
 def test_doctor_strict_exits_nonzero_only_on_failures(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1054,9 +1087,9 @@ def test_migrate_and_db_status() -> None:
     migrated = cli("migrate").output
     status = cli("db-status").output
 
-    assert "tasque2.sqlite3: core_0001" in migrated
-    assert re.search(r"current\s+.\s+core_0001", status)
-    assert re.search(r"head\s+.\s+core_0001", status)
+    assert "tasque2.sqlite3: core_0003" in migrated
+    assert re.search(r"current\s+.\s+core_0003", status)
+    assert re.search(r"head\s+.\s+core_0003", status)
     assert re.search(r"up to date\s+.\s+True", status)
 
 
@@ -1071,7 +1104,7 @@ def test_backup_create_and_restore(fresh_db: Path, tmp_path: Path) -> None:
 
     assert "backup:" in created and (backup_dir / "tasque2.sqlite3").is_file()
     assert "pass --force to confirm" in refused.output
-    assert "restored:" in restored and "(core_0001)" in restored
+    assert "restored:" in restored and "(core_0003)" in restored
     assert "previous database kept at:" in restored
     listing = cli("list").output
     assert "Kept" in listing

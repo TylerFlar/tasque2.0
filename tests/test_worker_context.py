@@ -10,10 +10,12 @@ from sqlalchemy.orm import Session
 from tasque2.artifacts import ArtifactStore
 from tasque2.config import get_settings
 from tasque2.db import session_scope
+from tasque2.discord.routing import DiscordService
 from tasque2.extensions import registry as extension_registry
 from tasque2.memory import MemoryService
 from tasque2.models import Memory, WorkflowDefinition, WorkflowEdge, WorkflowNode, WorkflowRun, WorkItem
 from tasque2.providers import FakeProvider, ProviderRegistry, ProviderRequest
+from tasque2.sticky import StickyService
 from tasque2.work.queue import WorkQueue
 from tasque2.work.repository import WorkRepository
 from tasque2.work.runner import WorkRunner
@@ -418,6 +420,47 @@ def test_workflow_packet_lists_the_current_node_and_its_upstream_outputs(fresh_d
     assert [artifact["id"] for artifact in packet["artifacts"]] == [run_artifact.id]
 
 
+def test_the_packet_carries_the_sticky_note_of_the_thread_the_work_posts_into(fresh_db: Path) -> None:
+    with session_scope() as session:
+        owner = _work(session, title="Career opener")
+        DiscordService(session).bind_thread(
+            purpose="work", discord_channel_id="jobs", discord_thread_id="t-career", work_item_id=owner.id
+        )
+        noted_at = datetime(2026, 9, 25, 3, 0, tzinfo=UTC)
+        StickyService(session).set_notes("t-career", "- Reply to Afraz (Brain Corp) on LinkedIn", now=noted_at)
+        definition = WorkflowDefinition(name="Apply", version="1", definition={})
+        session.add(definition)
+        session.flush()
+        run = WorkflowRun(workflow_definition_id=definition.id, name="Apply", status="active")
+        session.add(run)
+        session.flush()
+        scout = WorkflowNode(workflow_run_id=run.id, node_key="scout", kind="work", status="running")
+        report = WorkflowNode(workflow_run_id=run.id, node_key="report", kind="work", status="pending")
+        session.add_all([scout, report])
+        session.flush()
+        session.add(WorkflowEdge(workflow_run_id=run.id, from_node_id=scout.id, to_node_id=report.id))
+        in_run = {"discord_thread_id": "t-career", "workflow_run_id": run.id}
+        works = {
+            "reply": _work(session, discord_thread_id="t-career"),
+            "no thread": _work(session),
+            "scout": _work(session, workflow_node_id=scout.id, **in_run),
+            "report": _work(session, workflow_node_id=report.id, **in_run),
+            "not ours": _work(session, discord_thread_id="t-unbound"),
+        }
+        builder = WorkerContextBuilder(session)
+        stickies = {name: builder.build_for_work(work).get("thread_sticky") for name, work in works.items()}
+
+    assert stickies["reply"] == {
+        "thread_id": "t-career",
+        "shown": True,
+        "notes": "- Reply to Afraz (Brain Corp) on LinkedIn",
+        "notes_updated_at": "2026-09-24T20:00-07:00",
+        "coming_up": [],
+    }
+    assert stickies["report"] == stickies["reply"]
+    assert stickies["no thread"] is None and stickies["scout"] is None and stickies["not ours"] is None
+
+
 def test_extension_digests_join_the_packets_that_want_them(fresh_db: Path, caplog: pytest.LogCaptureFixture) -> None:
     registry = extension_registry()
     registry.add_context_digest(
@@ -576,6 +619,11 @@ def test_worker_contract_is_written_once_under_the_data_dir() -> None:
     path.write_text("kept", encoding="utf-8")
     assert contract_path() == path
     assert path.read_text(encoding="utf-8") == "kept"
+
+
+def test_worker_contract_explains_the_threads_sticky_note() -> None:
+    assert "## The thread's sticky note" in WORKER_CONTRACT
+    assert "`sticky_set` replaces its notes" in WORKER_CONTRACT
 
 
 def test_worker_contract_keeps_the_run_one_shot_and_in_the_foreground() -> None:

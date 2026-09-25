@@ -31,6 +31,10 @@ class DiscordSentMessage:
     channel_id: str
 
 
+class DiscordMessageGone(LookupError):
+    """The message, or the channel holding it, no longer exists on Discord."""
+
+
 class DiscordGateway(Protocol):
     def create_thread(
         self,
@@ -51,8 +55,10 @@ class DiscordGateway(Protocol):
     ) -> DiscordSentMessage: ...
 
     def send_embed(
-        self, *, channel_id: str, embed: dict[str, Any], view: object | None = None
-    ) -> DiscordSentMessage: ...
+        self, *, channel_id: str, embed: dict[str, Any], view: object | None = None, silent: bool = False
+    ) -> DiscordSentMessage:
+        """Post an embed; ``silent`` posts it without a push notification."""
+        ...
 
     def edit_message(
         self,
@@ -62,7 +68,13 @@ class DiscordGateway(Protocol):
         content: str | None = None,
         embed: dict[str, Any] | None = None,
         view: object | None = None,
-    ) -> None: ...
+    ) -> None:
+        """Edit a posted message; raises ``DiscordMessageGone`` when it was deleted."""
+        ...
+
+    def pin_message(self, *, channel_id: str, message_id: str) -> None:
+        """Pin a posted message unless it is pinned already; raises ``DiscordMessageGone`` when it was deleted."""
+        ...
 
 
 class FakeDiscordGateway:
@@ -76,6 +88,9 @@ class FakeDiscordGateway:
         self.edited_messages: list[tuple[str, str, str | None, dict[str, Any] | None, object | None]] = []
         self.sent_views: list[object | None] = []
         self.sent_attachments: list[list[DiscordFileUpload]] = []
+        self.silent_message_ids: list[str] = []
+        self.pinned_messages: list[tuple[str, str]] = []
+        self.gone_message_ids: set[str] = set()
         self._threads = 0
         self._messages = 0
 
@@ -95,15 +110,26 @@ class FakeDiscordGateway:
         self.sent_attachments.append(list(attachments or []))
         return DiscordSentMessage(message_id=f"fake-message-{self._messages}", channel_id=channel_id)
 
-    def send_embed(self, *, channel_id, embed, view=None) -> DiscordSentMessage:
+    def send_embed(self, *, channel_id, embed, view=None, silent=False) -> DiscordSentMessage:
         self._messages += 1
+        message_id = f"fake-message-{self._messages}"
         self.sent_embeds.append((channel_id, embed, view))
         self.sent_views.append(view)
         self.sent_attachments.append([])
-        return DiscordSentMessage(message_id=f"fake-message-{self._messages}", channel_id=channel_id)
+        if silent:
+            self.silent_message_ids.append(message_id)
+        return DiscordSentMessage(message_id=message_id, channel_id=channel_id)
 
     def edit_message(self, *, channel_id, message_id, content=None, embed=None, view=None) -> None:
+        if message_id in self.gone_message_ids:
+            raise DiscordMessageGone(message_id)
         self.edited_messages.append((channel_id, message_id, content, embed, view))
+
+    def pin_message(self, *, channel_id, message_id) -> None:
+        if message_id in self.gone_message_ids:
+            raise DiscordMessageGone(message_id)
+        if (channel_id, message_id) not in self.pinned_messages:
+            self.pinned_messages.append((channel_id, message_id))
 
 
 class DiscordPyGateway:
@@ -119,11 +145,14 @@ class DiscordPyGateway:
     def send_message(self, *, channel_id, content, view=None, attachments=None) -> DiscordSentMessage:
         return self._call(self._send_message(channel_id, content, view, list(attachments or [])))
 
-    def send_embed(self, *, channel_id, embed, view=None) -> DiscordSentMessage:
-        return self._call(self._send_embed(channel_id, embed, view))
+    def send_embed(self, *, channel_id, embed, view=None, silent=False) -> DiscordSentMessage:
+        return self._call(self._send_embed(channel_id, embed, view, silent))
 
     def edit_message(self, *, channel_id, message_id, content=None, embed=None, view=None) -> None:
         self._call(self._edit_message(channel_id, message_id, content, embed, view))
+
+    def pin_message(self, *, channel_id, message_id) -> None:
+        self._call(self._pin_message(channel_id, message_id))
 
     def _call(self, coroutine):
         return asyncio.run_coroutine_threadsafe(coroutine, self.loop).result(timeout=CALL_TIMEOUT_SECONDS)
@@ -183,25 +212,46 @@ class DiscordPyGateway:
             first = first or message
         return DiscordSentMessage(message_id=str(first.id), channel_id=str(channel.id))
 
-    async def _send_embed(self, channel_id, embed, view) -> DiscordSentMessage:
+    async def _send_embed(self, channel_id, embed, view, silent) -> DiscordSentMessage:
         import discord
 
         channel = await self._channel(channel_id)
-        message = await channel.send(embed=discord.Embed.from_dict(embed), view=view)
+        message = await channel.send(embed=discord.Embed.from_dict(embed), view=view, silent=silent)
         _count_outbound()
         return DiscordSentMessage(message_id=str(message.id), channel_id=str(channel.id))
 
     async def _edit_message(self, channel_id, message_id, content, embed, view) -> None:
         import discord
 
-        channel = await self._channel(channel_id)
-        message = await channel.fetch_message(int(message_id))
+        channel, message = await self._posted_message(channel_id, message_id)
+        await _reopen(channel)
         kwargs: dict[str, Any] = {"view": view}
         if content is not None:
             kwargs["content"] = content
         if embed is not None:
             kwargs["embed"] = discord.Embed.from_dict(embed)
         await message.edit(**kwargs)
+
+    async def _pin_message(self, channel_id, message_id) -> None:
+        channel, message = await self._posted_message(channel_id, message_id)
+        if not message.pinned:
+            await _reopen(channel)
+            await message.pin()
+
+    async def _posted_message(self, channel_id, message_id):
+        import discord
+
+        try:
+            channel = await self._channel(channel_id)
+            return channel, await channel.fetch_message(int(message_id))
+        except discord.NotFound as exc:
+            raise DiscordMessageGone(f"{channel_id}/{message_id}") from exc
+
+
+async def _reopen(channel) -> None:
+    """An archived thread refuses edits and pins; unarchiving it is what posting a message there would do."""
+    if getattr(channel, "archived", False) and not getattr(channel, "locked", False):
+        await channel.edit(archived=False)
 
 
 def _count_outbound() -> None:
