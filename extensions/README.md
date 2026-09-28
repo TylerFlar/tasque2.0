@@ -26,7 +26,14 @@ from pathlib import Path
 def register(registry) -> None:
     from . import models  # noqa: F401 - puts the tables on Base.metadata
     from . import tools
-    from .reading_log import build_reading_log, ingest_reading_produces, resolve_shelf_keys, wants_reading_log
+    from .reading_log import (
+        build_reading_log,
+        ingest_reading_produces,
+        reading_due_gate,
+        resolve_shelf_keys,
+        sync_shelf,
+        wants_reading_log,
+    )
 
     # Alembic revisions for your tables. The first revision's down_revision is a core revision
     # ("core_0001"); core and extension revisions upgrade together.
@@ -46,6 +53,15 @@ def register(registry) -> None:
 
     # Runs after every successfully completed attempt, e.g. to record ledger rows from its produces.
     registry.add_attempt_ingestor("reading_log", ingest_reading_produces)
+
+    # Lets a schedule whose payload names gate "reading_due" skip a slot when nothing is due:
+    # gate(session, schedule, scheduled_for) returns None to launch the run, or a reason to skip it.
+    registry.add_schedule_gate("reading_due", reading_due_gate)
+
+    # In-process work with no model: a work item or schedule with worker_kind "function.shelf_sync"
+    # runs sync_shelf(work_item). Return a summary and produces; {"silent": True} keeps a quiet run
+    # off Discord. Do network calls before writes, so no write lock is held across them.
+    registry.add_function_worker("function.shelf_sync", sync_shelf)
 ```
 
 Patterns that work well:

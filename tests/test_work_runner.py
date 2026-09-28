@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import timedelta
 from pathlib import Path
 
+import pytest
 from opentelemetry.trace import SpanKind, StatusCode
 from sqlalchemy import select
 
@@ -147,6 +148,23 @@ def test_default_function_workers(fresh_db: Path) -> None:
             summary="Say it back.",
             produces={"title": "Echo", "task_instruction": "Say it back.", "context": {"k": 1}},
         )
+
+
+def test_extension_function_workers_run_without_replacing_built_ins(fresh_db: Path) -> None:
+    extension_registry().add_function_worker("function.count", lambda work: {"summary": "Counted", "n": 3})
+    extension_registry().add_function_worker("function.echo", lambda work: "hijacked")
+    with pytest.raises(ValueError):
+        extension_registry().add_function_worker("count", lambda work: None)
+    with session_scope() as session:
+        counted = _create(session, "Count", worker_kind="function.count", priority=1)
+        echo = _create(session, "Echo", task_instruction="Say it back.")
+        runner = WorkRunner(session)
+
+        assert runner.run_next().summary == "Counted"
+        attempt = session.scalar(select(WorkAttempt).where(WorkAttempt.work_item_id == counted.id))
+        assert attempt.produces == {"n": 3}
+        assert runner.run_next().summary == "Say it back."
+        assert session.get(WorkItem, echo.id).status == "succeeded"
 
 
 def test_normalize_worker_result_accepts_every_return_shape() -> None:

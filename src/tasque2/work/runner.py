@@ -51,6 +51,9 @@ class FunctionWorkerRegistry:
     def register(self, worker_kind: str, function: WorkerFunction) -> None:
         self._workers[worker_kind] = function
 
+    def __contains__(self, worker_kind: object) -> bool:
+        return worker_kind in self._workers
+
     def run(self, work_item: WorkItem) -> WorkerResult:
         function = self._workers.get(work_item.worker_kind)
         if function is None:
@@ -84,6 +87,12 @@ def default_function_registry() -> FunctionWorkerRegistry:
     registry.register("function.noop", _noop_worker)
     registry.register("function.echo", _echo_worker)
     registry.register("function.notify", _notify_worker)
+    from tasque2.extensions import registry as extension_registry
+
+    # Extension workers add kinds; they never replace a built-in one.
+    for worker_kind, function in extension_registry().function_workers.items():
+        if worker_kind not in registry:
+            registry.register(worker_kind, function)
     return registry
 
 

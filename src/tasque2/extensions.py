@@ -35,6 +35,7 @@ DigestBuild = Callable[[Any], dict[str, Any]]
 AttemptIngestor = Callable[[Any, Any, Any], Any]
 CanonicalKeyResolver = Callable[[Any, dict[str, Any]], list[str]]
 ScheduleGate = Callable[[Any, Any, Any], "str | None"]
+FunctionWorker = Callable[[Any], Any]
 
 
 class ExtensionError(RuntimeError):
@@ -51,6 +52,7 @@ class ExtensionRegistry:
     attempt_ingestors: list[tuple[str, AttemptIngestor]] = field(default_factory=list)
     migration_locations: list[Path] = field(default_factory=list)
     schedule_gates: dict[str, ScheduleGate] = field(default_factory=dict)
+    function_workers: dict[str, FunctionWorker] = field(default_factory=dict)
     extension_names: list[str] = field(default_factory=list)
 
     def add_context_digest(self, key: str, wants: DigestWants, build: DigestBuild) -> None:
@@ -82,6 +84,17 @@ class ExtensionRegistry:
         a wrong skip can cost a missed bill.
         """
         self.schedule_gates[name] = gate
+
+    def add_function_worker(self, worker_kind: str, worker: FunctionWorker) -> None:
+        """Run work items of ``worker_kind`` in-process with ``worker(work_item)``, no model.
+
+        The kind must start with ``function.``; a work item or schedule names it as its
+        ``worker_kind``. The worker returns what a built-in function worker returns (a
+        ``WorkerResult``, a dict or a string); ``produces.silent`` keeps a quiet run off Discord.
+        """
+        if not worker_kind.startswith("function."):
+            raise ValueError(f"Function worker kinds start with 'function.': {worker_kind!r}")
+        self.function_workers[worker_kind] = worker
 
     def add_migration_location(self, path: Path | str) -> None:
         """Add an Alembic version directory that upgrades together with the core one."""

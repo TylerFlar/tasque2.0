@@ -1,6 +1,6 @@
 [project]
 name = "tasque2"
-version = "0.2.0"
+version = "0.3.0"
 description = "Local-first work, workflow, schedule, memory, artifact, and Discord orchestration for model-backed workers."
 readme = "README.md"
 requires-python = ">=3.12"
