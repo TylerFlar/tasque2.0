@@ -626,6 +626,11 @@ def test_worker_contract_explains_the_threads_sticky_note() -> None:
     assert "`sticky_set` replaces its notes" in WORKER_CONTRACT
 
 
+def test_worker_contract_takes_plans_from_the_calendar_and_keeps_done_items_closed() -> None:
+    assert "a subscribed group's calendar is never" in WORKER_CONTRACT
+    assert "When the user says something is done, it is done" in WORKER_CONTRACT
+
+
 def test_worker_contract_keeps_the_run_one_shot_and_in_the_foreground() -> None:
     assert "The run is headless and one-shot." in WORKER_CONTRACT
     assert "Run everything in the foreground and wait for it." in WORKER_CONTRACT
