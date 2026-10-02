@@ -28,7 +28,7 @@ from tasque2.mcp.tools.schedules import (
     schedule_update,
 )
 from tasque2.mcp.tools.sticky import sticky_get, sticky_set
-from tasque2.mcp.tools.system import submit_worker_result, system_status, weather_now
+from tasque2.mcp.tools.system import submit_worker_result, system_health, system_status, weather_now
 from tasque2.mcp.tools.work import work_cancel, work_enqueue, work_events, work_get, work_list, work_retry
 from tasque2.mcp.tools.workflows import workflow_list, workflow_start
 
@@ -77,6 +77,7 @@ CORE_TOOLS = (
     sticky_set,
     weather_now,
     system_status,
+    system_health,
     submit_worker_result,
 )
 

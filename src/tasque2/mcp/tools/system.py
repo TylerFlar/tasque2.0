@@ -5,6 +5,7 @@ from typing import Any
 
 from tasque2.db import session_scope
 from tasque2.mcp.tools._shared import optional_string, required, run_json
+from tasque2.ops.health import build_system_health
 from tasque2.ops.status import get_system_status
 from tasque2.weather import fetch_local_weather
 from tasque2.worker import results
@@ -32,6 +33,20 @@ def weather_now(days: int = 3, intent: str = "") -> str:
 def system_status(intent: str = "") -> str:
     """Queue, schedule, and workflow counts."""
     return run_json(_status, intent=intent)
+
+
+def system_health(days: int = 7, intent: str = "") -> str:
+    """Tasque's own health over the last ``days`` days (1-60): whether the daemon is ticking,
+    failed attempts by lane (with error types and whether the items recovered), unresolved dead
+    letters, work stuck without a heartbeat, the longest runs, enabled schedules not being
+    evaluated, and sticky notes that never pinned. ``attention`` names what needs a person;
+    an empty list means all is well."""
+    return run_json(lambda: _health(days), intent=intent)
+
+
+def _health(days: int) -> dict[str, Any]:
+    with session_scope() as session:
+        return {"ok": True, **build_system_health(session, days=days)}
 
 
 def _submit(result_token, summary, report, produces, status, error) -> dict[str, Any]:
