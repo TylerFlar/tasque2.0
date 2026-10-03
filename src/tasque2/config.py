@@ -102,6 +102,7 @@ class Settings(BaseSettings):
     worker_tools: str | None = Field(default=None)
     worker_disallowed_tools: str | None = Field(default=None)
     worker_auto_memory: bool = Field(default=False)
+    worker_auto_compact_window: str = Field(default="auto")
     worker_exit_grace_seconds: float = Field(default=20.0)
     default_mcp_servers: str | None = Field(default=None)
 
@@ -177,6 +178,16 @@ class Settings(BaseSettings):
     @property
     def worker_disallowed_tool_list(self) -> list[str]:
         return _csv(self.worker_disallowed_tools)
+
+    @property
+    def worker_compact_window(self) -> str | int:
+        """``"auto"`` (Claude Code's window tuned for the model) or a window in tokens."""
+        value = self.worker_auto_compact_window.strip().lower()
+        if value == "auto":
+            return value
+        if not value.isdigit() or not 100_000 <= int(value) <= 1_000_000:
+            raise ValueError("TASQUE2_WORKER_AUTO_COMPACT_WINDOW must be 'auto' or 100000 to 1000000 tokens.")
+        return int(value)
 
     @property
     def default_mcp_server_list(self) -> list[str] | None:

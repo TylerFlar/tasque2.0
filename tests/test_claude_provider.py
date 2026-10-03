@@ -194,6 +194,37 @@ def test_auto_memory_setting_drops_the_settings_override(monkeypatch: pytest.Mon
     reset_settings()
 
     assert "--settings" not in _argv()
+    assert "autoMemoryEnabled" not in json.loads(_flag(_argv(model="claude-sonnet-5"), "--settings"))
+
+
+def test_workers_keep_their_compact_window_and_subagent_model_over_the_users() -> None:
+    settings = json.loads(_flag(_argv(model="claude-opus-5-5"), "--settings"))
+
+    assert settings == {
+        "autoMemoryEnabled": False,
+        "modelSettings": {"claude-opus-5-5": {"autoCompactWindow": "auto"}},
+        "env": {"CLAUDE_CODE_SUBAGENT_MODEL": "claude-opus-5-5"},
+    }
+
+
+def test_worker_compact_window_setting_sets_the_window_in_tokens(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TASQUE2_WORKER_AUTO_COMPACT_WINDOW", " 400000 ")
+    reset_settings()
+
+    settings = json.loads(_flag(_argv(model="claude-sonnet-5"), "--settings"))
+
+    assert settings["modelSettings"] == {"claude-sonnet-5": {"autoCompactWindow": 400000}}
+
+
+@pytest.mark.parametrize("value", ["300k", "99999", "1000001", "none"])
+def test_worker_compact_window_setting_must_be_auto_or_a_token_count(
+    monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    monkeypatch.setenv("TASQUE2_WORKER_AUTO_COMPACT_WINDOW", value)
+    reset_settings()
+
+    with pytest.raises(ValueError, match="TASQUE2_WORKER_AUTO_COMPACT_WINDOW"):
+        _argv(model="claude-sonnet-5")
 
 
 def test_deny_list_reaches_the_cli_as_one_deduplicated_value(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -450,7 +481,11 @@ def test_contract_keys_reach_the_claude_command_line(
     assert _flag(argv, "--max-turns") == "30"
     assert _flag(argv, "--max-budget-usd") == "1.5"
     assert Path(_flag(argv, "--append-system-prompt-file")).read_text(encoding="utf-8") == WORKER_CONTRACT
-    assert json.loads(_flag(argv, "--settings")) == {"autoMemoryEnabled": False}
+    assert json.loads(_flag(argv, "--settings")) == {
+        "autoMemoryEnabled": False,
+        "modelSettings": {"claude-opus-5-5": {"autoCompactWindow": "auto"}},
+        "env": {"CLAUDE_CODE_SUBAGENT_MODEL": "claude-opus-5-5"},
+    }
 
 
 def test_default_profile_runs_sonnet_at_medium_effort(fresh_db: Path, claude_process: FakeClaudeProcess) -> None:
