@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import os
 
-from tasque2.config import Settings, get_settings
+from tasque2.config import get_settings
 from tasque2.providers.base import ProviderRequest, ProviderResponse
 from tasque2.providers.mcp_config import TASQUE_MCP_SERVER_NAME, claude_mcp_config
 from tasque2.providers.process import run_process
@@ -57,9 +57,8 @@ class ClaudeCodeProvider:
             argv.extend(["--max-turns", str(request.max_turns)])
         if request.max_budget_usd:
             argv.extend(["--max-budget-usd", f"{request.max_budget_usd:g}"])
-        layered = _worker_settings(request.model, settings)
-        if layered:
-            argv.extend(["--settings", json.dumps(layered)])
+        if not settings.worker_auto_memory:
+            argv.extend(["--settings", json.dumps({"autoMemoryEnabled": False})])
         return argv
 
     def run(self, request: ProviderRequest) -> ProviderResponse:
@@ -175,22 +174,6 @@ def request_result_probe(request: ProviderRequest):
 
     token = request.result_token
     return lambda: results.peek(token)
-
-
-def _worker_settings(model: str | None, settings: Settings) -> dict:
-    """Settings layered over the user's own, so their interactive defaults stay out of workers.
-
-    The worker compacts on its own window and its subagents run on the worker's model, whatever
-    ``autoCompactWindow`` or ``CLAUDE_CODE_SUBAGENT_MODEL`` the user set for their sessions. The
-    window goes under ``modelSettings``: a top-level "auto" does not override a user's number.
-    """
-    layered: dict = {}
-    if not settings.worker_auto_memory:
-        layered["autoMemoryEnabled"] = False
-    if model:
-        layered["modelSettings"] = {model: {"autoCompactWindow": settings.worker_compact_window}}
-        layered["env"] = {"CLAUDE_CODE_SUBAGENT_MODEL": model}
-    return layered
 
 
 def _trace_env(env: dict[str, str]) -> dict[str, str]:
