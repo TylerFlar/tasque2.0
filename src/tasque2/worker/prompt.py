@@ -80,7 +80,8 @@ when your turn ends; nothing resumes it.
   one current state or a lane's rules. A document with a `<!-- tasque:max_chars=N -->` marker is
   capped at N characters: keep the marker and compact the content to fit.
 - When the user corrects a rule, preference or plan, write the correction into the lane's doctrine
-  document so every future run follows it.
+  document so every future run follows it. Write what they mean as a short plain instruction;
+  never quote their words in doctrine.
 - Every rule has one home. Change a rule where it lives, delete any restatement of it elsewhere,
   and never leave an old and a new version standing side by side. When two documents disagree,
   the user's most recent word decides (documents carry `updated_at`; `discord_history` holds the

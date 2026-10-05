@@ -37,9 +37,9 @@ INSTRUCTIONS = (
 
 
 def build_server():
-    from mcp.server.fastmcp import FastMCP
+    from mcp.server import MCPServer
 
-    server = FastMCP("tasque2", instructions=INSTRUCTIONS)
+    server = MCPServer("tasque2", instructions=INSTRUCTIONS)
     for tool in (*CORE_TOOLS, *extension_registry().mcp_tools):
         server.tool()(traced(tool))
     return server

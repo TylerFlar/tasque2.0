@@ -635,3 +635,7 @@ def test_worker_contract_keeps_the_run_one_shot_and_in_the_foreground() -> None:
     assert "The run is headless and one-shot." in WORKER_CONTRACT
     assert "Run everything in the foreground and wait for it." in WORKER_CONTRACT
     assert "Call `submit_worker_result` exactly once, as your last action" in WORKER_CONTRACT
+
+
+def test_worker_contract_writes_doctrine_in_plain_words() -> None:
+    assert "never quote their words in doctrine" in WORKER_CONTRACT

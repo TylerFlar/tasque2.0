@@ -71,6 +71,8 @@ Patterns that work well:
   quote computed numbers instead of keeping their own counts in memory.
 - **Tools** built with `tasque2.mcp.toolkit` (`run_json`, `session_scope`, `calling_work_item`,
   `required`, `optional_string`, ...) so they behave like core tools and are traced the same way.
+  A tool that starts a process passes `stdin=subprocess.DEVNULL`: on Windows the child otherwise
+  inherits the server's stdio pipe, and a call such as `git fetch` can hang until the client gives up.
 - **Local dates** from `tasque2.localtime.local_today` / `local_date`, so every ledger agrees on
   what "today" is.
 

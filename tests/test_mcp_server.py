@@ -54,13 +54,13 @@ def test_server_serves_every_core_tool_with_its_parameters() -> None:
     assert set(tools) == {tool.__name__ for tool in CORE_TOOLS}
     recall = tools["memory_recall"]
     assert recall.description == memory_recall.__doc__
-    assert recall.inputSchema["required"] == ["query"]
-    assert list(recall.inputSchema["properties"]) == ["query", "namespace", "tags", "limit", "intent"]
-    assert recall.inputSchema["properties"]["limit"]["default"] == 8
+    assert recall.input_schema["required"] == ["query"]
+    assert list(recall.input_schema["properties"]) == ["query", "namespace", "tags", "limit", "intent"]
+    assert recall.input_schema["properties"]["limit"]["default"] == 8
     submit = tools["submit_worker_result"]
     assert submit.description == submit_worker_result.__doc__
-    assert submit.inputSchema["required"] == ["result_token", "summary", "report"]
-    assert submit.inputSchema["properties"]["status"]["default"] == "succeeded"
+    assert submit.input_schema["required"] == ["result_token", "summary", "report"]
+    assert submit.input_schema["properties"]["status"]["default"] == "succeeded"
 
 
 def test_server_serves_extension_tools_beside_the_core() -> None:
@@ -73,7 +73,7 @@ def test_server_serves_extension_tools_beside_the_core() -> None:
 
     assert len(tools) == len(CORE_TOOLS) + 1
     assert tools["ledger_balance"].description == "Current balance of one ledger account."
-    assert tools["ledger_balance"].inputSchema["required"] == ["account"]
+    assert tools["ledger_balance"].input_schema["required"] == ["account"]
 
 
 def test_server_instructions_state_the_result_contract() -> None:
@@ -108,10 +108,10 @@ def test_tool_call_records_a_server_span_under_the_runs_traceparent(spans, monke
 def test_tool_called_through_the_server_is_traced(fresh_db: Path, spans, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("TRACEPARENT", TRACEPARENT)
 
-    _content, structured = asyncio.run(build_server().call_tool("system_status", {}))
+    result = asyncio.run(build_server().call_tool("system_status", {}))
 
     call = _call_span(spans, "system_status")
-    assert json.loads(structured["result"])["ok"] is True
+    assert json.loads(result.structured_content["result"])["ok"] is True
     assert f"{call.parent.span_id:016x}" == PARENT_SPAN_ID
     assert "error.type" not in call.attributes
 
