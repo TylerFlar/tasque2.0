@@ -7,11 +7,12 @@ from tasque2.mcp.tools._shared import calling_thread, optional_string, required,
 from tasque2.reminders import ReminderService
 
 
-def reminder_set(text: str, at: str, thread_id: str | None = None) -> str:
+def reminder_set(text: str, at: str, thread_id: str | None = None, silent: bool = False) -> str:
     """Keep a reminder the user asked for: at ``at`` (local ``YYYY-MM-DD``, or ``YYYY-MM-DDTHH:MM``)
     Tasque posts ``text`` into the thread, with no model run. A date alone posts late morning.
-    ``thread_id`` defaults to the thread this work answers in."""
-    return run_json(lambda: _set(text, at, thread_id))
+    ``thread_id`` defaults to the thread this work answers in. ``silent`` keeps it off Discord:
+    it is only listed (``reminder_list``), for a page that already shows the day's reminders."""
+    return run_json(lambda: _set(text, at, thread_id, silent))
 
 
 def reminder_list(days: int = 7, intent: str = "") -> str:
@@ -24,12 +25,14 @@ def reminder_cancel(reminder_id: str) -> str:
     return run_json(lambda: _cancel(reminder_id))
 
 
-def _set(text: str, at: str, thread_id: str | None) -> dict[str, Any]:
+def _set(text: str, at: str, thread_id: str | None, silent: bool = False) -> dict[str, Any]:
     with session_scope() as session:
         thread = optional_string(thread_id) or calling_thread(session)
         if not thread:
             raise ValueError("This work has no Discord thread; pass thread_id for where the reminder should post.")
-        reminder = ReminderService(session).set(required(text, "text"), required(at, "at"), thread_id=thread)
+        reminder = ReminderService(session).set(
+            required(text, "text"), required(at, "at"), thread_id=thread, silent=bool(silent)
+        )
         return {"ok": True, "reminder": reminder.data()}
 
 

@@ -927,3 +927,35 @@ def test_discord_history_returns_the_users_messages_in_a_lane_newest_first(fresh
     assert [item["content"] for item in lane] == ["TRIP does accept credit cards.", "Remind me to pay on the 26th."]
     assert [item["content"] for item in matched] == ["TRIP does accept credit cards."]
     assert [item["from"] for item in everything] == ["user", "tasque", "user"]
+
+
+def test_thread_rename_goes_through_the_bot_and_needs_its_token(fresh_db: Path, monkeypatch) -> None:
+    import httpx
+
+    from tasque2.config import reset_settings
+
+    calls: list[dict[str, Any]] = []
+
+    class Response:
+        status_code = 200
+        text = ""
+
+        def json(self) -> dict[str, Any]:
+            return {"name": calls[-1]["json"]["name"]}
+
+    def fake_patch(url: str, **kwargs: Any) -> Response:
+        calls.append({"url": url, **kwargs})
+        return Response()
+
+    monkeypatch.setattr(httpx, "patch", fake_patch)
+    refused = json.loads(tools.discord_thread_rename("123", "Money"))
+    assert refused["ok"] is False and "bot token" in refused["error"]
+
+    monkeypatch.setenv("TASQUE2_DISCORD_TOKEN", "bot-secret")
+    reset_settings()
+    renamed = _ok(tools.discord_thread_rename("123", "  Money   review "))
+
+    assert renamed == {"ok": True, "thread_id": "123", "name": "Money review"}
+    assert calls[0]["url"].endswith("/channels/123")
+    assert calls[0]["headers"] == {"Authorization": "Bot bot-secret"}
+    assert calls[0]["json"] == {"name": "Money review"}

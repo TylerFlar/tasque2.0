@@ -1,7 +1,9 @@
 """Reminders: one-shot messages the user asked for, posted at their time without a model run.
 
 A reminder is a date schedule whose worker is ``function.notify``: when it fires, the run
-posts its text into the Discord thread it names and costs nothing. A date without a time
+posts its text into the Discord thread it names and costs nothing. A silent reminder fires
+without posting: it exists to be listed, for example on a daily page that already shows the
+day's reminders, so it does not arrive twice. A date without a time
 posts at ``TASQUE2_REMINDER_DEFAULT_TIME`` (local). Reminders past their time are pruned
 after a month.
 """
@@ -32,6 +34,7 @@ class Reminder:
     text: str
     thread_id: str | None
     sent: bool
+    silent: bool = False
 
     def data(self) -> dict[str, Any]:
         return {
@@ -40,6 +43,7 @@ class Reminder:
             "text": self.text,
             "thread_id": self.thread_id,
             "sent": self.sent,
+            "silent": self.silent,
         }
 
 
@@ -48,8 +52,11 @@ class ReminderService:
         self.session = session
         self.schedules = ScheduleService(session)
 
-    def set(self, text: str, at: str, *, thread_id: str, now: datetime | None = None) -> Reminder:
-        """Keep a reminder that posts ``text`` into ``thread_id`` at ``at`` (local date or date and time)."""
+    def set(self, text: str, at: str, *, thread_id: str, silent: bool = False, now: datetime | None = None) -> Reminder:
+        """Keep a reminder that posts ``text`` into ``thread_id`` at ``at`` (local date or date and time).
+
+        ``silent`` keeps it from posting: it is only listed, by whatever shows the day's reminders.
+        """
         body = " ".join(text.split())
         if not body:
             raise ValueError("A reminder needs text.")
@@ -67,6 +74,7 @@ class ReminderService:
                 "discord_thread_id": thread_id,
                 "lane": REMINDER_LANE,
                 "max_attempts": 1,
+                **({"visible": False} if silent else {}),
             },
             timezone_name=str(when.tzinfo),
         )
@@ -114,6 +122,7 @@ class ReminderService:
             text=text,
             thread_id=payload.get("discord_thread_id"),
             sent=sent is not None,
+            silent=payload.get("visible") is False,
         )
 
 

@@ -2,7 +2,7 @@
 docstring are the schema the model sees."""
 
 from tasque2.mcp.tools.artifacts import artifact_capture_file, artifact_get, artifact_list, artifact_read_text
-from tasque2.mcp.tools.discord import discord_history
+from tasque2.mcp.tools.discord import discord_history, discord_thread_rename
 from tasque2.mcp.tools.images import image_compose, image_crop, image_fetch, image_find, image_save, image_send
 from tasque2.mcp.tools.memory import (
     memory_archive,
@@ -70,6 +70,7 @@ CORE_TOOLS = (
     workflow_list,
     workflow_start,
     discord_history,
+    discord_thread_rename,
     reminder_set,
     reminder_list,
     reminder_cancel,

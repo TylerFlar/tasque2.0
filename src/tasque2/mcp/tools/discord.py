@@ -8,7 +8,7 @@ from sqlalchemy import or_, select
 
 from tasque2.config import get_settings
 from tasque2.db import session_scope
-from tasque2.mcp.tools._shared import clamp, optional_string, run_json
+from tasque2.mcp.tools._shared import clamp, optional_string, required, run_json
 from tasque2.models import DiscordMessage, DiscordThread, WorkItem, utc_now
 
 
@@ -26,6 +26,37 @@ def discord_history(
     containing every word of ``query``, and look back ``days``. ``include_tasque`` adds
     Tasque's own posts for context."""
     return run_json(lambda: _history(lane, thread_id, query, days, limit, include_tasque), intent=intent)
+
+
+DISCORD_API = "https://discord.com/api/v10"
+THREAD_NAME_LIMIT = 100
+
+
+def discord_thread_rename(thread_id: str, name: str) -> str:
+    """Rename a Discord thread with Tasque's bot (it needs the Manage Threads permission there).
+
+    Thread and channel housekeeping goes through the bot, never through a scripted user account:
+    platforms disable user accounts that act like bots."""
+    return run_json(lambda: _rename(thread_id, name))
+
+
+def _rename(thread_id: str, name: str) -> dict[str, Any]:
+    import httpx
+
+    thread = required(thread_id, "thread_id")
+    title = " ".join(required(name, "name").split())[:THREAD_NAME_LIMIT]
+    token = get_settings().discord_token
+    if not token:
+        raise ValueError("No Discord bot token is configured (TASQUE2_DISCORD_TOKEN).")
+    response = httpx.patch(
+        f"{DISCORD_API}/channels/{thread}",
+        headers={"Authorization": f"Bot {token}"},
+        json={"name": title},
+        timeout=20,
+    )
+    if response.status_code >= 400:
+        raise ValueError(f"Discord refused the rename ({response.status_code}): {response.text[:300]}")
+    return {"ok": True, "thread_id": thread, "name": response.json().get("name", title)}
 
 
 def _history(

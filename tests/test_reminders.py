@@ -115,3 +115,35 @@ def test_reminder_tools_default_to_the_thread_the_work_answers_in(
     assert json.loads(tools.reminder_cancel(reminder_id=created["reminder"]["id"]))["ok"] is True
     with session_scope() as session:
         assert session.scalar(select(Schedule).where(Schedule.worker_kind == "function.notify")) is None
+
+
+def test_a_silent_reminder_fires_and_is_listed_but_never_posts(fresh_db: Path) -> None:
+    gateway = FakeDiscordGateway()
+    with session_scope() as session:
+        _thread(session)
+        reminder = ReminderService(session).set(
+            "Certify in UI Online", "2026-09-26T09:00", thread_id="thread-finance", silent=True, now=NOW
+        )
+        assert ScheduleService(session).poll_due_schedules(now=datetime(2026, 9, 26, 16, 0, tzinfo=UTC)) == 1
+        WorkRunner(session).run_next()
+        DiscordOutputService(session).post_pending_updates(gateway=gateway, channels=CHANNELS)
+
+        assert reminder.silent is True
+        assert gateway.sent_messages == []
+        [listed] = ReminderService(session).list(days=7, now=datetime(2026, 9, 26, 8, 0, tzinfo=UTC))
+        assert listed.silent is True
+        assert listed.data()["silent"] is True
+
+
+def test_the_reminder_tool_sets_silent_reminders(fresh_db: Path) -> None:
+    with session_scope() as session:
+        _thread(session)
+    later = (datetime.now(UTC) + timedelta(days=2)).strftime("%Y-%m-%dT09:00")
+
+    payload = json.loads(tools.reminder_set("Certify", later, thread_id="thread-finance", silent=True))
+
+    assert payload["ok"] is True
+    assert payload["reminder"]["silent"] is True
+    with session_scope() as session:
+        schedule = session.get(Schedule, payload["reminder"]["id"])
+        assert schedule.payload["visible"] is False
