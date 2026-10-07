@@ -97,6 +97,10 @@ def remove_worktrees(worktrees: list[RepoWorktree], *, delete_branches: bool) ->
         if tree.name == "core":
             shutil.rmtree(tree.path, ignore_errors=True)
             git(tree.live, "worktree", "prune", check=False)
+            try:
+                Path(tree.path).parent.rmdir()  # the repairs folder, once its last repair is gone
+            except OSError:
+                pass
 
 
 def live_changes(worktrees: list[RepoWorktree]) -> list[str]:

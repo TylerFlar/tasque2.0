@@ -173,6 +173,7 @@ def test_worktrees_cover_core_and_each_extension_and_notice_a_moving_live_checko
         _git(project, "checkout", "--", "src/app.py")
         remove_worktrees(trees, delete_branches=True)
     assert not Path(trees[0].path).exists()
+    assert not Path(trees[0].path).parent.exists()  # no empty repairs folder left behind
     assert _git(project, "branch", "--list", "repair/t1") == ""
 
 
