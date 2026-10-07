@@ -90,6 +90,14 @@ def build_workflow_controls_view(run: WorkflowRun) -> Any | None:
     return _view("workflow", run.id, buttons)
 
 
+def build_gate_card_view(workflow_run_id: str, choices: list[str]) -> Any | None:
+    """One button per gate choice: the first is the go-ahead, the rest plain."""
+    buttons = [
+        (choice, "success" if index == 0 else "secondary", str(index), None) for index, choice in enumerate(choices)
+    ]
+    return _view("gate", workflow_run_id, buttons)
+
+
 def build_ops_embed(status: SystemStatus) -> dict[str, Any]:
     ready, running = status.work_items.get("ready", 0), status.work_items.get("running", 0)
     paused, dead = status.work_items.get("paused", 0), status.work_items.get("dead_letter", 0)
@@ -201,7 +209,34 @@ class DiscordUIService:
             return self._work_action(action.action, action.entity_id)
         if action.scope == "workflow":
             return self._workflow_action(action.action, action.entity_id)
+        if action.scope == "gate":
+            return self._gate_choice(action.action, action.entity_id)
         return f"Unknown Tasque action: {action.scope}:{action.action}"
+
+    def _gate_choice(self, index: str, workflow_run_id: str) -> str:
+        """A gate card's button: answer the run's open gate with the chosen label."""
+        gates = [
+            node
+            for node in self.session.scalars(
+                select(WorkflowNode).where(
+                    WorkflowNode.workflow_run_id == workflow_run_id,
+                    WorkflowNode.kind == "gate",
+                    WorkflowNode.status == "awaiting_input",
+                )
+            ).all()
+            if (node.definition or {}).get("choices")
+        ]
+        if not gates:
+            return "That choice is no longer open."
+        choices = gates[0].definition["choices"]
+        try:
+            choice = str(choices[int(index)])
+        except (ValueError, IndexError):
+            raise ValueError(f"Unknown choice: {index}") from None
+        WorkflowService(self.session).answer_gate(
+            workflow_run_id=workflow_run_id, node_key=gates[0].node_key, answer=choice
+        )
+        return f"Chosen: {choice}"
 
     def answer_gate(self, *, workflow_run_id: str, answer: str, node_key: str | None = None) -> str:
         key = (node_key or "").strip()

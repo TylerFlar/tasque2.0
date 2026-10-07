@@ -1,9 +1,9 @@
 """Tasque's own health over a window: what failed, what is stuck, and whether the daemon is ticking.
 
-``build_system_health`` reads the work, attempt, dead-letter, schedule and sticky-note tables and
-the daemon's state file, and returns one report a health-check run can judge and word. Every
-count is computed here; the report names what needs attention in ``attention`` and leaves the
-wording to the caller.
+``build_system_health`` reads the work, attempt, dead-letter, schedule, workflow and sticky-note
+tables, the daemon's state file and its last restart, and returns one report a health-check run can
+judge and word. Every count is computed here; the report names what needs attention in
+``attention`` and leaves the wording to the caller.
 """
 
 from __future__ import annotations
@@ -15,8 +15,18 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from tasque2.daemon import restart
 from tasque2.daemon.control import read_state
-from tasque2.models import DiscordSticky, FailedWork, Schedule, WorkAttempt, WorkItem, utc_now
+from tasque2.models import (
+    DiscordSticky,
+    FailedWork,
+    Schedule,
+    WorkAttempt,
+    WorkflowNode,
+    WorkflowRun,
+    WorkItem,
+    utc_now,
+)
 from tasque2.ops.backup_runner import backup_health
 from tasque2.ops.faults import fault_summary, recurring
 
@@ -25,6 +35,8 @@ STUCK_MINUTES = 30
 LONG_RUN_MINUTES = 45
 STALE_SCHEDULE_MINUTES = 15
 MESSAGE_CHARS = 240
+GATE_WAIT_DAYS = 7
+RESTART_WAIT_DAYS = 2
 
 
 def _aware(value: datetime | None) -> datetime | None:
@@ -187,6 +199,72 @@ def _unpinned_stickies(session: Session) -> int:
     return len(rows)
 
 
+def _waiting_gates(session: Session, now: datetime) -> list[dict[str, Any]]:
+    """Workflow choices still waiting for the user, oldest first."""
+    rows = session.execute(
+        select(WorkflowNode, WorkflowRun)
+        .join(WorkflowRun, WorkflowRun.id == WorkflowNode.workflow_run_id)
+        .where(WorkflowNode.kind == "gate", WorkflowNode.status == "awaiting_input")
+        .order_by(WorkflowNode.updated_at)
+    ).all()
+    waiting = []
+    for node, run in rows:
+        since = _aware(node.updated_at) or now
+        waiting.append(
+            {
+                "workflow": run.name,
+                "gate": node.node_key,
+                "prompt": _clip((node.definition or {}).get("prompt")),
+                "since": _iso(since),
+                "days": (now - since).days,
+            }
+        )
+    return waiting
+
+
+def _restarts(session: Session, now: datetime, since: datetime) -> dict[str, Any]:
+    """A restart still waiting for its window, and the last restart's outcome when it fell in the window."""
+    report: dict[str, Any] = {"pending": None, "last": None, "attention": []}
+    request = restart.read_request()
+    if request is not None:
+        try:
+            requested = _aware(datetime.fromisoformat(str(request.get("requested_at"))))
+        except ValueError:
+            requested = None
+        waiting = restart.waiting_reason(session, request, now=now)
+        report["pending"] = {"reason": request.get("reason"), "requested_at": _iso(requested), "waiting": waiting}
+        if requested is not None and now - requested > timedelta(days=RESTART_WAIT_DAYS) and waiting:
+            report["attention"].append(
+                f"a restart ({request.get('reason')}) has waited since {requested:%Y-%m-%d}: {waiting}"
+            )
+    result = restart.read_result()
+    if result is not None:
+        try:
+            ended = _aware(datetime.fromisoformat(str(result.get("ended_at") or result.get("started_at"))))
+        except ValueError:
+            ended = None
+        if ended is not None and ended >= since:
+            report["last"] = {
+                "reason": result.get("reason"),
+                "at": _iso(ended),
+                "ok": bool(result.get("ok")),
+                "rolled_back": result.get("rolled_back") or [],
+                "error": _clip(result.get("error") or result.get("switch_error")),
+                "unpushed": [entry.get("repo") for entry in result.get("pushed") or [] if not entry.get("ok")],
+            }
+            last = report["last"]
+            if last["rolled_back"]:
+                report["attention"].append(
+                    f"the restart on {ended:%Y-%m-%d} ({last['reason']}) did not come up and was rolled back"
+                )
+            elif not last["ok"]:
+                detail = last["error"] or "see daemon.respawn.log"
+                report["attention"].append(f"the restart on {ended:%Y-%m-%d} ({last['reason']}) failed: {detail}")
+            if last["unpushed"]:
+                report["attention"].append(f"merged but not pushed: {', '.join(last['unpushed'])}")
+    return report
+
+
 def build_system_health(session: Session, *, days: int = 7, now: datetime | None = None) -> dict[str, Any]:
     """Tasque's health over the last ``days`` days, with what needs attention named."""
     now = _aware(now) or utc_now()
@@ -201,6 +279,8 @@ def build_system_health(session: Session, *, days: int = 7, now: datetime | None
     unpinned = _unpinned_stickies(session)
     faults = fault_summary(days=days, now=now)
     backups = backup_health(now=now)
+    gates = _waiting_gates(session, now)
+    restarts = _restarts(session, now, since)
     succeeded = session.scalars(
         select(WorkAttempt.id).where(WorkAttempt.created_at >= since, WorkAttempt.status == "succeeded")
     ).all()
@@ -227,6 +307,10 @@ def build_system_health(session: Session, *, days: int = 7, now: datetime | None
             what = fault.get("exc_type") or "error"
             attention.append(f"code fault x{fault['count']} on {fault['days']} day(s): {what} in {where}")
     attention.extend(f"backups: {line}" for line in backups["attention"])
+    for gate in gates:
+        if gate["days"] >= GATE_WAIT_DAYS:
+            attention.append(f"{gate['workflow']} has waited {gate['days']} days for a choice: {gate['prompt']}")
+    attention.extend(restarts["attention"])
 
     totals: dict[str, Any] = defaultdict(int)
     totals["succeeded_attempts"] = len(succeeded)
@@ -245,4 +329,6 @@ def build_system_health(session: Session, *, days: int = 7, now: datetime | None
         "unpinned_stickies": unpinned,
         "faults": faults[:12],
         "backups": backups,
+        "waiting_choices": gates,
+        "restarts": {key: value for key, value in restarts.items() if key != "attention"},
     }

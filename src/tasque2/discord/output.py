@@ -26,6 +26,7 @@ from tasque2.discord.routing import DiscordService
 from tasque2.discord.ui import (
     CONTROL_PANEL_ENTITY_ID,
     CONTROL_PANEL_VERSION,
+    build_gate_card_view,
     build_ops_embed,
     build_sticky_embed,
     build_work_controls_view,
@@ -93,7 +94,44 @@ class DiscordOutputService:
             channel_id = channels.dlq if work_item.status == "dead_letter" else channels.jobs
             self.post_work_result(work_item_id=work_item.id, channel_id=channel_id, gateway=gateway)
             posted += 1
+        if not quiet:
+            posted += self.post_gate_cards(gateway=gateway)
         self.refresh_stickies(gateway=gateway)
+        return posted
+
+    def post_gate_cards(self, *, gateway: DiscordGateway) -> int:
+        """A gate that offers ``choices`` posts one card, with a button per choice, into its run's thread."""
+        nodes = self.session.scalars(
+            select(WorkflowNode).where(WorkflowNode.kind == "gate", WorkflowNode.status == "awaiting_input")
+        ).all()
+        posted = 0
+        for node in nodes:
+            choices = (node.definition or {}).get("choices")
+            run = node.workflow_run
+            if not choices or run is None or not run.discord_thread_id:
+                continue
+            if self._already_posted("discord.gate_card_posted", node.id, "awaiting_input"):
+                continue
+            card = (node.input or {}).get("card") or (node.definition or {}).get("prompt")
+            chunks = split_markdown(str(card or f"{run.name} is waiting for a choice."), MESSAGE_LIMIT)
+            sent = None
+            for index, content in enumerate(chunks):
+                last = index == len(chunks) - 1
+                sent = gateway.send_message(
+                    channel_id=run.discord_thread_id,
+                    content=content,
+                    view=build_gate_card_view(run.id, list(choices)) if last else None,
+                )
+                self._record_outbound(sent, content=content, thread_id=run.discord_thread_id, workflow_run_id=run.id)
+            self._event(
+                "discord.gate_card_posted",
+                "workflow_node",
+                node.id,
+                workflow_run_id=run.id,
+                summary=f"Posted the gate card for {node.node_key}",
+                payload={"status": "awaiting_input", "discord_message_id": sent.message_id if sent else None},
+            )
+            posted += 1
         return posted
 
     def ensure_control_panel(self, *, channel_id: str, gateway: DiscordGateway) -> DiscordSentMessage | None:

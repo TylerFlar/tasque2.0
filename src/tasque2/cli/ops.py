@@ -455,6 +455,35 @@ def backup_status(as_json: Annotated[bool, typer.Option("--json")] = False) -> N
         echo(f"attention: {line}")
 
 
+@app.command("privacy-scan")
+def privacy_scan(
+    base: Annotated[str, typer.Option("--base", help="Commit the range starts after.")] = "origin/main",
+    head: Annotated[str, typer.Option("--head", help="Commit the range ends at.")] = "HEAD",
+    repo: Annotated[Path | None, typer.Option("--repo", help="Repository (default: the project).")] = None,
+) -> None:
+    """Refuse personal data in what a push would publish: emails, long ids, phones, home paths, denylist terms."""
+    from tasque2.ops.privacy import scan_range
+
+    root = (repo or get_settings().resolved_project_dir).resolve()
+    findings = scan_range(root, base, head)
+    for finding in findings:
+        echo(f"{finding.where}: {finding.kind} {finding.match!r}  | {finding.line}")
+    if findings:
+        raise fail(f"{len(findings)} possible personal detail(s) in {base}..{head}; nothing should be pushed.")
+    echo(f"privacy scan clean: {base}..{head}")
+
+
+@app.command("privacy-hook-install")
+def privacy_hook_install(
+    repo: Annotated[Path | None, typer.Option("--repo", help="Repository (default: the project).")] = None,
+) -> None:
+    """Put the privacy scan in front of every git push from this repository."""
+    from tasque2.ops.privacy import install_hook
+
+    path = install_hook((repo or get_settings().resolved_project_dir).resolve())
+    echo(f"pre-push hook: {path}")
+
+
 @app.command("effort")
 def effort(
     days: Annotated[int, typer.Option("--days", "-d", help="Window in days.")] = 30,

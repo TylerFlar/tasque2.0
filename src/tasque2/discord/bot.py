@@ -113,6 +113,13 @@ class TasqueBot(discord.Client):
             content = await asyncio.to_thread(_run_ui_action, action)
         except Exception as exc:  # noqa: BLE001 - report the failure to the clicker
             content = f"Tasque action failed: {exc}"
+        if action.scope == "gate" and content.startswith("Chosen: ") and interaction.message is not None:
+            try:  # the card keeps its text, shows the choice, and loses its buttons
+                await interaction.message.edit(
+                    content=f"{interaction.message.content}\n\n**{content}**"[:2000], view=None
+                )
+            except discord.HTTPException:
+                pass
         await interaction.followup.send(content=content[:1900], ephemeral=True)
 
     async def close(self) -> None:

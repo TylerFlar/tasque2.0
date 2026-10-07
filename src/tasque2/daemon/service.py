@@ -16,7 +16,7 @@ from collections.abc import Callable
 
 import tasque2
 from tasque2.config import Settings, get_settings
-from tasque2.daemon import control
+from tasque2.daemon import control, restart
 from tasque2.daemon.pool import WorkPool
 from tasque2.daemon.tick import DaemonTick, TickResult
 from tasque2.db import session_scope
@@ -43,6 +43,7 @@ class Daemon:
         self.discord = discord
         self._stop: asyncio.Event | None = None
         self._stop_requests = 0
+        self._restart_wait: str | None = None
 
     async def run(self) -> None:
         self._stop = asyncio.Event()
@@ -98,7 +99,29 @@ class Daemon:
                 logger.exception("Could not write the daemon state file")
             if draining and self.pool.in_flight_count() == 0:
                 return
+            if not draining and self.pool.in_flight_count() == 0 and await asyncio.to_thread(self._restart_due):
+                try:
+                    restart.spawn_respawn(pid=os.getpid())
+                except OSError:
+                    logger.exception("Could not start the respawn process; the restart request is dropped")
+                    restart.clear_request()
+                else:
+                    logger.info("Restarting at a quiet moment: the respawn process takes over")
+                    return
             await self._sleep(draining)
+
+    def _restart_due(self) -> bool:
+        """A restart was requested and its window is open (logged once per change while it waits)."""
+        request = restart.read_request()
+        if request is None:
+            self._restart_wait = None
+            return False
+        with session_scope() as session:
+            reason = restart.waiting_reason(session, request)
+        if reason and reason != self._restart_wait:
+            logger.info("Restart requested (%s); waiting: %s", request.get("reason"), reason)
+        self._restart_wait = reason
+        return reason is None
 
     def _tick_once(self, *, claim: bool) -> TickResult:
         with session_scope() as session:

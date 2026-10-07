@@ -43,6 +43,8 @@ TERMINAL_RUN_STATUSES = {"completed", "failed", "canceled"}
 TERMINAL_NODE_STATUSES = {"succeeded", "failed", "failed_tolerated", "canceled"}
 COMPLETED_NODE_STATUSES = {"succeeded", "failed_tolerated"}
 NODE_KINDS = {"work", "fan_out", "join", "gate"}
+GATE_CHOICES_MAX = 5  # one Discord row of buttons
+GATE_CHOICE_CHARS = 80  # a Discord button label
 _TEMPLATE_KEYS = (
     ("task_template_path", "task_instruction"),
     ("child_task_template_path", "child_task_instruction_template"),
@@ -320,6 +322,11 @@ class WorkflowService:
         elif node.kind == "gate":
             node.status = "awaiting_input"
             run.status = "awaiting_input"
+            card_from = node.definition.get("card_from")
+            if card_from:
+                card = self._output_reference(run, card_from)
+                if card not in (None, ""):
+                    node.input = {**(node.input or {}), "card": str(card)}
             self._event(
                 "workflow.gate_waiting",
                 run,
@@ -440,20 +447,24 @@ class WorkflowService:
     def _fan_out_items(self, run: WorkflowRun, node_def: dict[str, Any]) -> Any:
         if "items_from_output" not in node_def:
             return run.input.get(str(node_def.get("items_from", "items")), [])
-        reference = node_def["items_from_output"]
+        items = self._output_reference(run, node_def["items_from_output"])
+        return [] if items is None else items
+
+    def _output_reference(self, run: WorkflowRun, reference: Any) -> Any:
+        """Resolve ``"<node>.<path>"`` (or ``{"node", "path"}``) against an upstream node's output."""
         if isinstance(reference, str):
             node_key, _, path = reference.partition(".")
         elif isinstance(reference, dict):
             node_key, path = str(reference.get("node") or ""), str(reference.get("path") or "")
         else:
-            return []
+            return None
         if not node_key:
-            return []
+            return None
         node = self.session.scalar(
             select(WorkflowNode).where(WorkflowNode.workflow_run_id == run.id, WorkflowNode.node_key == node_key)
         )
         if node is None:
-            return []
+            return None
         return _output_path(node.output or {}, path)
 
     def _dependencies_satisfied(self, node: WorkflowNode) -> bool:
@@ -595,10 +606,20 @@ def validate_definition(definition: dict[str, Any]) -> None:
         kind = str(node.get("kind", "work"))
         if kind not in NODE_KINDS:
             raise ValueError(f"Unsupported workflow node kind: {kind}")
+        if "choices" in node and not _valid_choices(kind, node["choices"]):
+            raise ValueError(
+                f"Gate {key}: choices must be 2-{GATE_CHOICES_MAX} labels of {GATE_CHOICE_CHARS} characters or fewer."
+            )
     for node in nodes:
         for dependency in node.get("depends_on", []):
             if str(dependency) not in keys:
                 raise ValueError(f"Unknown workflow dependency: {dependency}")
+
+
+def _valid_choices(kind: str, choices: Any) -> bool:
+    if kind != "gate" or not isinstance(choices, list) or not 2 <= len(choices) <= GATE_CHOICES_MAX:
+        return False
+    return all(isinstance(choice, str) and 0 < len(choice.strip()) <= GATE_CHOICE_CHARS for choice in choices)
 
 
 def node_instruction(

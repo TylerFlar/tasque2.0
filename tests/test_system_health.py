@@ -4,12 +4,16 @@ import json
 from datetime import timedelta
 from pathlib import Path
 
+from sqlalchemy import update
+
 from tasque2.daemon.control import state_path, write_state
+from tasque2.daemon.restart import request_path, result_path
 from tasque2.db import session_scope
 from tasque2.mcp import tools
-from tasque2.models import FailedWork, Schedule, WorkAttempt, utc_now
+from tasque2.models import FailedWork, Schedule, WorkAttempt, WorkflowNode, utc_now
 from tasque2.ops.health import build_system_health
 from tasque2.work.repository import WorkRepository
+from tasque2.workflows import WorkflowService
 
 
 def _item(session, title: str, lane: str, status: str):
@@ -130,3 +134,54 @@ def test_the_tool_reports_the_same(fresh_db: Path) -> None:
     data = json.loads(tools.system_health(days=3, intent="weekly check"))
     assert data["ok"] is True and data["window"]["days"] == 3 and data["attention"] == []
     assert state_path().exists()
+
+
+def test_a_rolled_back_restart_a_stalled_one_and_a_long_waiting_choice_are_named(fresh_db: Path) -> None:
+    write_state(started_at=utc_now(), in_flight_attempt_ids=[], draining=False, version="t")
+    now = utc_now()
+    result_path().write_text(
+        json.dumps(
+            {
+                "reason": "repair 1",
+                "ok": False,
+                "rolled_back": ["core"],
+                "pushed": [],
+                "ended_at": (now - timedelta(days=1)).isoformat(),
+            }
+        ),
+        encoding="utf-8",
+    )
+    request_path().write_text(
+        json.dumps(
+            {"requested_at": (now - timedelta(days=3)).isoformat(), "reason": "repair 2", "window": "now", "switch": []}
+        ),
+        encoding="utf-8",
+    )
+    with session_scope() as session:
+        _item(session, "Queued", "daybook", "ready")
+        service = WorkflowService(session)
+        definition = service.create_definition(
+            name="repair",
+            version="1",
+            definition={"nodes": [{"key": "approve", "kind": "gate", "prompt": "Merge?", "choices": ["Yes", "No"]}]},
+        )
+        service.start_run(workflow_definition_id=definition.id)
+        service.tick_runs()
+        session.execute(update(WorkflowNode).values(updated_at=now - timedelta(days=8)))
+        health = build_system_health(session, now=now)
+
+    attention = health["attention"]
+    assert any("did not come up and was rolled back" in line for line in attention)
+    assert any("a restart (repair 2) has waited since" in line and "work is waiting" in line for line in attention)
+    assert any("repair has waited 8 days for a choice: Merge?" in line for line in attention)
+    assert health["restarts"]["pending"]["waiting"] == "work is waiting"
+    assert health["waiting_choices"][0]["gate"] == "approve"
+
+
+def test_an_old_restart_outcome_is_not_raised_again(fresh_db: Path) -> None:
+    write_state(started_at=utc_now(), in_flight_attempt_ids=[], draining=False, version="t")
+    old = (utc_now() - timedelta(days=10)).isoformat()
+    result_path().write_text(json.dumps({"reason": "x", "ok": False, "ended_at": old}), encoding="utf-8")
+    with session_scope() as session:
+        health = build_system_health(session)
+    assert health["attention"] == [] and health["restarts"]["last"] is None

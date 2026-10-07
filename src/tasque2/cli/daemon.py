@@ -70,6 +70,19 @@ def daemon_stop(
     raise fail("Timed out waiting for the daemon to stop; the drain request stays in place.")
 
 
+@app.command("daemon-restart")
+def daemon_restart(
+    now: Annotated[bool, typer.Option("--now", help="Restart at the next idle moment, not the small hours.")] = False,
+    reason: Annotated[str, typer.Option("--reason", help="Why, for the log.")] = "requested from the command line",
+) -> None:
+    """Ask the daemon to restart itself at a quiet moment (it drains, then a respawn process starts it again)."""
+    from tasque2.daemon.restart import request_restart
+
+    path = request_restart(reason=reason, window="now" if now else "quiet")
+    when = "the next idle moment" if now else "the next quiet moment in the small hours"
+    console.print(f"Restart requested ({path.name}): the daemon restarts at {when}.")
+
+
 @app.command("tick")
 def tick(
     max_claims: Annotated[int | None, typer.Option("--max-claims")] = None,

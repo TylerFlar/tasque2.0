@@ -465,7 +465,9 @@ class ScheduleService:
 
 def core_schedule_gates() -> dict[str, Any]:
     """Gates the core provides for its own schedules; they win over an extension gate of the same name."""
-    return {}
+    from tasque2.ops.repair import REPAIR_GATE, repair_gate
+
+    return {REPAIR_GATE: repair_gate}
 
 
 def _work_fields(schedule: Schedule) -> dict[str, Any]:
