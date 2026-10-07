@@ -308,7 +308,7 @@ class ScheduleService:
             return None
         from tasque2.extensions import registry
 
-        gate = registry().schedule_gates.get(name)
+        gate = core_schedule_gates().get(name) or registry().schedule_gates.get(name)
         if gate is None:
             logger.warning("Schedule %s names unknown gate %r; running it", schedule.name, name)
             return None
@@ -461,6 +461,11 @@ class ScheduleService:
             summary=summary,
             payload=payload,
         )
+
+
+def core_schedule_gates() -> dict[str, Any]:
+    """Gates the core provides for its own schedules; they win over an extension gate of the same name."""
+    return {}
 
 
 def _work_fields(schedule: Schedule) -> dict[str, Any]:

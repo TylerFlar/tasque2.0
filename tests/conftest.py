@@ -50,6 +50,8 @@ def isolated(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
     monkeypatch.setenv("TASQUE2_DATA_DIR", str(tmp_path / "data"))
     monkeypatch.setenv("TASQUE2_EXTENSIONS_DIR", str(tmp_path / "extensions"))
     monkeypatch.setenv("TASQUE2_ALLOW_TEST_PROVIDERS", "true")
+    # Off unless a test turns it on: output tests must not depend on the time of day they run.
+    monkeypatch.setenv("TASQUE2_QUIET_HOURS", "")
     _reset_process_state()
     _SPAN_EXPORTER.clear()
     yield tmp_path

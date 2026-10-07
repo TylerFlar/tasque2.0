@@ -17,6 +17,8 @@ from sqlalchemy.orm import Session
 
 from tasque2.daemon.control import read_state
 from tasque2.models import DiscordSticky, FailedWork, Schedule, WorkAttempt, WorkItem, utc_now
+from tasque2.ops.backup_runner import backup_health
+from tasque2.ops.faults import fault_summary, recurring
 
 FAILED_ATTEMPTS = ("failed", "expired", "orphaned")
 STUCK_MINUTES = 30
@@ -197,6 +199,8 @@ def build_system_health(session: Session, *, days: int = 7, now: datetime | None
     long_runs = _long_runs(session, since)
     stale = _stale_schedules(session, now) if daemon.get("alive") else []
     unpinned = _unpinned_stickies(session)
+    faults = fault_summary(days=days, now=now)
+    backups = backup_health(now=now)
     succeeded = session.scalars(
         select(WorkAttempt.id).where(WorkAttempt.created_at >= since, WorkAttempt.status == "succeeded")
     ).all()
@@ -216,6 +220,13 @@ def build_system_health(session: Session, *, days: int = 7, now: datetime | None
         attention.append(f"{len(stale)} enabled schedule(s) not evaluated in {STALE_SCHEDULE_MINUTES} min")
     if unpinned:
         attention.append(f"{unpinned} sticky note(s) posted but not pinned")
+    for fault in faults:
+        if recurring(fault):
+            frame = fault.get("frame") or {}
+            where = f"{frame.get('file')}:{frame.get('function')}"
+            what = fault.get("exc_type") or "error"
+            attention.append(f"code fault x{fault['count']} on {fault['days']} day(s): {what} in {where}")
+    attention.extend(f"backups: {line}" for line in backups["attention"])
 
     totals: dict[str, Any] = defaultdict(int)
     totals["succeeded_attempts"] = len(succeeded)
@@ -232,4 +243,6 @@ def build_system_health(session: Session, *, days: int = 7, now: datetime | None
         "long_runs": long_runs,
         "stale_schedules": stale,
         "unpinned_stickies": unpinned,
+        "faults": faults[:12],
+        "backups": backups,
     }

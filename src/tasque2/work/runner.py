@@ -87,6 +87,8 @@ def default_function_registry() -> FunctionWorkerRegistry:
     registry.register("function.noop", _noop_worker)
     registry.register("function.echo", _echo_worker)
     registry.register("function.notify", _notify_worker)
+    for worker_kind, function in core_function_workers().items():
+        registry.register(worker_kind, function)
     from tasque2.extensions import registry as extension_registry
 
     # Extension workers add kinds; they never replace a built-in one.
@@ -94,6 +96,13 @@ def default_function_registry() -> FunctionWorkerRegistry:
         if worker_kind not in registry:
             registry.register(worker_kind, function)
     return registry
+
+
+def core_function_workers() -> dict[str, WorkerFunction]:
+    """No-model workers the core itself provides for its own schedules."""
+    from tasque2.ops.backup_runner import backup_worker
+
+    return {"function.backup": backup_worker}
 
 
 def _manual_worker(work_item: WorkItem) -> WorkerResult:

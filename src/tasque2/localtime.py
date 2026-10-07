@@ -8,7 +8,7 @@ extensions share these helpers so every ledger agrees on what "today" means.
 
 from __future__ import annotations
 
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, time
 from zoneinfo import ZoneInfo
 
 from tasque2.config import get_settings
@@ -30,3 +30,33 @@ def _to_local(value: datetime) -> datetime:
     except Exception:  # noqa: BLE001 - settings/tz problems must not break date math
         return value
     return value.astimezone(zone)
+
+
+def quiet_window() -> tuple[time, time] | None:
+    """The configured quiet hours as (start, end) local times, or None when they are off.
+
+    ``TASQUE2_QUIET_HOURS`` reads "HH:MM-HH:MM" (default 22:00-08:00); an empty value turns
+    quiet hours off. A window may cross midnight.
+    """
+    raw = (get_settings().quiet_hours or "").strip()
+    if not raw:
+        return None
+    try:
+        start_text, end_text = (part.strip() for part in raw.split("-", 1))
+        start, end = time.fromisoformat(start_text), time.fromisoformat(end_text)
+    except ValueError:
+        return None
+    return (start, end) if start != end else None
+
+
+def in_quiet_hours(value: datetime | None = None) -> bool:
+    """Whether a moment (default now) falls inside the configured quiet hours, local time."""
+    window = quiet_window()
+    if window is None:
+        return False
+    moment = value or datetime.now(UTC)
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=UTC)
+    local = _to_local(moment).time()
+    start, end = window
+    return start <= local < end if start < end else local >= start or local < end

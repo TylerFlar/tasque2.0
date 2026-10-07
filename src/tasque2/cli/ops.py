@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 import os
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -350,6 +352,158 @@ def backup_restore(
     echo(f"restored: {result.restored_database_path} ({status.current_display})")
     if result.previous_database_backup:
         echo(f"previous database kept at: {result.previous_database_backup}")
+
+
+@app.command("backup-init")
+def backup_init(
+    repository: Annotated[str, typer.Argument(help="Where the restic repository lives, e.g. F:/TasqueBackups/restic.")],
+    restic_binary: Annotated[str | None, typer.Option("--restic", help="Path to the restic binary.")] = None,
+) -> None:
+    """Set up scheduled backups: a starter data/backup.toml, a stored password and the repository."""
+    from tasque2.ops import backup_runner
+
+    path = backup_runner.write_starter_config(repository)
+    if restic_binary:
+        text = path.read_text(encoding="utf-8")
+        binary = Path(restic_binary).as_posix()
+        path.write_text(text.replace('restic = "restic"', f'restic = "{binary}"', 1), encoding="utf-8")
+    try:
+        config = backup_runner.load_config(path)
+    except backup_runner.BackupConfigError as exc:
+        raise fail(str(exc)) from None
+    _password, created = backup_runner.ensure_password()
+    result = backup_runner.init_repository(config)
+    if not result.ok:
+        raise fail(f"restic init failed: {result.stderr.strip() or result.stdout.strip()}")
+    echo(f"config: {path}")
+    echo(f"repository: {config.repository}")
+    where = f"{backup_runner.KEYRING_SERVICE}/{backup_runner.KEYRING_USER} in the system credential store"
+    echo(f"password: {'created and stored' if created else 'already stored'} as {where}")
+    if created:
+        echo("Copy that password into your password manager: without it the backups cannot be read.")
+
+
+@app.command("backup-run")
+def backup_run(
+    dry_run: Annotated[bool, typer.Option("--dry-run", help="Show what would be backed up; change nothing.")] = False,
+    maintenance: Annotated[bool, typer.Option("--maintenance", help="Prune and check now.")] = False,
+    restore_test: Annotated[bool, typer.Option("--restore-test", help="Restore and verify the database now.")] = False,
+    as_json: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    """Run a backup now (the daemon's tasque-backup schedule does this nightly)."""
+    from tasque2.migrations import upgrade_database
+    from tasque2.ops.backup_runner import run_backup
+
+    upgrade_database()
+    run = run_backup(dry_run=dry_run, force_maintenance=maintenance, force_restore_test=restore_test)
+    if as_json:
+        emit_json(run)
+    else:
+        _print_backup_run(run)
+    if not run["ok"]:
+        raise typer.Exit(code=1)
+
+
+@app.command("backup-verify")
+def backup_verify(as_json: Annotated[bool, typer.Option("--json")] = False) -> None:
+    """Check the repository and restore-test the latest database snapshot, without backing up."""
+    from tasque2.ops import backup_runner
+
+    try:
+        config = backup_runner.load_config()
+    except backup_runner.BackupConfigError as exc:
+        raise fail(str(exc)) from None
+    out = {"maintenance": backup_runner.maintenance(config), "restore_test": backup_runner.restore_test(config)}
+    state = backup_runner.read_state()
+    now = datetime.now(UTC).isoformat()
+    state.update(
+        last_check_at=now,
+        last_check_ok=out["maintenance"]["ok"],
+        last_restore_test_at=now,
+        last_restore_test_ok=out["restore_test"]["ok"],
+    )
+    backup_runner.write_state(state)
+    if as_json:
+        emit_json(out)
+    else:
+        for name, part in out.items():
+            details = json.dumps({key: value for key, value in part.items() if key != "ok"})
+            echo(f"{name}: {'ok' if part['ok'] else 'FAILED'} {details}")
+    if not all(part["ok"] for part in out.values()):
+        raise typer.Exit(code=1)
+
+
+@app.command("backup-status")
+def backup_status(as_json: Annotated[bool, typer.Option("--json")] = False) -> None:
+    """When the last backup ran, whether it worked, and what needs attention."""
+    from tasque2.ops.backup_runner import backup_health, read_state
+
+    health = backup_health()
+    if as_json:
+        emit_json({"health": health, "state": read_state()})
+        return
+    if not health["configured"]:
+        echo("backups are not configured: run `tasque2 backup-init <repository>`")
+        for line in health["attention"]:
+            echo(f"attention: {line}")
+        return
+    echo(f"last good backup: {health['last_success_at'] or 'never'} ({health['age_hours']} h ago)")
+    echo(f"last snapshot: {health['last_snapshot_id'] or '-'}")
+    echo(f"last check: {health['last_check_at'] or 'never'}")
+    echo(f"last restore test: {health['last_restore_test_at'] or 'never'}")
+    for line in health["attention"] or ["nothing needs attention"]:
+        echo(f"attention: {line}")
+
+
+@app.command("effort")
+def effort(
+    days: Annotated[int, typer.Option("--days", "-d", help="Window in days.")] = 30,
+    as_json: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    """What Tasque asks of its user, per thread: posts a week, ask share, quiet-hour posts, pushback."""
+    from tasque2.ops.effort import effort_report
+
+    with cli_session_scope() as session:
+        report = effort_report(session, days=days)
+    if as_json:
+        emit_json(report)
+        return
+    totals = report["totals"]
+    echo(
+        f"{report['window']['days']} days: {totals['posts']} posts ({totals['posts_per_week']}/week), "
+        f"{totals['ask_share']:.0%} ask something, {totals['quiet_hours_share']:.0%} in quiet hours; "
+        f"{totals['inbound']} messages back, {totals['pushback']} pushback"
+    )
+    table = PlainTable("Thread", "Posts/wk", "Median chars", "Asks", "Quiet hrs", "Inbound", "Pushback")
+    for row in report["threads"]:
+        table.add_row(
+            row["label"],
+            str(row["posts_per_week"]),
+            str(row["median_chars"]),
+            f"{row['ask_share']:.0%}",
+            f"{row['quiet_hours_share']:.0%}",
+            str(row["inbound"]),
+            str(row["pushback"]),
+        )
+    console.print(table)
+
+
+def _print_backup_run(run: dict[str, Any]) -> None:
+    backup = run.get("backup") or {}
+    status = "ok" if run["ok"] else "FAILED"
+    added = backup.get("data_added")
+    size = f", {added / 1_000_000:.1f} MB added" if isinstance(added, int | float) else ""
+    dry = " (dry run)" if run.get("dry_run") else ""
+    echo(f"backup {status}{dry}: snapshot {backup.get('snapshot_id') or '-'}{size}, {backup.get('seconds', 0)} s")
+    if run.get("error") or backup.get("error"):
+        echo(f"error: {run.get('error') or backup.get('error')}")
+    database = run.get("database") or {}
+    echo(f"database: {database.get('error') or database.get('check') or '-'}")
+    for source in run.get("missing_sources") or []:
+        echo(f"missing source (skipped): {source}")
+    for part in ("maintenance", "restore_test"):
+        if part in run:
+            echo(f"{part}: {'ok' if run[part]['ok'] else 'FAILED'}")
 
 
 @app.command("reset-jobs")
