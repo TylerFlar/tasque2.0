@@ -21,6 +21,7 @@ from tasque2.ops.backup_runner import (
     ResticResult,
     backup_health,
     backup_worker,
+    excluded_by,
     read_state,
     run_backup,
     stage_dir,
@@ -64,7 +65,7 @@ class FakeRestic:
             return ResticResult(True, '{"message_type":"status"}\n' + json.dumps(summary) + "\n", "", 1.0)
         if command == "restore":
             target = Path(args[args.index("--target") + 1])
-            copy = target / "G" / "data" / "runtime" / "backup-stage"
+            copy = target / "G" / "data" / "backup" / "stage"
             copy.mkdir(parents=True)
             shutil.copy2(stage_dir() / "tasque2.sqlite3", copy / "tasque2.sqlite3")
             manifest = json.loads((stage_dir() / "manifest.json").read_text(encoding="utf-8"))
@@ -250,3 +251,32 @@ def test_backup_status_explains_how_to_start_when_unconfigured(isolated: Path) -
     result = CliRunner().invoke(app, ["backup-status"])
     assert result.exit_code == 0
     assert "backup-init" in result.output
+
+
+def test_a_config_that_excludes_the_database_stage_is_refused(configured, fake_restic) -> None:
+    data = get_settings().resolved_data_dir.as_posix()
+    config = BackupConfig(repository=configured.repository, sources=configured.sources, excludes=[data])
+
+    run = run_backup(config=config)
+
+    assert run["ok"] is False
+    assert "leaves the database snapshot out" in run["error"]
+    assert fake_restic.calls == []  # nothing ran on a config that would back up an empty stage
+
+
+def test_excluded_by_matches_parents_and_named_folders_but_not_other_globs(tmp_path: Path) -> None:
+    stage = tmp_path / "data" / "backup" / "stage"
+    assert excluded_by(stage, [str(tmp_path / "data")]) == str(tmp_path / "data")
+    assert excluded_by(stage, [(tmp_path / "DATA").as_posix()]) is not None  # Windows paths ignore case
+    assert excluded_by(stage, ["**/backup"]) == "**/backup"
+    assert excluded_by(stage, [str(tmp_path / "data" / "runtime"), "**/node_modules", "*.tmp"]) is None
+
+
+def test_the_starter_config_backs_up_data_but_never_its_stage(isolated: Path, vault) -> None:
+    path = backup_runner.write_starter_config("F:/repo")
+    config = backup_runner.load_config(path)
+
+    assert excluded_by(stage_dir(), config.excludes) is None
+    assert excluded_by(get_settings().resolved_data_dir / "memory-vault", config.excludes) is None
+    assert excluded_by(get_settings().resolved_data_dir / "scratch", config.excludes) is not None
+    assert excluded_by(get_settings().database_path, config.excludes) is not None

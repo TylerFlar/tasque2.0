@@ -55,21 +55,25 @@ stale_hours = 48             # health checks flag a backup older than this
 check_every_days = 7         # forget --prune and restic check
 restore_test_every_days = 30 # restore the database and verify it
 
-# Folders to back up. The database is snapshotted separately: never list the live .sqlite3.
-# restic stores junctions and symlinks as links: list the folder they point to as its own source.
+# Folders to back up. The database is snapshotted separately into data/backup/stage: never list the
+# live .sqlite3. restic applies excludes inside every source, so never exclude a folder that holds
+# something you want, and never data/backup. restic stores junctions and symlinks as links: list the
+# folder they point to as its own source.
 sources = [
-  "{project}",
-  "{data}/work-templates",
-  "{data}/workflows",
-  "{data}/lanes.json",
-  "{data}/memory-vault",
-  "{data}/artifacts",
+  "{project}",{data_source}
 ]
 
 # Exact paths (or glob patterns) to leave out.
 excludes = [
   "{project}/.venv",
-  "{project}/data",
+  "{data}/scratch",
+  "{data}/scratchpad",
+  "{data}/tmp",
+  "{data}/backups",
+  "{data}/runtime",
+  "{data}/tasque2.sqlite3",
+  "{data}/tasque2.sqlite3-wal",
+  "{data}/tasque2.sqlite3-shm",
   "**/node_modules",
   "**/__pycache__",
   "**/.pytest_cache",
@@ -105,7 +109,29 @@ def state_path() -> Path:
 
 
 def stage_dir() -> Path:
-    return get_settings().resolved_data_dir / "runtime" / "backup-stage"
+    return get_settings().resolved_data_dir / "backup" / "stage"
+
+
+def excluded_by(path: Path, patterns: list[str]) -> str | None:
+    """The configured exclude that would leave ``path`` out of a backup, if any.
+
+    restic applies excludes inside every source, so a pattern matching a parent folder empties a
+    source listed under it. This checks plain paths (a parent or the path itself) and ``**/name``
+    patterns (any path component named ``name``); other globs are left to restic.
+    """
+    target = path.resolve().as_posix().lower().rstrip("/")
+    parts = target.split("/")
+    for pattern in patterns:
+        flat = pattern.replace("\\", "/").lower().rstrip("/")
+        if flat.startswith("**/") and not any(char in flat[3:] for char in "*?["):
+            if flat[3:] in parts:
+                return pattern
+            continue
+        if any(char in flat for char in "*?["):
+            continue
+        if target == flat or target.startswith(flat + "/"):
+            return pattern
+    return None
 
 
 def load_config(path: Path | None = None) -> BackupConfig:
@@ -138,12 +164,15 @@ def write_starter_config(repository: str, path: Path | None = None) -> Path:
     if path.exists():
         return path
     settings = get_settings()
+    project, data = settings.resolved_project_dir, settings.resolved_data_dir
+    data_source = "" if data.is_relative_to(project) else f'\n  "{data.as_posix()}",'
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         STARTER_CONFIG.format(
             repository=repository.replace("\\", "/"),
-            project=settings.resolved_project_dir.as_posix(),
-            data=settings.resolved_data_dir.as_posix(),
+            project=project.as_posix(),
+            data=data.as_posix(),
+            data_source=data_source,
         ),
         encoding="utf-8",
     )
@@ -318,6 +347,11 @@ def run_backup(
         run["error"] = str(exc)
         return _finish(state, run, now, dry_run=dry_run)
 
+    blocking = excluded_by(stage_dir(), config.excludes)
+    if blocking:
+        run["error"] = f"data/backup.toml excludes {blocking!r}, which leaves the database snapshot out of every backup"
+        return _finish(state, run, now, dry_run=dry_run)
+
     try:
         manifest = stage_database()
         run["database"] = {"check": manifest["check_result"], "tables": len(manifest["row_counts"])}
@@ -410,13 +444,11 @@ def maintenance(config: BackupConfig) -> dict[str, Any]:
 def restore_test(config: BackupConfig) -> dict[str, Any]:
     """Restore the latest database snapshot and prove it opens, passes integrity_check and matches."""
     with tempfile.TemporaryDirectory(prefix="tasque2-restore-") as target:
-        result = restic(
-            config, "restore", "latest", "--tag", "tasque2", "--target", target, "--include", "**/backup-stage/*"
-        )
+        result = restic(config, "restore", "latest", "--tag", "tasque2", "--target", target, "--include", "**/stage/*")
         if not result.ok:
             return {"ok": False, "error": _clip(result.stderr or result.stdout)}
-        databases = list(Path(target).rglob("backup-stage/tasque2.sqlite3"))
-        manifests = list(Path(target).rglob("backup-stage/manifest.json"))
+        databases = list(Path(target).rglob("backup/stage/tasque2.sqlite3"))
+        manifests = list(Path(target).rglob("backup/stage/manifest.json"))
         if not databases or not manifests:
             return {"ok": False, "error": "the snapshot holds no staged database"}
         restored = describe_database(databases[0])
