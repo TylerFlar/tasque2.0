@@ -267,6 +267,52 @@ def test_the_pending_output_pass_keeps_sticky_notes_current(fresh_db: Path) -> N
     ]
 
 
+def test_an_extensions_section_shows_between_the_notes_and_the_upcoming_runs(
+    fresh_db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tasque2 import sticky as sticky_module
+
+    plan = {"value": "Breakfast: muffin"}
+
+    def section(_session: Session, thread_id: str, _now: datetime) -> list[dict[str, str]] | None:
+        return [{"name": "Thu 10/8", "value": plan["value"]}] if thread_id == "t-kitchen" else None
+
+    def broken(_session: Session, _thread_id: str, _now: datetime) -> None:
+        raise RuntimeError("the ledger is gone")
+
+    monkeypatch.setattr(sticky_module, "extension_sections", lambda: [("plan", section), ("broken", broken)])
+    gateway = FakeDiscordGateway()
+    with session_scope() as session:
+        _thread(session, "t-kitchen")
+        _thread(session, "t-career")
+        _schedule(session, "kitchen", "0 12 * * SUN", thread="t-kitchen")
+        _schedule(session, "career-review", "0 12 * * SUN", thread="t-career")
+        StickyService(session).set_notes("t-kitchen", "- Check out the cart", now=NOW)
+        output = DiscordOutputService(session)
+        assert output.refresh_stickies(gateway=gateway, now=NOW) == 2
+        plan["value"] = "Breakfast: nothing"
+        assert output.refresh_stickies(gateway=gateway, now=NOW) == 1  # the section changed: one edit
+
+    posted = {channel: embed for channel, embed, _view in gateway.sent_embeds}
+    kitchen = posted["t-kitchen"]
+    assert kitchen["description"] == "- Check out the cart"
+    assert [field["name"] for field in kitchen["fields"]] == ["Thu 10/8", "Coming up"]
+    assert kitchen["fields"][0]["value"] == "Breakfast: muffin"
+    assert [field["name"] for field in posted["t-career"]["fields"]] == ["Coming up"]
+    [(channel, _message, _content, edited, _view)] = gateway.edited_messages
+    assert channel == "t-kitchen" and edited["fields"][0]["value"] == "Breakfast: nothing"
+
+
+def test_sections_past_the_embed_limit_are_left_out() -> None:
+    sections = tuple((f"Day {index}", "x" * 1000) for index in range(10))
+    embed = build_sticky_embed(
+        StickyView(thread_id="t", notes="n" * 800, notes_updated_at=None, shown=True, coming_up=(), sections=sections)
+    )
+    total = len(embed["title"]) + len(embed["description"])
+    total += sum(len(field["name"]) + len(field["value"]) for field in embed["fields"])
+    assert total <= 6000 and 0 < len(embed["fields"]) < 10
+
+
 def test_an_empty_sticky_note_says_so() -> None:
     embed = build_sticky_embed(StickyView(thread_id="t", notes="", notes_updated_at=None, shown=True, coming_up=()))
 

@@ -20,6 +20,9 @@ CONTROL_PANEL_ENTITY_ID = "discord-control-panel"
 CONTROL_PANEL_VERSION = 3
 EMBED_DESCRIPTION_LIMIT = 4096
 EMBED_FIELD_LIMIT = 1024
+EMBED_FIELD_NAME_LIMIT = 256
+EMBED_FIELDS_LIMIT = 25
+EMBED_TOTAL_LIMIT = 6000  # every text in one embed, together
 COLOR_OK = 0x2ECC71
 COLOR_WARN = 0xF1C40F
 COLOR_ALERT = 0xE74C3C
@@ -181,15 +184,27 @@ def build_workflow_status_panel_embed(run: WorkflowRun, nodes: list[WorkflowNode
 
 
 def build_sticky_embed(view: StickyView) -> dict[str, Any]:
-    """A thread's sticky note: the notes kept for the user, then the thread's upcoming runs."""
+    """A thread's sticky note: the notes kept for the user, the fields extensions add (as many as fit
+    Discord's embed limit), then the thread's upcoming runs."""
     embed: dict[str, Any] = {"title": "Sticky note", "color": COLOR_IDLE}
     lines = view.lines()
     if view.notes:
         embed["description"] = view.notes[:EMBED_DESCRIPTION_LIMIT]
-    elif not lines:
+    elif not lines and not view.sections:
         embed["description"] = "_(nothing here)_"
+    coming = "\n".join(lines)[:EMBED_FIELD_LIMIT]
+    budget = EMBED_TOTAL_LIMIT - len(embed["title"]) - len(embed.get("description", "")) - len(coming) - 40
+    fields: list[dict[str, Any]] = []
+    for name, value in view.sections[: EMBED_FIELDS_LIMIT - 1]:
+        field = {"name": name[:EMBED_FIELD_NAME_LIMIT], "value": value[:EMBED_FIELD_LIMIT], "inline": False}
+        budget -= len(field["name"]) + len(field["value"])
+        if budget < 0:
+            break
+        fields.append(field)
     if lines:
-        embed["fields"] = [{"name": "Coming up", "value": "\n".join(lines)[:EMBED_FIELD_LIMIT], "inline": False}]
+        fields.append({"name": "Coming up", "value": coming, "inline": False})
+    if fields:
+        embed["fields"] = fields
     if view.notes_updated_at is not None:
         embed["footer"] = {"text": "notes updated"}
         embed["timestamp"] = view.notes_updated_at.isoformat()

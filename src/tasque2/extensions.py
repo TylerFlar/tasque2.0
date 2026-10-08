@@ -11,7 +11,8 @@ directory (``TASQUE2_EXTENSIONS_DIR``, default ``extensions/``), each exposing
 - context digests: code-computed state injected into matching work items' packets;
 - canonical-key resolvers that choose pinned documents per run;
 - attempt ingestors that run after every successfully completed attempt;
-- schedule gates: code that decides, before a scheduled run is launched, whether it is needed.
+- schedule gates: code that decides, before a scheduled run is launched, whether it is needed;
+- sticky sections: fields a thread's sticky note shows below its notes, kept current in place.
 
 Extensions load once per process on first use. A broken extension raises: a daemon that
 silently lost its domain tools would corrupt runs far worse than a loud startup failure.
@@ -35,6 +36,7 @@ DigestBuild = Callable[[Any], dict[str, Any]]
 AttemptIngestor = Callable[[Any, Any, Any], Any]
 CanonicalKeyResolver = Callable[[Any, dict[str, Any]], list[str]]
 ScheduleGate = Callable[[Any, Any, Any], "str | None"]
+StickySection = Callable[[Any, str, Any], "list[dict[str, str]] | None"]
 FunctionWorker = Callable[[Any], Any]
 
 
@@ -53,6 +55,7 @@ class ExtensionRegistry:
     migration_locations: list[Path] = field(default_factory=list)
     schedule_gates: dict[str, ScheduleGate] = field(default_factory=dict)
     function_workers: dict[str, FunctionWorker] = field(default_factory=dict)
+    sticky_sections: list[tuple[str, StickySection]] = field(default_factory=list)
     extension_names: list[str] = field(default_factory=list)
 
     def add_context_digest(self, key: str, wants: DigestWants, build: DigestBuild) -> None:
@@ -95,6 +98,16 @@ class ExtensionRegistry:
         if not worker_kind.startswith("function."):
             raise ValueError(f"Function worker kinds start with 'function.': {worker_kind!r}")
         self.function_workers[worker_kind] = worker
+
+    def add_sticky_section(self, name: str, section: StickySection) -> None:
+        """Show fields on a thread's sticky note, below its notes and above its upcoming runs.
+
+        ``section(session, thread_id, now)`` returns ``[{"name": ..., "value": ...}]`` for a thread it
+        serves and None for any other. It runs on every output pass, so it reads the ledgers and never
+        calls out; the note is edited in place whenever what it returns changes. One that raises is left
+        out of that pass.
+        """
+        self.sticky_sections.append((name, section))
 
     def add_migration_location(self, path: Path | str) -> None:
         """Add an Alembic version directory that upgrades together with the core one."""

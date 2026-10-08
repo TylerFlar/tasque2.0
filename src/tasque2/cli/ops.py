@@ -310,7 +310,9 @@ def discord_output_simulate(limit: Annotated[int, typer.Option("--limit", "-n")]
     gateway = FakeDiscordGateway()
     channels = OutputChannels(ops="local-ops", jobs="local-jobs", chains="local-chains", dlq="local-dlq")
     with cli_session_scope() as session:
-        posted = DiscordOutputService(session).post_pending_updates(gateway=gateway, channels=channels, limit=limit)
+        posted = DiscordOutputService(session, dry_run=True).post_pending_updates(
+            gateway=gateway, channels=channels, limit=limit
+        )
         session.rollback()
     threads, messages = len(gateway.created_threads), len(gateway.sent_messages)
     console.print(f"would post {posted} update(s): {threads} thread(s), {messages} message(s)")

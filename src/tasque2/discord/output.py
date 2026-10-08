@@ -5,6 +5,10 @@ once per status and survives restarts. Work that carries a thread Tasque already
 into that thread; other work opens a new thread under the jobs channel (dead letters under
 the DLQ channel); intake work answers in the intake channel. A thread's sticky note is posted
 once, pinned, and edited in place; its message id, last rendering and pin state live on its row.
+
+A message Discord accepted is never sent again because its record failed: the pass commits before
+each post, and the records of what was sent are written again after a pause when another writer
+holds the database (a long sync can hold SQLite's lock past its busy timeout).
 """
 
 from __future__ import annotations
@@ -12,13 +16,16 @@ from __future__ import annotations
 import json
 import logging
 import mimetypes
-from collections.abc import Sequence
+import time
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from functools import partial
 from pathlib import Path
 from typing import Any
 
 from sqlalchemy import func, select
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from tasque2.discord.gateway import MESSAGE_LIMIT, DiscordGateway, DiscordMessageGone, DiscordSentMessage
@@ -64,6 +71,16 @@ STICKY_PIN_RETRY = timedelta(minutes=10)
 # the user has been active recently (they are up, so nothing is gained by holding).
 REPLY_SOURCES = {"discord", "discord_reply_followup", "discord_attachment", "cli"}
 AWAKE_WINDOW = timedelta(minutes=60)
+# Recording a message Discord already accepted waits out another writer's lock: the attempts, and the
+# pause before the n-th retry (n times this many seconds).
+RECORD_ATTEMPTS = 8
+RECORD_PAUSE_SECONDS = 1.5
+
+
+def _database_busy(exc: BaseException) -> bool:
+    """SQLite refused a write because another connection holds its lock."""
+    text = str(exc).lower()
+    return "database is locked" in text or "database is busy" in text
 
 
 @dataclass(frozen=True)
@@ -75,8 +92,10 @@ class OutputChannels:
 
 
 class DiscordOutputService:
-    def __init__(self, session: Session) -> None:
+    def __init__(self, session: Session, *, dry_run: bool = False) -> None:
         self.session = session
+        # A dry run (the output simulator) commits nothing, so its caller can roll the whole pass back.
+        self.dry_run = dry_run
 
     def post_pending_updates(self, *, gateway: DiscordGateway, channels: OutputChannels, limit: int = 50) -> int:
         self.refresh_control_panel(channel_id=channels.ops, gateway=gateway)
@@ -114,25 +133,37 @@ class DiscordOutputService:
                 continue
             card = (node.input or {}).get("card") or (node.definition or {}).get("prompt")
             chunks = split_markdown(str(card or f"{run.name} is waiting for a choice."), MESSAGE_LIMIT)
-            sent = None
+            thread_id, run_id, node_id, node_key = run.discord_thread_id, run.id, node.id, node.node_key
+            self._settle()
+            sent_messages: list[tuple[DiscordSentMessage, str]] = []
             for index, content in enumerate(chunks):
                 last = index == len(chunks) - 1
                 sent = gateway.send_message(
-                    channel_id=run.discord_thread_id,
+                    channel_id=thread_id,
                     content=content,
-                    view=build_gate_card_view(run.id, list(choices)) if last else None,
+                    view=build_gate_card_view(run_id, list(choices)) if last else None,
                 )
-                self._record_outbound(sent, content=content, thread_id=run.discord_thread_id, workflow_run_id=run.id)
-            self._event(
-                "discord.gate_card_posted",
-                "workflow_node",
-                node.id,
-                workflow_run_id=run.id,
-                summary=f"Posted the gate card for {node.node_key}",
-                payload={"status": "awaiting_input", "discord_message_id": sent.message_id if sent else None},
-            )
+                sent_messages.append((sent, content))
+            self._record_sent(partial(self._record_gate_card, sent_messages, thread_id, run_id, node_id, node_key))
             posted += 1
         return posted
+
+    def _record_gate_card(
+        self, sent_messages: list[tuple[DiscordSentMessage, str]], thread_id: str, run_id: str, node_id: str, key: str
+    ) -> None:
+        for sent, content in sent_messages:
+            self._record_outbound(sent, content=content, thread_id=thread_id, workflow_run_id=run_id)
+        self._event(
+            "discord.gate_card_posted",
+            "workflow_node",
+            node_id,
+            workflow_run_id=run_id,
+            summary=f"Posted the gate card for {key}",
+            payload={
+                "status": "awaiting_input",
+                "discord_message_id": sent_messages[-1][0].message_id if sent_messages else None,
+            },
+        )
 
     def ensure_control_panel(self, *, channel_id: str, gateway: DiscordGateway) -> DiscordSentMessage | None:
         if self._control_panel_event(channel_id) is not None:
@@ -247,11 +278,15 @@ class DiscordOutputService:
             signature = json.dumps(embed, sort_keys=True, default=str)
             sticky = stickies.sticky(view.thread_id)
             if sticky is None or not sticky.discord_message_id:
+                self._settle()
                 try:
                     sent = gateway.send_embed(channel_id=view.thread_id, embed=embed, silent=True)
                 except Exception:  # noqa: BLE001 - nothing is recorded, so the next pass posts it again
                     continue
-                sticky = stickies.record_posted(view.thread_id, message_id=sent.message_id, signature=signature)
+                self._record_sent(
+                    partial(stickies.record_posted, view.thread_id, message_id=sent.message_id, signature=signature)
+                )
+                sticky = stickies.sticky(view.thread_id)
                 written += 1
             elif sticky.signature != signature:
                 try:
@@ -317,38 +352,42 @@ class DiscordOutputService:
         chunks = split_markdown(
             _with_attachment_note(self._work_content(work_item, attempt), uploads), MESSAGE_LIMIT
         ) or ["Done."]
-        sent_messages: list[DiscordSentMessage] = []
+        thread_id, item_id = thread.discord_thread_id, work_item.id
+        run_id, status = work_item.workflow_run_id, work_item.status
+        self._settle()
+        sent_messages: list[tuple[DiscordSentMessage, str]] = []
         for index, content in enumerate(chunks):
             last = index == len(chunks) - 1
             sent = gateway.send_message(
-                channel_id=thread.discord_thread_id,
+                channel_id=thread_id,
                 content=content,
                 view=build_work_controls_view(work_item) if last else None,
                 attachments=uploads if last else None,
             )
-            sent_messages.append(sent)
-            self._record_outbound(
-                sent,
-                content=content,
-                thread_id=thread.discord_thread_id,
-                work_item_id=work_item.id,
-                workflow_run_id=work_item.workflow_run_id,
+            sent_messages.append((sent, content))
+
+        def record() -> None:
+            for sent, content in sent_messages:
+                self._record_outbound(
+                    sent, content=content, thread_id=thread_id, work_item_id=item_id, workflow_run_id=run_id
+                )
+            self._event(
+                "discord.work_status_posted",
+                "work_item",
+                item_id,
+                work_item_id=item_id,
+                workflow_run_id=run_id,
+                summary=f"Posted work status to Discord: {status}",
+                payload={
+                    "status": status,
+                    "discord_message_id": sent_messages[-1][0].message_id,
+                    "discord_message_ids": [message.message_id for message, _content in sent_messages],
+                    "upload_artifact_ids": [upload.artifact_id for upload in uploads if upload.artifact_id],
+                },
             )
-        self._event(
-            "discord.work_status_posted",
-            "work_item",
-            work_item.id,
-            work_item_id=work_item.id,
-            workflow_run_id=work_item.workflow_run_id,
-            summary=f"Posted work status to Discord: {work_item.status}",
-            payload={
-                "status": work_item.status,
-                "discord_message_id": sent_messages[-1].message_id,
-                "discord_message_ids": [message.message_id for message in sent_messages],
-                "upload_artifact_ids": [upload.artifact_id for upload in uploads if upload.artifact_id],
-            },
-        )
-        return sent_messages[-1]
+
+        self._record_sent(record)
+        return sent_messages[-1][0]
 
     def post_workflow_result(
         self, *, workflow_run_id: str, channel_id: str, gateway: DiscordGateway
@@ -384,31 +423,38 @@ class DiscordOutputService:
         chunks = split_markdown(_with_attachment_note(self._workflow_content(run, finals), uploads), MESSAGE_LIMIT) or [
             "Done."
         ]
-        sent_messages: list[DiscordSentMessage] = []
+        thread_id, run_id, status = thread.discord_thread_id, run.id, run.status
+        self._settle()
+        sent_messages: list[tuple[DiscordSentMessage, str]] = []
         for index, content in enumerate(chunks):
             last = index == len(chunks) - 1
             sent = gateway.send_message(
-                channel_id=thread.discord_thread_id,
+                channel_id=thread_id,
                 content=content,
                 view=build_workflow_controls_view(run) if last else None,
                 attachments=uploads if last else None,
             )
-            sent_messages.append(sent)
-            self._record_outbound(sent, content=content, thread_id=thread.discord_thread_id, workflow_run_id=run.id)
-        self._event(
-            "discord.workflow_final_posted",
-            "workflow_run",
-            run.id,
-            workflow_run_id=run.id,
-            summary=f"Posted workflow result to Discord: {run.status}",
-            payload={
-                "status": run.status,
-                "discord_message_id": sent_messages[-1].message_id,
-                "discord_message_ids": [message.message_id for message in sent_messages],
-                "upload_artifact_ids": [upload.artifact_id for upload in uploads if upload.artifact_id],
-            },
-        )
-        return sent_messages[-1]
+            sent_messages.append((sent, content))
+
+        def record() -> None:
+            for sent, content in sent_messages:
+                self._record_outbound(sent, content=content, thread_id=thread_id, workflow_run_id=run_id)
+            self._event(
+                "discord.workflow_final_posted",
+                "workflow_run",
+                run_id,
+                workflow_run_id=run_id,
+                summary=f"Posted workflow result to Discord: {status}",
+                payload={
+                    "status": status,
+                    "discord_message_id": sent_messages[-1][0].message_id,
+                    "discord_message_ids": [message.message_id for message, _content in sent_messages],
+                    "upload_artifact_ids": [upload.artifact_id for upload in uploads if upload.artifact_id],
+                },
+            )
+
+        self._record_sent(record)
+        return sent_messages[-1][0]
 
     def ensure_work_thread(self, *, work_item: WorkItem, channel_id: str, gateway: DiscordGateway) -> DiscordThread:
         """The thread this work posts into.
@@ -511,24 +557,28 @@ class DiscordOutputService:
         if uploads:
             content += "\n\nAttached: " + ", ".join(upload.display_name for upload in uploads[:5])
         content = _truncate(content, MESSAGE_LIMIT)
+        item_id, run_id, status = work_item.id, work_item.workflow_run_id, work_item.status
+        self._settle()
         sent = gateway.send_message(channel_id=channel_id, content=content, attachments=uploads)
-        self._record_outbound(
-            sent, content=content, work_item_id=work_item.id, workflow_run_id=work_item.workflow_run_id
-        )
-        self._event(
-            "discord.work_status_posted",
-            "work_item",
-            work_item.id,
-            work_item_id=work_item.id,
-            workflow_run_id=work_item.workflow_run_id,
-            summary=f"Posted intake response to Discord: {work_item.status}",
-            payload={
-                "mode": "intake_response",
-                "status": work_item.status,
-                "discord_message_id": sent.message_id,
-                "discord_channel_id": sent.channel_id,
-            },
-        )
+
+        def record() -> None:
+            self._record_outbound(sent, content=content, work_item_id=item_id, workflow_run_id=run_id)
+            self._event(
+                "discord.work_status_posted",
+                "work_item",
+                item_id,
+                work_item_id=item_id,
+                workflow_run_id=run_id,
+                summary=f"Posted intake response to Discord: {status}",
+                payload={
+                    "mode": "intake_response",
+                    "status": status,
+                    "discord_message_id": sent.message_id,
+                    "discord_channel_id": sent.channel_id,
+                },
+            )
+
+        self._record_sent(record)
         return sent
 
     def _quiet_now(self) -> bool:
@@ -815,6 +865,31 @@ class DiscordOutputService:
                 .order_by(WorkflowNode.created_at)
             ).all()
         )
+
+    def _settle(self) -> None:
+        """Commit what the pass did so far, before a post: a record that fails once Discord accepted the
+        message then loses only that record, which ``_record_sent`` writes again."""
+        if not self.dry_run:
+            self.session.commit()
+
+    def _record_sent(self, record: Callable[[], Any]) -> None:
+        """Write the records of messages Discord already accepted, and commit them. When another writer
+        holds the database past the busy timeout, the write is rolled back and tried again after a pause;
+        the message itself is never sent a second time for it."""
+        if self.dry_run:
+            record()
+            return
+        for attempt in range(1, RECORD_ATTEMPTS + 1):
+            try:
+                record()
+                self.session.commit()
+                return
+            except OperationalError as exc:
+                self.session.rollback()
+                if not _database_busy(exc) or attempt == RECORD_ATTEMPTS:
+                    raise
+                logger.warning("The database was busy recording a sent Discord message; trying again (%d)", attempt)
+                time.sleep(RECORD_PAUSE_SECONDS * attempt)
 
     def _record_outbound(
         self,

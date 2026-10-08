@@ -127,6 +127,77 @@ def test_finished_work_opens_a_thread_and_posts_once(fresh_db: Path) -> None:
         assert posted_event.payload["status"] == "succeeded"
 
 
+def test_a_post_whose_record_meets_a_busy_database_is_recorded_again_never_sent_twice(
+    fresh_db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from sqlalchemy.exc import OperationalError
+
+    from tasque2.discord import output as output_module
+
+    # Another writer holds SQLite's lock past the busy timeout just as the post's record is written: the
+    # message already went out, so the record is written again after a pause and nothing is sent twice.
+    pauses: list[float] = []
+    monkeypatch.setattr(output_module.time, "sleep", pauses.append)
+    real = DiscordService.record_message
+    failed: list[str] = []
+
+    def busy_once(self: DiscordService, **kwargs: Any) -> Any:
+        if kwargs.get("content_preview") == "Run output." and not failed:
+            failed.append("once")
+            raise OperationalError("INSERT INTO discord_messages", {}, Exception("database is locked"))
+        return real(self, **kwargs)
+
+    monkeypatch.setattr(DiscordService, "record_message", busy_once)
+    gateway = FakeDiscordGateway()
+    with session_scope() as session:
+        work = _echo_work(session, "Output work", "Run output.")
+        service = DiscordOutputService(session)
+
+        assert _post_pending(service, gateway) == 1
+        assert _post_pending(service, gateway) == 0
+
+        assert failed == ["once"] and pauses == [output_module.RECORD_PAUSE_SECONDS]
+        assert gateway.sent_messages == [("fake-thread-1", "Run output.")]
+        outbound = session.scalars(
+            select(DiscordMessage).where(
+                DiscordMessage.direction == "outbound",
+                DiscordMessage.work_item_id == work.id,
+                DiscordMessage.content_preview == "Run output.",
+            )
+        ).all()
+        assert len(outbound) == 1
+        posted = session.scalars(
+            select(WorkEvent).where(
+                WorkEvent.event_type == "discord.work_status_posted", WorkEvent.work_item_id == work.id
+            )
+        ).all()
+        assert len(posted) == 1
+
+
+def test_a_record_that_fails_for_another_reason_still_fails_loudly(
+    fresh_db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from sqlalchemy.exc import OperationalError
+
+    from tasque2.discord import output as output_module
+
+    monkeypatch.setattr(output_module.time, "sleep", lambda _seconds: None)
+
+    real = DiscordService.record_message
+
+    def broken(self: DiscordService, **kwargs: Any) -> Any:
+        if kwargs.get("content_preview") == "Run output.":
+            raise OperationalError("INSERT INTO discord_messages", {}, Exception("disk I/O error"))
+        return real(self, **kwargs)
+
+    monkeypatch.setattr(DiscordService, "record_message", broken)
+    gateway = FakeDiscordGateway()
+    with session_scope() as session:
+        _echo_work(session, "Output work", "Run output.")
+        with pytest.raises(OperationalError, match="disk I/O error"):
+            _post_pending(DiscordOutputService(session), gateway)
+
+
 def test_work_carrying_a_bound_thread_posts_into_it_unless_it_asks_for_a_new_thread(fresh_db: Path) -> None:
     gateway = FakeDiscordGateway()
     with session_scope() as session:

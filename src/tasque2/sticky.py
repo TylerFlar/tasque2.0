@@ -2,15 +2,17 @@
 
 A thread's sticky note shows the notes a worker keeps for the user there (things to do,
 replies owed, a decision waiting) above the thread's upcoming runs, which come from the
-enabled schedules that post into it. Workers may leave the notes empty. A sticky note shows
+enabled schedules that post into it; an extension may add fields between the two (the Kitchen's
+plan table). Workers may leave the notes empty. A sticky note shows
 in an active Tasque thread that has notes or an upcoming run. The user turns a thread's
 sticky note off by deleting its message; a worker brings it back only when the user asks.
 """
 
 from __future__ import annotations
 
+import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -23,6 +25,8 @@ from tasque2.events import record_event
 from tasque2.models import DiscordSticky, DiscordThread, Schedule, utc_now
 from tasque2.reminders import NOTIFY_WORKER
 from tasque2.schedules import ScheduleService
+
+logger = logging.getLogger(__name__)
 
 STICKY_NOTES_MAX_CHARS = 800
 COMING_UP_LIMIT = 8
@@ -54,6 +58,7 @@ class StickyView:
     shown: bool
     coming_up: tuple[UpcomingRun, ...]
     more: int = 0
+    sections: tuple[tuple[str, str], ...] = ()  # extension fields: (name, value)
 
     def lines(self) -> list[str]:
         """The coming-up lines, soonest first."""
@@ -106,11 +111,30 @@ class StickyService:
             thread_id for thread_id, sticky in stickies.items() if sticky.notes or sticky.discord_message_id
         }
         views: list[StickyView] = []
+        moment = now or utc_now()
         for thread_id in sorted(self._active_threads(candidates)):
             sticky = stickies.get(thread_id)
             if sticky is None or sticky.status == STICKY_ON:
-                views.append(_view(thread_id, sticky, upcoming.get(thread_id, [])))
+                view = _view(thread_id, sticky, upcoming.get(thread_id, []))
+                views.append(replace(view, sections=self._sections(thread_id, now=moment)))
         return views
+
+    def _sections(self, thread_id: str, *, now: datetime) -> tuple[tuple[str, str], ...]:
+        """The fields extensions add to this thread's note, read fresh; a section that fails is left out."""
+        found: list[tuple[str, str]] = []
+        for name, section in extension_sections():
+            try:
+                fields = section(self.session, thread_id, now) or []
+            except Exception:  # noqa: BLE001 - one broken section must never stop the sticky notes
+                if name not in _warned:
+                    _warned.add(name)
+                    logger.warning("Sticky section %s failed for thread %s", name, thread_id, exc_info=True)
+                continue
+            for field in fields:
+                label, value = str(field.get("name") or "").strip(), str(field.get("value") or "").strip()
+                if label and value:
+                    found.append((label, value))
+        return tuple(found)
 
     def set_notes(
         self,
@@ -249,6 +273,16 @@ class StickyService:
             summary=summary,
             payload=payload,
         )
+
+
+_warned: set[str] = set()
+
+
+def extension_sections() -> list[tuple[str, Any]]:
+    """The sticky sections the loaded extensions registered."""
+    from tasque2.extensions import registry
+
+    return list(registry().sticky_sections)
 
 
 def clean_notes(notes: str | None) -> str:
