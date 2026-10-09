@@ -41,7 +41,16 @@ def test_tasque_server_runs_this_interpreter_against_this_install(monkeypatch: p
         "TASQUE2_TIMEZONE": "America/Los_Angeles",
         "TASQUE2_PROJECT_DIR": str(settings.resolved_project_dir),
         "TASQUE2_WORK_ITEM_ID": "work-1",
+        "PYTHONPATH": "",  # always explicit: a run's own PYTHONPATH never reaches the live server
     }
+
+
+def test_a_runs_python_path_never_reaches_the_live_server(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A Workshop build runs staged code with PYTHONPATH at its worktree; the Tasque server it talks to
+    must keep the daemon's own path, or it would import staged code against the live database."""
+    monkeypatch.delenv("PYTHONPATH", raising=False)
+    config = tasque_mcp_server_config(work_item_id="work-1", extra_env={"TRACEPARENT": "00-abc"})
+    assert config["env"]["PYTHONPATH"] == ""
 
 
 def test_tasque_server_env_passes_through_python_path_logging_telemetry_and_trace(

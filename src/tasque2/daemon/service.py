@@ -50,6 +50,7 @@ class Daemon:
         restore_signals = self._install_signal_handlers(asyncio.get_running_loop())
         instruments().observe_queue(_queue_counts)
         bot, bot_task = self._start_discord()
+        await asyncio.to_thread(self._after_start)
         logger.info(
             "Tasque daemon %s started (pid %s, concurrency %s)",
             tasque2.__version__,
@@ -109,6 +110,16 @@ class Daemon:
                     logger.info("Restarting at a quiet moment: the respawn process takes over")
                     return
             await self._sleep(draining)
+
+    def _after_start(self) -> None:
+        """Once per start: say how a release that restarted the daemon went (the Workshop)."""
+        try:
+            from tasque2.workshop.pipeline import announce_releases
+
+            with session_scope() as session:
+                announce_releases(session)
+        except Exception:  # noqa: BLE001 - a start never fails on its announcements
+            logger.exception("Could not announce the Workshop's releases")
 
     def _restart_due(self) -> bool:
         """A restart was requested and its window is open (logged once per change while it waits)."""

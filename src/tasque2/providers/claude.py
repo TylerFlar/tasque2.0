@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+from typing import Any
 
 from tasque2.config import get_settings
 from tasque2.providers.base import ProviderRequest, ProviderResponse
@@ -57,8 +58,10 @@ class ClaudeCodeProvider:
             argv.extend(["--max-turns", str(request.max_turns)])
         if request.max_budget_usd:
             argv.extend(["--max-budget-usd", f"{request.max_budget_usd:g}"])
-        if not settings.worker_auto_memory:
-            argv.extend(["--settings", json.dumps({"autoMemoryEnabled": False})])
+        run_settings: dict[str, Any] = {} if settings.worker_auto_memory else {"autoMemoryEnabled": False}
+        run_settings.update(request.settings or {})
+        if run_settings:
+            argv.extend(["--settings", json.dumps(run_settings)])
         return argv
 
     def run(self, request: ProviderRequest) -> ProviderResponse:

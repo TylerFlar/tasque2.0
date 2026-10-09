@@ -80,6 +80,12 @@ def upgrade_database(revision: str = "heads") -> MigrationStatus:
     return schema_status()
 
 
+def downgrade_database(revision: str) -> MigrationStatus:
+    """Step the schema back to ``revision`` (a release's undo, with the code that holds its downgrades)."""
+    command.downgrade(alembic_config(), revision)
+    return schema_status()
+
+
 def schema_status() -> MigrationStatus:
     config = alembic_config()
     head_revisions = tuple(ScriptDirectory.from_config(config).get_heads())

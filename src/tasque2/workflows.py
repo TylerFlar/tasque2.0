@@ -167,7 +167,7 @@ class WorkflowService:
         if node.status != "awaiting_input" or run.status in TERMINAL_RUN_STATUSES:
             raise ValueError(f"Gate {node_key} is not waiting for an answer (gate {node.status}, run {run.status}).")
         node.status = "succeeded"
-        node.output = {"answer": answer}
+        node.output = {"answer": answer, **({"notes": node.input["notes"]} if (node.input or {}).get("notes") else {})}
         if run.status == "awaiting_input":
             run.status = "active"
         self.session.flush()
@@ -176,6 +176,31 @@ class WorkflowService:
             run,
             entity=("workflow_node", node.id),
             summary=f"Gate answered: {node_key}",
+            payload={"node_key": node_key},
+        )
+        return node
+
+    def add_gate_note(self, *, workflow_run_id: str, node_key: str, text: str, author: str = "user") -> WorkflowNode:
+        """Keep what the user typed while a gate waits: it goes with the answer (``output.notes``) when a
+        button decides; typing never decides on its own."""
+        node = self.session.scalar(
+            select(WorkflowNode).where(
+                WorkflowNode.workflow_run_id == workflow_run_id, WorkflowNode.node_key == node_key
+            )
+        )
+        if node is None or node.kind != "gate" or node.status != "awaiting_input":
+            raise ValueError(f"Gate {node_key} is not waiting for an answer.")
+        notes = [
+            *((node.input or {}).get("notes") or []),
+            {"at": utc_now().isoformat(), "author": author, "text": text},
+        ]
+        node.input = {**(node.input or {}), "notes": notes}
+        self.session.flush()
+        self._event(
+            "workflow.gate_note",
+            node.workflow_run,
+            entity=("workflow_node", node.id),
+            summary=f"Note on gate {node_key}",
             payload={"node_key": node_key},
         )
         return node
@@ -241,6 +266,7 @@ class WorkflowService:
             self.session.add(node)
             self.session.flush()
             by_key[node.node_key] = node
+        tolerant = {str(node_def["key"]) for node_def in definition["nodes"] if node_def.get("tolerate_failure")}
         for node_def in definition["nodes"]:
             for dependency in node_def.get("depends_on", []):
                 self.session.add(
@@ -248,7 +274,8 @@ class WorkflowService:
                         workflow_run_id=run.id,
                         from_node_id=by_key[str(dependency)].id,
                         to_node_id=by_key[str(node_def["key"])].id,
-                        condition="succeeded",
+                        # A node that may fail lets the next one start either way; it reads the outcome.
+                        condition="finished" if str(dependency) in tolerant else "succeeded",
                     )
                 )
 
@@ -313,6 +340,19 @@ class WorkflowService:
                 )
 
     def _start_node(self, run: WorkflowRun, node: WorkflowNode) -> None:
+        if node.kind == "work" and node.definition.get("skip_when"):
+            if self._output_reference(run, node.definition["skip_when"]):
+                # Nothing to do: the node passes without running (the next nodes read ``skipped``).
+                node.status = "succeeded"
+                node.output = {"skipped": True}
+                self._event(
+                    "workflow.node_skipped",
+                    run,
+                    entity=("workflow_node", node.id),
+                    summary=f"Skipped: {node.node_key}",
+                    payload={"node_key": node.node_key},
+                )
+                return
         if node.kind == "work":
             self._enqueue_work_node(run, node)
         elif node.kind == "fan_out":
@@ -320,6 +360,21 @@ class WorkflowService:
         elif node.kind == "join":
             self._complete_join(run, node)
         elif node.kind == "gate":
+            skip_when = node.definition.get("skip_when")
+            if skip_when and self._output_reference(run, skip_when):
+                # Nothing to ask: the gate takes its first choice (or ``skip_answer``) on its own.
+                choices = node.definition.get("choices") or []
+                answer = node.definition.get("skip_answer") or (choices[0] if choices else "skipped")
+                node.status = "succeeded"
+                node.output = {"answer": answer, "skipped": True}
+                self._event(
+                    "workflow.gate_skipped",
+                    run,
+                    entity=("workflow_node", node.id),
+                    summary=f"Gate passed on its own: {node.node_key}",
+                    payload={"node_key": node.node_key, "answer": answer},
+                )
+                return
             node.status = "awaiting_input"
             run.status = "awaiting_input"
             card_from = node.definition.get("card_from")
@@ -341,11 +396,18 @@ class WorkflowService:
     def _enqueue_work_node(self, run: WorkflowRun, node: WorkflowNode) -> None:
         node_def = node.definition
         context = {**dict(run.input), **dict(node_def.get("context") or {})}
+        contract = dict(node_def.get("runtime_contract") or {})
+        # ``contract_from`` fills contract keys from upstream outputs ("<node>.<path>"), e.g. a model tier
+        # chosen by an earlier step; an unresolved reference leaves the stored value.
+        for key, reference in dict(node_def.get("contract_from") or {}).items():
+            value = self._output_reference(run, reference)
+            if value not in (None, ""):
+                contract[str(key)] = value
         work_item = WorkRepository(self.session).create_work_item(
             title=str(node_def.get("title", node.node_key)),
             task_instruction=node_instruction(node_def) or node.node_key,
             worker_kind=str(node_def.get("worker_kind", "manual")),
-            runtime_contract=dict(node_def.get("runtime_contract") or {}),
+            runtime_contract=contract,
             context=context,
             retry_policy=dict(node_def.get("retry_policy") or {}),
             priority=int(node_def.get("priority", 0)),
@@ -357,7 +419,7 @@ class WorkflowService:
             workflow_run_id=run.id,
             workflow_node_id=node.id,
             discord_thread_id=run.discord_thread_id,
-            lane=str(run.input.get("lane") or run.definition.name),
+            lane=str(node_def.get("lane") or run.input.get("lane") or run.definition.name),
             traceparent=run.traceparent,
         )
         node.work_item_id = work_item.id

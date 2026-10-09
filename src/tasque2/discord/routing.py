@@ -490,8 +490,20 @@ class DiscordService:
             )
         ).all()
         if run.status == "awaiting_input" and len(gates) == 1:
+            gate = gates[0]
+            choices = [str(choice) for choice in (gate.definition or {}).get("choices") or []]
+            if choices and content.strip().casefold() not in {choice.casefold() for choice in choices}:
+                # A gate with buttons is answered by a button (or its exact label); anything else typed
+                # while it waits is a note that goes with the answer, never the answer itself.
+                node = WorkflowService(self.session).add_gate_note(
+                    workflow_run_id=run.id, node_key=gate.node_key, text=content, author=author
+                )
+                return DiscordRouteResult(
+                    action="workflow_gate_note", entity_id=node.id, summary=f"Noted for gate {node.node_key}."
+                )
+            answer = next((choice for choice in choices if choice.casefold() == content.strip().casefold()), content)
             node = WorkflowService(self.session).answer_gate(
-                workflow_run_id=run.id, node_key=gates[0].node_key, answer=content
+                workflow_run_id=run.id, node_key=gate.node_key, answer=answer
             )
             return DiscordRouteResult(
                 action="workflow_gate_answered", entity_id=node.id, summary=f"Answered gate {node.node_key}."

@@ -125,6 +125,7 @@ class ProviderRuntime:
                     result_token=result_token,
                     work_item_id=work_item.id,
                     argv=[str(item) for item in _list(contract.get("argv"), "argv")],
+                    settings=guard_settings(contract.get("guard"), cwd=cwd),
                 )
                 argv_record = _redacted_argv(adapter, request)
                 response = adapter.run(request)
@@ -363,3 +364,30 @@ def _optional_float(value: Any) -> float | None:
     if value is None or str(value).strip() == "":
         return None
     return float(value)
+
+
+def guard_settings(guard: Any, *, cwd: str | None = None) -> dict[str, Any]:
+    """The run settings for a contract's ``guard`` ({"root", "mode"}; the root defaults to the run's
+    folder): the Workshop's PreToolUse hook, run from this (the live) checkout so a run can never edit the
+    guard that checks it."""
+    if not guard:
+        return {}
+    if not isinstance(guard, Mapping) or not (guard.get("root") or cwd):
+        raise ProviderExecutionError("runtime_contract.guard needs the run's root folder.")
+    import sys
+    from pathlib import Path
+
+    from tasque2.workshop import guard as guard_module
+
+    settings = get_settings()
+    scripts = Path(sys.executable).parent
+    allow = [sys.executable, *(str(path) for path in scripts.glob("ruff*") if path.is_file())]
+    return guard_module.hook_settings(
+        python=sys.executable,
+        guard=str(Path(guard_module.__file__).resolve()),
+        root=str(Path(str(guard.get("root") or cwd)).resolve()),
+        live=str(settings.resolved_project_dir),
+        data=str(settings.resolved_data_dir),
+        mode=str(guard.get("mode") or "build"),
+        allow=allow,
+    )

@@ -449,7 +449,7 @@ def verify_worker(work_item: WorkItem) -> dict[str, Any]:
 
 def merge_worker(work_item: WorkItem) -> dict[str, Any]:
     """``function.tasque_repair_merge``: carry out the user's answer; never raises."""
-    from tasque2.daemon.restart import request_restart
+    from tasque2.daemon.restart import RestartBusy, request_restart
     from tasque2.ops.backup import BackupService
 
     session = _session(work_item)
@@ -469,11 +469,18 @@ def merge_worker(work_item: WorkItem) -> dict[str, Any]:
         )
     except OSError as exc:
         return {"summary": f"Repair not merged: the database snapshot failed ({exc}).", "produces": {"silent": True}}
-    request_restart(
-        reason=f"repair {repair_id}",
-        window="quiet",
-        switch=[{"repo": tree.live, "ref": tree.branch, "push": tree.name == "core"} for tree in changed],
-    )
+    try:
+        request_restart(
+            reason=f"repair {repair_id}",
+            window="quiet",
+            switch=[{"repo": tree.live, "ref": tree.branch, "push": tree.name == "core"} for tree in changed],
+        )
+    except RestartBusy as exc:
+        branches = ", ".join(tree.branch for tree in changed)
+        return {
+            "summary": f"Repair {repair_id} not merged yet ({exc}); it is kept on {branches}.",
+            "produces": {"silent": True, "merged": False, "waiting": True},
+        }
     return {
         "summary": f"Repair {repair_id} queued: the daemon switches to it and restarts at the next quiet hour.",
         "produces": {"silent": True, "merged": True, "backup": str(backup.backup_dir)},

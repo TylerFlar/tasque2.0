@@ -105,6 +105,10 @@ class Settings(BaseSettings):
     worker_auto_memory: bool = Field(default=False)
     worker_exit_grace_seconds: float = Field(default=20.0)
     default_mcp_servers: str | None = Field(default=None)
+    # "lane:cap,lane:cap": at most that many running items in each lane named (the Workshop's lanes).
+    lane_caps: str | None = Field(default=None)
+    # Slots a capped lane never takes, kept for every other lane, out of daemon_concurrency.
+    reserved_slots: int = Field(default=0)
 
     embedding_provider: str = Field(default="auto")
     embedding_model: str = Field(default="text-embedding-3-small")
@@ -178,6 +182,15 @@ class Settings(BaseSettings):
     @property
     def worker_disallowed_tool_list(self) -> list[str]:
         return _csv(self.worker_disallowed_tools)
+
+    @property
+    def lane_cap_map(self) -> dict[str, int]:
+        caps: dict[str, int] = {}
+        for entry in _csv(self.lane_caps or ""):
+            lane, _, cap = entry.partition(":")
+            if lane.strip() and cap.strip().isdigit():
+                caps[lane.strip()] = int(cap.strip())
+        return caps
 
     @property
     def default_mcp_server_list(self) -> list[str] | None:

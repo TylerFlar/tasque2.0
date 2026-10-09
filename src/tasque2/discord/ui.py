@@ -101,6 +101,17 @@ def build_gate_card_view(workflow_run_id: str, choices: list[str]) -> Any | None
     return _view("gate", workflow_run_id, buttons)
 
 
+def build_undo_view(release_id: str) -> Any | None:
+    """A Workshop report's button: reverse the release it reports."""
+    return _view("workshop", release_id, [("Undo", "danger", "undo", None)])
+
+
+def result_view(produces: dict[str, Any] | None, default: Any | None) -> Any | None:
+    """The buttons under a result: an Undo for a Workshop release, else the usual controls."""
+    release_id = (produces or {}).get("undo_release")
+    return build_undo_view(str(release_id)) if release_id else default
+
+
 def build_ops_embed(status: SystemStatus) -> dict[str, Any]:
     ready, running = status.work_items.get("ready", 0), status.work_items.get("running", 0)
     paused, dead = status.work_items.get("paused", 0), status.work_items.get("dead_letter", 0)
@@ -226,6 +237,10 @@ class DiscordUIService:
             return self._workflow_action(action.action, action.entity_id)
         if action.scope == "gate":
             return self._gate_choice(action.action, action.entity_id)
+        if action.scope == "workshop" and action.action == "undo":
+            from tasque2.workshop.pipeline import undo_by_id
+
+            return undo_by_id(self.session, action.entity_id)
         return f"Unknown Tasque action: {action.scope}:{action.action}"
 
     def _gate_choice(self, index: str, workflow_run_id: str) -> str:

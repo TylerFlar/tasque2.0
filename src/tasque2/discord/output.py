@@ -39,6 +39,7 @@ from tasque2.discord.ui import (
     build_work_controls_view,
     build_workflow_controls_view,
     build_workflow_status_panel_embed,
+    result_view,
 )
 from tasque2.discord.uploads import DiscordFileUpload
 from tasque2.events import record_event
@@ -361,7 +362,9 @@ class DiscordOutputService:
             sent = gateway.send_message(
                 channel_id=thread_id,
                 content=content,
-                view=build_work_controls_view(work_item) if last else None,
+                view=result_view(attempt.produces if attempt else None, build_work_controls_view(work_item))
+                if last
+                else None,
                 attachments=uploads if last else None,
             )
             sent_messages.append((sent, content))
@@ -428,10 +431,13 @@ class DiscordOutputService:
         sent_messages: list[tuple[DiscordSentMessage, str]] = []
         for index, content in enumerate(chunks):
             last = index == len(chunks) - 1
+            undo = next(
+                (attempt.produces for _node, attempt in finals if (attempt.produces or {}).get("undo_release")), None
+            )
             sent = gateway.send_message(
                 channel_id=thread_id,
                 content=content,
-                view=build_workflow_controls_view(run) if last else None,
+                view=result_view(undo, build_workflow_controls_view(run)) if last else None,
                 attachments=uploads if last else None,
             )
             sent_messages.append((sent, content))

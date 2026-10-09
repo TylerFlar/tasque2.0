@@ -163,3 +163,102 @@ def read_document(path: Path) -> str:
 
 def content_hash(content: str) -> str:
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
+# --- edits held in the config repository ---------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class HeldEdit:
+    """One document a change edited: its text when the change began (None: new) and after (None: gone)."""
+
+    namespace: str
+    canonical_key: str
+    before: str | None
+    after: str | None
+
+
+def held_edits(root: Path, base: str, ref: str = "HEAD") -> list[HeldEdit]:
+    """The doctrine documents the config repository at ``root`` changed between ``base`` and ``ref``."""
+    from tasque2.ops.datarepo import changed_files, file_at
+
+    edits = []
+    for name in changed_files(base, ref, root=root):
+        parts = name.split("/")
+        if len(parts) != 3 or parts[0] != "doctrine" or not parts[2].endswith(".md"):
+            continue
+        before, after = file_at(base, name, root=root), file_at(ref, name, root=root)
+        edits.append(
+            HeldEdit(
+                namespace=parts[1],
+                canonical_key=unquote(parts[2][: -len(".md")]),
+                before=before.decode("utf-8").replace("\r\n", "\n") if before is not None else None,
+                after=after.decode("utf-8").replace("\r\n", "\n") if after is not None else None,
+            )
+        )
+    return edits
+
+
+def held_conflicts(session: Session, edits: list[HeldEdit]) -> list[str]:
+    """Documents an edit cannot land on: changed live since the change began, gone, or new but taken."""
+    service = MemoryService(session)
+    found = []
+    for edit in edits:
+        live = service.get_canonical(namespace=edit.namespace, canonical_key=edit.canonical_key)
+        name = f"{edit.namespace}/{edit.canonical_key}"
+        if edit.before is None and live is not None and live.content != edit.after:
+            found.append(f"{name}: a live document exists already")
+        elif edit.before is not None and live is None and edit.after is not None:
+            found.append(f"{name}: gone from the live documents")
+        elif edit.before is not None and live is not None and live.content not in (edit.before, edit.after):
+            found.append(f"{name}: changed live since the change began")
+    return found
+
+
+def apply_held(session: Session, edits: list[HeldEdit], *, dry_run: bool = False) -> list[DoctrineChange]:
+    """Land each edit while its document still reads as the change saw it; a conflict is reported and
+    left alone. An edit already in place is unchanged, so applying twice changes nothing."""
+    service = MemoryService(session)
+    blocked = {line.split(":", 1)[0] for line in held_conflicts(session, edits)}
+    changes: list[DoctrineChange] = []
+    for edit in edits:
+        namespace, key = edit.namespace, edit.canonical_key
+        if f"{namespace}/{key}" in blocked:
+            changes.append(DoctrineChange(namespace, key, "conflict", "changed live since the change began"))
+            continue
+        live = service.get_canonical(namespace=namespace, canonical_key=key)
+        if edit.after is None:
+            if live is None:
+                changes.append(DoctrineChange(namespace, key, "unchanged"))
+                continue
+            if not dry_run:
+                service.archive_memory(live.id)
+            changes.append(DoctrineChange(namespace, key, "retired", f"{len(live.content)} chars archived"))
+            continue
+        if live is not None and live.content == edit.after:
+            changes.append(DoctrineChange(namespace, key, "unchanged"))
+            continue
+        if not dry_run:
+            try:
+                service.upsert_canonical(
+                    namespace=namespace,
+                    canonical_key=key,
+                    kind=live.kind if live is not None else "doctrine",
+                    content=edit.after,
+                    tags=list(live.tags or []) if live is not None else [namespace, key],
+                    source_kind="workshop_release",
+                    pinned=live.pinned if live is not None else True,
+                    ttl_days=live.ttl_days if live is not None else None,
+                )
+            except MemoryBudgetExceeded as exc:
+                changes.append(DoctrineChange(namespace, key, "over_budget", str(exc)))
+                continue
+        status = "created" if live is None else "applied"
+        detail = f"{len(edit.after)} chars" if live is None else f"{len(live.content)} -> {len(edit.after)} chars"
+        changes.append(DoctrineChange(namespace, key, status, detail))
+    return changes
+
+
+def reversed_edits(edits: list[HeldEdit]) -> list[HeldEdit]:
+    """The edits that undo ``edits``: each document back to its text before the change."""
+    return [HeldEdit(edit.namespace, edit.canonical_key, edit.after, edit.before) for edit in edits]

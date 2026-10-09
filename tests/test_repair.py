@@ -332,3 +332,22 @@ def test_launch_starts_the_workflow_in_the_worktree(fresh_db: Path, project: Pat
         assert fix_item.context["memory_canonical_keys"] == ["tasque_repair"]
         trees = [RepoWorktree.from_data(item) for item in run.input["worktrees"]]
     remove_worktrees(trees, delete_branches=True)
+
+
+def test_a_merge_never_replaces_a_release_waiting_to_go_live(fresh_db: Path, project: Path) -> None:
+    from tasque2.daemon.restart import request_restart
+
+    request_restart(reason="release w1", window="now", switch=[{"repo": str(project), "ref": "workshop/w1"}])
+    trees = create_worktrees("t7")
+    _commit_fix(trees[0])
+    with session_scope() as session:
+        run = _repair_run(session, trees, {"fixed": True})
+        approve = session.scalar(select(WorkflowNode).where(WorkflowNode.node_key == "approve"))
+        approve.output = {"answer": "Merge and restart"}
+        work = WorkItem(title="merge", task_instruction="x", worker_kind=repair.MERGE_WORKER, workflow_run_id=run.id)
+        session.add(work)
+        session.flush()
+        result = repair.merge_worker(work)
+    assert result["produces"]["merged"] is False and "kept on repair/t7" in result["summary"]
+    assert read_request()["reason"] == "release w1"
+    assert _git(project, "branch", "--list", "repair/t7")

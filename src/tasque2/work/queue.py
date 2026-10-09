@@ -15,6 +15,7 @@ from typing import Any
 from sqlalchemy import func, or_, select, update
 from sqlalchemy.orm import Session
 
+from tasque2.config import get_settings
 from tasque2.events import record_event
 from tasque2.models import FailedWork, ProviderRun, WorkAttempt, WorkDependency, WorkItem, utc_now
 from tasque2.telemetry import instruments
@@ -43,6 +44,16 @@ class WorkQueue:
     ) -> ClaimedWork | None:
         now = now or utc_now()
         gated = capacity_gate.is_closed(now)
+        settings = get_settings()
+        caps = settings.lane_cap_map
+        running: dict[str, int] = {}
+        if caps:
+            for lane, count in self.session.execute(
+                select(WorkItem.lane, func.count()).where(WorkItem.status == "running").group_by(WorkItem.lane)
+            ).all():
+                running[str(lane)] = int(count)
+        # A capped lane (background work such as the Workshop) never takes the slots kept for the rest.
+        open_to_capped = sum(running.values()) < settings.daemon_concurrency - settings.reserved_slots
         candidates = self.session.scalars(
             select(WorkItem)
             .where(WorkItem.status == "ready", or_(WorkItem.not_before.is_(None), WorkItem.not_before <= now))
@@ -51,6 +62,10 @@ class WorkQueue:
         ).all()
         for work_item in candidates:
             if gated and work_item.worker_kind.startswith("provider."):
+                continue
+            if work_item.lane in caps and (
+                running.get(work_item.lane, 0) >= caps[work_item.lane] or not open_to_capped
+            ):
                 continue
             if work_item.deadline_at is not None and work_item.deadline_at < now:
                 self._expire_overdue(work_item, now=now)
@@ -154,6 +169,30 @@ class WorkQueue:
             payload={"produces": produces or {}, "report_artifact_id": report_artifact_id},
         )
         self._observe(attempt, work_item, outcome=work_item.status)
+        return attempt
+
+    def defer_attempt(
+        self, attempt_id: str, *, until: datetime, reason: str, now: datetime | None = None
+    ) -> WorkAttempt:
+        """The worker cannot go on yet: the item is ready again at ``until``, and the attempt it used is
+        given back (``max_attempts`` grows by one), so waiting is never a failure."""
+        now = now or utc_now()
+        attempt = self._get_attempt(attempt_id)
+        work_item = attempt.work_item
+        self.session.refresh(work_item)
+        attempt.status = "deferred"
+        attempt.ended_at = now
+        attempt.summary = reason
+        if work_item.status in {"cancel_requested", "canceled"}:
+            work_item.status = "canceled"
+        else:
+            work_item.status = "ready"
+            work_item.not_before = until
+            work_item.max_attempts = max(work_item.max_attempts, work_item.attempt_count + 1)
+        self.session.flush()
+        self._event(
+            "work.deferred", work_item, attempt_id=attempt.id, summary=reason, payload={"until": until.isoformat()}
+        )
         return attempt
 
     def fail_attempt(

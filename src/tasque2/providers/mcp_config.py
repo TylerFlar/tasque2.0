@@ -37,6 +37,9 @@ def tasque_mcp_server_config(
     for name in _PASSTHROUGH_ENV:
         if os.environ.get(name):
             env[name] = os.environ[name]
+    # Always explicit, from the daemon itself: a run whose own environment points PYTHONPATH at staged code
+    # (a Workshop build) must never hand that to the live server, which would run it against live data.
+    env["PYTHONPATH"] = os.environ.get("PYTHONPATH", "")
     for name, value in os.environ.items():
         if name.startswith("OTEL_") and name not in {"OTEL_SERVICE_NAME", "OTEL_RESOURCE_ATTRIBUTES"}:
             env[name] = value

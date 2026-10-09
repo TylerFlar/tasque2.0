@@ -24,7 +24,7 @@ from datetime import datetime, time, timedelta
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from tasque2.config import get_settings
@@ -39,6 +39,10 @@ USER_IDLE = timedelta(minutes=15)
 STALE_REQUEST = timedelta(hours=24)
 
 
+class RestartBusy(RuntimeError):
+    """A restart that switches code is already waiting; a second one would replace it."""
+
+
 def request_path() -> Path:
     return get_settings().resolved_data_dir / REQUEST_FILE
 
@@ -47,10 +51,17 @@ def result_path() -> Path:
     return get_settings().resolved_data_dir / RESULT_FILE
 
 
-def request_restart(*, reason: str, window: str = "quiet", switch: list[dict[str, Any]] | None = None) -> Path:
-    """Ask the daemon to restart; ``switch`` entries are ``{repo, ref, push?, remote?, branch?}``."""
+def request_restart(
+    *, reason: str, window: str = "quiet", switch: list[dict[str, Any]] | None = None, release: str | None = None
+) -> Path:
+    """Ask the daemon to restart; ``switch`` entries are ``{repo, ref, push?, remote?, branch?}``. ``release``
+    is a release plan's path (``tasque2.ops.release``): the respawn also merges its config, runs its
+    ``release-apply`` with the new code, and restores the database snapshot if anything fails."""
     if window not in WINDOWS:
         raise ValueError(f"window must be one of {', '.join(WINDOWS)}")
+    pending = read_request()
+    if pending and (pending.get("switch") or pending.get("release")) and (switch or release):
+        raise RestartBusy(f"another restart is waiting to go live: {pending.get('reason')}")
     entries = []
     for entry in switch or []:
         if not entry.get("repo") or not entry.get("ref"):
@@ -67,6 +78,8 @@ def request_restart(*, reason: str, window: str = "quiet", switch: list[dict[str
     path = request_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {"requested_at": utc_now().isoformat(), "reason": reason, "window": window, "switch": entries}
+    if release:
+        payload["release"] = str(Path(release).resolve())
     temporary = path.with_suffix(".tmp")
     temporary.write_text(json.dumps(payload, indent=1), encoding="utf-8")
     os.replace(temporary, path)
@@ -103,7 +116,11 @@ def waiting_reason(session: Session, request: dict[str, Any], *, now: datetime |
     from tasque2.schedules import ScheduleService
 
     now = now or utc_now()
-    if session.scalar(select(func.count()).select_from(WorkItem).where(WorkItem.status == "ready")):
+    if session.scalar(
+        select(func.count())
+        .select_from(WorkItem)
+        .where(WorkItem.status == "ready", or_(WorkItem.not_before.is_(None), WorkItem.not_before <= now))
+    ):
         return "work is waiting"
     last_inbound = session.scalar(
         select(func.max(DiscordMessage.created_at)).where(DiscordMessage.direction == "inbound")
@@ -142,6 +159,8 @@ def respawn_command(*, pid: int) -> list[str]:
         str(settings.resolved_project_dir),
         "--data",
         str(settings.resolved_data_dir),
+        "--database",
+        str(settings.database_path),
     ]
 
 

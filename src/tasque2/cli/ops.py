@@ -43,11 +43,13 @@ WORK_NODE_KINDS = ("work", "fan_out")
 
 
 @app.command("migrate")
-def migrate() -> None:
-    """Create or upgrade the database schema."""
-    from tasque2.migrations import upgrade_database
+def migrate(
+    to: Annotated[str | None, typer.Option("--to", help="Step back to this revision (an undo).")] = None,
+) -> None:
+    """Create or upgrade the database schema (or, with --to, step it back)."""
+    from tasque2.migrations import downgrade_database, upgrade_database
 
-    status = upgrade_database()
+    status = downgrade_database(to) if to else upgrade_database()
     echo(f"{status.database_path}: {status.current_display}")
 
 

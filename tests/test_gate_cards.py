@@ -127,3 +127,83 @@ def test_an_unknown_choice_is_refused(fresh_db: Path) -> None:
 def test_bad_choices_are_refused_when_the_definition_is_read(node: dict) -> None:
     with pytest.raises(ValueError, match="choices"):
         validate_definition({"nodes": [node]})
+
+
+def _bind(session, run: WorkflowRun, thread: str = "thread-accounts") -> None:
+    from tasque2.models import DiscordThread
+
+    session.add(
+        DiscordThread(purpose="workflow", discord_thread_id=thread, discord_channel_id="jobs", workflow_run_id=run.id)
+    )
+    session.flush()
+
+
+def test_typing_while_a_gate_waits_is_a_note_and_only_a_choice_answers_it(fresh_db: Path) -> None:
+    from tasque2.discord.routing import DiscordService
+
+    with session_scope() as session:
+        run = _started(session)
+        _bind(session, run)
+        routing = DiscordService(session)
+        asked = routing.handle_thread_reply(
+            discord_message_id="m1",
+            discord_channel_id="thread-accounts",
+            discord_thread_id="thread-accounts",
+            author="user",
+            content="what does this change?",
+        )
+        assert asked.action == "workflow_gate_note"
+        gate = _gate(session, run)
+        assert gate.status == "awaiting_input" and gate.input["notes"][0]["text"] == "what does this change?"
+        answered = routing.handle_thread_reply(
+            discord_message_id="m2",
+            discord_channel_id="thread-accounts",
+            discord_thread_id="thread-accounts",
+            author="user",
+            content="discard",
+        )
+        assert answered.action == "workflow_gate_answered"
+        assert _gate(session, run).output == {
+            "answer": "Discard",
+            "notes": [{"at": gate.input["notes"][0]["at"], "author": "user", "text": "what does this change?"}],
+        }
+
+
+def test_a_gate_with_nothing_to_ask_passes_on_its_own(fresh_db: Path) -> None:
+    definition = {
+        "nodes": [
+            {
+                "key": "check",
+                "kind": "work",
+                "title": "Check",
+                "task_instruction": "ok",
+                "worker_kind": "function.echo",
+            },
+            {
+                "key": "approve",
+                "kind": "gate",
+                "choices": ["Ship", "Discard"],
+                "skip_when": "check.task_instruction",
+                "depends_on": ["check"],
+            },
+            {
+                "key": "after",
+                "kind": "work",
+                "title": "After",
+                "task_instruction": "after",
+                "worker_kind": "function.echo",
+                "depends_on": ["approve"],
+            },
+        ]
+    }
+    validate_definition(definition)
+    with session_scope() as session:
+        service = WorkflowService(session)
+        made = service.create_definition(name="auto", version="1", definition=definition)
+        run = service.start_run(workflow_definition_id=made.id)
+        service.tick_runs()
+        WorkRunner(session).run_next()
+        service.tick_runs()
+        gate = _gate(session, run)
+        assert gate.status == "succeeded" and gate.output == {"answer": "Ship", "skipped": True}
+        assert run.status == "active"  # it never waited

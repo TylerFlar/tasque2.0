@@ -1,9 +1,12 @@
-"""Throwaway git worktrees for a repair: the core repository and every extension repository in it.
+"""Throwaway git worktrees for a repair or a Workshop change: the core repository, every extension
+repository in it, and (for a change) the config repository rooted at the data directory.
 
-A repair works on its own branch in its own folder, next to the live checkout, so the code the
-daemon runs never changes until the user approves and the restart fast-forwards it. Each worktree
-records the live HEAD it started from and a hash of the live checkout's status, so a check after
-the repair can prove the live checkouts were left alone.
+A repair or a change works on its own branch in its own folder, next to the live checkout, so the code
+the daemon runs never changes until the user approves and the restart fast-forwards it. Each worktree
+records the live HEAD it started from and a hash of the live checkout's status, so a check afterwards
+can prove the live checkouts were left alone. A change's config worktree sits at ``<root>/data``, so
+the root is a whole staging Tasque: code, extensions, config, and the database copy a rehearsal puts
+there (ignored by git).
 """
 
 from __future__ import annotations
@@ -52,9 +55,9 @@ def status_hash(repo: Path | str) -> str:
     return hashlib.sha256(git(repo, "status", "--porcelain", "--untracked-files=no").encode("utf-8")).hexdigest()
 
 
-def workspace_root(repair_id: str) -> Path:
+def workspace_root(repair_id: str, kind: str = "repair") -> Path:
     project = get_settings().resolved_project_dir
-    return project.parent / f"{project.name}-repair" / repair_id
+    return project.parent / f"{project.name}-{kind}" / repair_id
 
 
 def _extension_repos() -> list[Path]:
@@ -64,11 +67,14 @@ def _extension_repos() -> list[Path]:
     return sorted(child for child in root.iterdir() if child.is_dir() and (child / ".git").exists())
 
 
-def create_worktrees(repair_id: str) -> list[RepoWorktree]:
-    """A worktree of the core repository and, nested in it, one of each extension repository."""
+def create_worktrees(repair_id: str, *, kind: str = "repair", include_data: bool = False) -> list[RepoWorktree]:
+    """A worktree of the core repository and, nested in it, one of each extension repository (and, with
+    ``include_data``, one of the config repository at ``data``)."""
+    from tasque2.ops.datarepo import is_repo
+
     project = get_settings().resolved_project_dir
-    root = workspace_root(repair_id)
-    branch = f"repair/{repair_id}"
+    root = workspace_root(repair_id, kind)
+    branch = f"{kind}/{repair_id}"
     made: list[RepoWorktree] = []
     try:
         root.parent.mkdir(parents=True, exist_ok=True)
@@ -81,6 +87,11 @@ def create_worktrees(repair_id: str) -> list[RepoWorktree]:
             base = git(repo, "rev-parse", "HEAD")
             git(repo, "worktree", "add", "-q", "-b", branch, str(target), base)
             made.append(RepoWorktree(repo.name, str(repo), str(target), branch, base, status_hash(repo)))
+        data = get_settings().resolved_data_dir
+        if include_data and is_repo(data):
+            base = git(data, "rev-parse", "HEAD")
+            git(data, "worktree", "add", "-q", "-b", branch, str(root / "data"), base)
+            made.append(RepoWorktree("data", str(data), str(root / "data"), branch, base, status_hash(data)))
     except WorktreeError:
         remove_worktrees(made, delete_branches=True)
         raise

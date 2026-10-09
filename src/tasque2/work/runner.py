@@ -42,6 +42,16 @@ class WorkerNotFoundError(LookupError):
     pass
 
 
+class WorkDeferred(Exception):  # noqa: N818 - a signal, not an error
+    """Raised by a function worker that cannot go on yet: its item waits until ``until`` and runs again,
+    with nothing recorded as a failure."""
+
+    def __init__(self, until: datetime, reason: str) -> None:
+        super().__init__(reason)
+        self.until = until
+        self.reason = reason
+
+
 class FunctionWorkerRegistry:
     """In-process workers keyed by ``worker_kind`` (used for smoke runs and tests)."""
 
@@ -102,12 +112,20 @@ def core_function_workers() -> dict[str, WorkerFunction]:
     """No-model workers the core itself provides for its own schedules."""
     from tasque2.ops import repair
     from tasque2.ops.backup_runner import backup_worker
+    from tasque2.workshop import pipeline, reply
 
     return {
         "function.backup": backup_worker,
         repair.LAUNCH_WORKER: repair.launch_worker,
         repair.VERIFY_WORKER: repair.verify_worker,
         repair.MERGE_WORKER: repair.merge_worker,
+        pipeline.CLASSIFY_WORKER: pipeline.classify_worker,
+        pipeline.PREPARE_WORKER: pipeline.prepare_worker,
+        pipeline.VERIFY_WORKER: pipeline.verify_worker,
+        pipeline.RELEASE_WORKER: pipeline.release_worker,
+        pipeline.REPORT_WORKER: pipeline.report_worker,
+        pipeline.ANNOUNCE_WORKER: pipeline.announce_worker,
+        pipeline.REPLY_WORKER: reply.reply_worker,
     }
 
 
@@ -178,6 +196,10 @@ class WorkRunner:
                     result = self.provider_runtime.run(self.session, work_item, attempt)
                 else:
                     result = self.registry.run(work_item)
+            except WorkDeferred as deferred:
+                queue.defer_attempt(attempt.id, until=deferred.until, reason=deferred.reason)
+                current.set_attribute("tasque.work.status", work_item.status)
+                return RunOutcome(work_item.id, attempt.id, work_item.status, deferred.reason)
             except Exception as exc:
                 record_exception(current, exc)
                 queue.fail_attempt(attempt.id, error_type=type(exc).__name__, error_message=str(exc))

@@ -508,3 +508,18 @@ def test_unknown_model_profile_or_effort_is_rejected() -> None:
         model_choice_for("claude", {"model_profile": "hint:fast"})
     with pytest.raises(ValueError, match="effort must be one of"):
         model_choice_for("claude", {"effort": "extreme"})
+
+
+def test_a_guarded_run_carries_the_workshop_hook_in_its_settings(isolated, tmp_path) -> None:
+    import json as _json
+
+    from tasque2.providers.base import ProviderRequest
+    from tasque2.providers.claude import ClaudeCodeProvider
+    from tasque2.worker.runtime import guard_settings
+
+    settings = guard_settings({"root": str(tmp_path / "change"), "mode": "build"})
+    argv = ClaudeCodeProvider().build_argv(ProviderRequest(provider="claude", prompt="x", settings=settings))
+    passed = _json.loads(argv[argv.index("--settings") + 1])
+    command = passed["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+    assert "workshop" in command and "guard.py" in command and '"--mode" "build"' in command
+    assert guard_settings(None) == {}

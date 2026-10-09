@@ -13,7 +13,16 @@ is broken. Steps:
    previous code again, and append a fault to the ledger;
 6. if it is healthy: push the repositories the request asked to push, and delete the merged refs.
 
-The outcome goes to ``daemon.restart.result.json``.
+A request may also carry a release plan (``tasque2.ops.release``): then, before the code switch, the
+database is snapshotted, the plan's ``pre_switch`` commands run with the old code (an undo's downgrade),
+and the config repository is fast-forwarded to the change's branch (its own live edits committed first,
+the change carried onto them when needed); after it ``uv sync`` runs when the lockfile changed and the
+new code's ``tasque2 release-apply`` lands the migrations, doctrine, lanes, workflows and database
+script. Any failure, then or at the health check, resets the code and the config, re-syncs, and
+restores the database snapshot before the previous code starts again.
+
+The outcome goes to ``daemon.restart.result.json``, and a release's into its plan (``outcome``, with the
+commits each repository moved between, and ``released_at`` when it went live).
 """
 
 from __future__ import annotations
@@ -22,8 +31,11 @@ import argparse
 import hashlib
 import json
 import os
+import shutil
+import sqlite3
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -165,6 +177,71 @@ def switch_repos(entries: list[dict[str, Any]], prior: dict[str, str]) -> tuple[
     return done, None
 
 
+def snapshot_database(database: Path, target: Path) -> Path:
+    """A consistent copy of the live database (the backup API, so the write-ahead log is included)."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    source = sqlite3.connect(f"file:{database}?mode=ro", uri=True)
+    copy = sqlite3.connect(str(target))
+    try:
+        source.backup(copy)
+    finally:
+        copy.close()
+        source.close()
+    return target
+
+
+def restore_database(snapshot: Path, database: Path) -> None:
+    source = sqlite3.connect(f"file:{snapshot}?mode=ro", uri=True)
+    live = sqlite3.connect(str(database))
+    try:
+        source.backup(live)
+    finally:
+        live.close()
+        source.close()
+
+
+def merge_config(data: Path, release: dict[str, Any]) -> tuple[str | None, str | None]:
+    """Commit the live config's own edits, carry the change onto them when needed, fast-forward; returns
+    (the head before, an error)."""
+    branch, base = release["data"]["branch"], release["data"]["base"]
+    git(str(data), "add", "-A")
+    if git(str(data), "status", "--porcelain").stdout.strip():
+        git(str(data), "commit", "-q", "-m", f"live: before release {release['id']}")
+    prior = head_of(str(data))
+    if git(str(data), "merge-base", "--is-ancestor", prior, branch).returncode != 0:
+        place = Path(tempfile.mkdtemp(prefix="tasque-rebase-"))
+        shutil.rmtree(place, ignore_errors=True)
+        added = git(str(data), "worktree", "add", "-q", str(place), branch)
+        if added.returncode != 0:
+            return prior, f"cannot check out the config branch: {added.stderr.strip()[:300]}"
+        moved = git(str(place), "rebase", "-q", "--onto", prior, base)
+        if moved.returncode != 0:
+            git(str(place), "rebase", "--abort")
+        git(str(data), "worktree", "remove", "--force", str(place))
+        shutil.rmtree(place, ignore_errors=True)
+        if moved.returncode != 0:
+            return prior, f"the config change no longer applies cleanly: {moved.stderr.strip()[:300]}"
+        release["data"]["rebased"] = True  # the change's commits now start from the live head
+    merged = git(str(data), "merge", "--ff-only", "-q", branch)
+    if merged.returncode != 0:
+        return prior, f"the config fast-forward failed: {merged.stderr.strip()[:300]}"
+    return prior, None
+
+
+def tasque_command(project: Path) -> list[str]:
+    scripts = project / ".venv" / ("Scripts" if os.name == "nt" else "bin")
+    return [str(scripts / ("tasque2.exe" if os.name == "nt" else "tasque2"))]
+
+
+def run_step(command: list[str], project: Path, timeout: float = 15 * 60) -> tuple[bool, str]:
+    try:
+        done = subprocess.run(command, cwd=str(project), capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, f"{type(exc).__name__}: {exc}"
+    tail = (done.stderr.strip() or done.stdout.strip())[-400:]
+    return done.returncode == 0, tail
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--wait-pid", type=int, required=True)
@@ -172,9 +249,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--data", required=True)
     parser.add_argument("--health-seconds", type=float, default=HEALTH_SECONDS)
     parser.add_argument("--daemon-command", help="JSON list; tests replace the daemon with a stand-in")
+    parser.add_argument("--database", help="the live database (default: tasque2.sqlite3 in the data directory)")
+    parser.add_argument("--tasque-command", help="JSON list; tests replace the new code's CLI with a stand-in")
     args = parser.parse_args(argv)
     project, data = Path(args.project), Path(args.data)
     command = json.loads(args.daemon_command) if args.daemon_command else default_daemon_command(project)
+    tasque = json.loads(args.tasque_command) if args.tasque_command else tasque_command(project)
+    database = Path(args.database) if args.database else data / "tasque2.sqlite3"
     result: dict[str, Any] = {"started_at": now_iso(), "old_pid": args.wait_pid}
 
     deadline = time.monotonic() + EXIT_WAIT_SECONDS
@@ -194,21 +275,81 @@ def main(argv: list[str] | None = None) -> int:
     entries = list(request.get("switch") or [])
     prior = {entry["repo"]: head_of(entry["repo"]) for entry in entries}
     result.update(reason=request.get("reason"), prior=prior)
-
-    switched, error = switch_repos(entries, prior)
+    release: dict[str, Any] | None = None
+    error: str | None = None
+    if request.get("release"):
+        try:
+            release = json.loads(Path(request["release"]).read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            error = f"the release plan cannot be read: {exc}"
+    snapshot: Path | None = None
+    config_prior: str | None = None
+    if release is not None:
+        result["release"] = release.get("id")
+        try:
+            snapshot = snapshot_database(database, data / "backups" / f"pre-release-{release['id']}" / database.name)
+        except sqlite3.Error as exc:
+            error = f"the database snapshot failed: {exc}"
+        for step in release.get("pre_switch") or []:
+            if error is not None:
+                break
+            ok_step, tail = run_step([*tasque, *step], project)
+            result.setdefault("steps", []).append({"step": " ".join(step), "ok": ok_step, "detail": tail})
+            if not ok_step:
+                error = f"{' '.join(step)} failed: {tail}"
+        if error is None and release.get("data"):
+            config_prior, error = merge_config(data, release)
+            if error:
+                config_prior = None if head_of(str(data)) == config_prior else config_prior
+            elif release["data"].get("rebased"):
+                release["data"]["base"] = config_prior  # the apply reads the change's own commits only
+                Path(request["release"]).write_text(json.dumps(release, indent=1), encoding="utf-8")
+        if error and snapshot is not None and release.get("pre_switch"):
+            restore_database(snapshot, database)  # the old code's own steps may have moved it
     if error:
+        entries = []  # nothing of a release is switched when its config or snapshot failed
+
+    switched, switch_error = switch_repos(entries, prior)
+    error = error or switch_error
+
+    def undo(reason: str) -> None:
+        """Back to where it was: code, config, dependencies, database."""
+        for repo in switched:
+            git(repo, "reset", "--keep", prior[repo])
+        if config_prior:
+            git(str(data), "reset", "--keep", config_prior)
+        if release is not None and release.get("lock_changed"):
+            run_step(["uv", "sync", "--frozen"], project)
+        if snapshot is not None:
+            restore_database(snapshot, database)
+        result["rolled_back"] = [*switched, *([str(data)] if config_prior else [])]
+        record_fault(data, reason)
+
+    if release is not None and not error:
+        steps = []
+        if release.get("lock_changed"):
+            steps.append(("uv sync", ["uv", "sync", "--frozen"]))
+        steps.append(("release-apply", [*tasque, "release-apply", "--plan", str(request["release"])]))
+        for name, step in steps:
+            ok_step, tail = run_step(step, project)
+            result.setdefault("steps", []).append({"step": name, "ok": ok_step, "detail": tail})
+            if not ok_step:
+                error = f"{name} failed: {tail}"
+                break
+        if error:
+            undo(f"release {release.get('id')}: {error}; rolled back")
+            switched, config_prior = [], None
+            result["release_error"] = error
+    elif error:
         result["switch_error"] = error
         record_fault(data, error)
 
     rotate_logs(data)
     process = start_daemon(command, project, data)
     ok = healthy(data, old_pid=args.wait_pid, timeout=args.health_seconds)
-    if not ok and switched:
+    if not ok and (switched or config_prior):
         stop_tree(process.pid)
-        for repo in switched:
-            git(repo, "reset", "--keep", prior[repo])
-        result["rolled_back"] = switched
-        record_fault(data, f"the daemon did not come up healthy after switching {', '.join(switched)}; rolled back")
+        undo(f"the daemon did not come up healthy after switching {', '.join(switched) or 'the config'}; rolled back")
         rotate_logs(data)
         process = start_daemon(command, project, data)
         result["previous_code_healthy"] = healthy(data, old_pid=args.wait_pid, timeout=args.health_seconds)
@@ -227,9 +368,39 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 pushed.append({"repo": entry["repo"], "ok": push.returncode == 0, "detail": push.stderr.strip()[-300:]})
             git(entry["repo"], "branch", "-d", entry["ref"])
+        if release is not None and config_prior is not None and not error:
+            release["data"]["head"] = head_of(str(data))
+            git(str(data), "branch", "-D", release["data"]["branch"])
     result.update(ok=ok and not error, switched=switched, pushed=pushed, new_pid=process.pid, ended_at=now_iso())
+    if release is not None:
+        record_release(Path(request["release"]), release, result, prior=prior, switched=switched)
     (data / RESULT_FILE).write_text(json.dumps(result, indent=1), encoding="utf-8")
     return 0 if result["ok"] else 1
+
+
+def record_release(
+    path: Path, release: dict[str, Any], result: dict[str, Any], *, prior: dict[str, str], switched: list[str]
+) -> None:
+    """How the release went, into its plan: what the new code's release-apply wrote there is kept."""
+    try:
+        stored = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        stored = {}
+    merged = {**release, **{key: value for key, value in stored.items() if key == "revision_before"}}
+    merged["outcome"] = {
+        "ok": bool(result.get("ok")),
+        "at": now_iso(),
+        "error": result.get("release_error") or result.get("switch_error"),
+        "rolled_back": result.get("rolled_back") or [],
+        "code": {repo: {"before": prior[repo], "after": head_of(repo)} for repo in switched},
+        "pushed": result.get("pushed") or [],
+    }
+    if result.get("ok"):
+        merged["released_at"] = now_iso()
+    try:
+        path.write_text(json.dumps(merged, indent=1), encoding="utf-8")
+    except OSError:
+        pass
 
 
 if __name__ == "__main__":

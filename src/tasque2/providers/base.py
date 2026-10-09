@@ -23,6 +23,7 @@ class ProviderRequest:
     result_token: str | None = None
     work_item_id: str | None = None
     argv: list[str] = field(default_factory=list)
+    settings: dict[str, Any] = field(default_factory=dict)  # merged into the CLI's --settings (hooks)
 
 
 @dataclass(frozen=True)

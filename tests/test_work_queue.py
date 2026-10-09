@@ -757,3 +757,26 @@ def test_running_attempt_completion_honors_an_external_cancel(fresh_db: Path) ->
 
         assert runner_session.get(WorkItem, work.id).status == "canceled"
         assert runner_session.get(WorkAttempt, claimed.attempt.id).status == "canceled"
+
+
+def test_a_capped_lane_runs_one_at_a_time_and_never_takes_the_kept_slot(fresh_db, monkeypatch) -> None:
+    from tasque2.config import reset_settings
+    from tasque2.models import WorkItem
+    from tasque2.work.queue import WorkQueue
+
+    monkeypatch.setenv("TASQUE2_LANE_CAPS", "workshop:1")
+    monkeypatch.setenv("TASQUE2_DAEMON_CONCURRENCY", "3")
+    monkeypatch.setenv("TASQUE2_RESERVED_SLOTS", "1")
+    reset_settings()
+    with session_scope() as session:
+        for title, lane in (("w1", "workshop"), ("w2", "workshop"), ("k", "kitchen"), ("d", "daybook")):
+            session.add(WorkItem(title=title, task_instruction="x", worker_kind="function.echo", lane=lane))
+        session.flush()
+        queue = WorkQueue(session)
+        first = queue.claim_next_ready_work(lease_owner="t")
+        assert first.work_item.title == "w1"
+        second = queue.claim_next_ready_work(lease_owner="t")
+        assert second.work_item.lane != "workshop"  # the Workshop's one slot is taken
+        third = queue.claim_next_ready_work(lease_owner="t")
+        assert third.work_item.lane != "workshop"
+        assert queue.claim_next_ready_work(lease_owner="t") is None  # w2 waits: its cap, and the kept slot
