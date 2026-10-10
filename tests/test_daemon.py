@@ -124,6 +124,37 @@ def test_read_state_is_none_for_a_missing_or_corrupt_file(isolated: Path) -> Non
     assert control.read_state() is None
 
 
+def test_state_file_is_rewritten_once_a_reader_lets_go_of_it(isolated: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # Windows denies replacing a file another process has open (``tasque2 status``, a health check), so
+    # the tick waits a moment for the reader to close it instead of failing to write its state.
+    control.write_state(started_at=utc_now(), in_flight_attempt_ids=[], draining=False, version="1.0.0")
+    reader = control.state_path().open(encoding="utf-8")
+    monkeypatch.setattr(time, "sleep", lambda _seconds: reader.close())
+    try:
+        control.write_state(started_at=utc_now(), in_flight_attempt_ids=["a"], draining=False, version="2.0.0")
+    finally:
+        reader.close()
+
+    state = control.read_state()
+    assert state.version == "2.0.0"
+    assert state.in_flight == 1
+    assert not control.state_path().with_suffix(".tmp").exists()
+
+
+def test_state_file_that_stays_denied_still_fails_loudly(isolated: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    pauses: list[float] = []
+    monkeypatch.setattr(time, "sleep", pauses.append)
+
+    def denied(source: Path, target: Path) -> None:
+        raise PermissionError(13, "Access is denied", str(target))
+
+    monkeypatch.setattr(os, "replace", denied)
+
+    with pytest.raises(PermissionError):
+        control.write_state(started_at=utc_now(), in_flight_attempt_ids=[], draining=False, version="1.0.0")
+    assert pauses == [control.REPLACE_PAUSE_SECONDS] * (control.REPLACE_ATTEMPTS - 1)
+
+
 def test_state_freshness_follows_the_stale_window(monkeypatch: pytest.MonkeyPatch) -> None:
     _configure(monkeypatch, TASQUE2_DAEMON_STALE_SECONDS="60")
     now = utc_now()

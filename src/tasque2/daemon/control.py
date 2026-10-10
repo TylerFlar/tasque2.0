@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -19,6 +20,9 @@ from sqlalchemy.orm import Session
 
 from tasque2.config import get_settings
 from tasque2.models import Schedule, utc_now
+
+REPLACE_ATTEMPTS = 5
+REPLACE_PAUSE_SECONDS = 0.1
 
 
 @dataclass(frozen=True)
@@ -64,7 +68,16 @@ def write_state(
     }
     temporary = path.with_suffix(".tmp")
     temporary.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    os.replace(temporary, path)
+    # Windows denies replacing a file another process has open (``tasque2 status``, a health check,
+    # the restart watch) until that reader closes it: try again after a pause, then fail as before.
+    for attempt in range(1, REPLACE_ATTEMPTS + 1):
+        try:
+            os.replace(temporary, path)
+            return
+        except PermissionError:
+            if attempt == REPLACE_ATTEMPTS:
+                raise
+            time.sleep(REPLACE_PAUSE_SECONDS)
 
 
 def read_state() -> DaemonState | None:
