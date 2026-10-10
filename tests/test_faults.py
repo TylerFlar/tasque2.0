@@ -13,7 +13,11 @@ from tasque2.ops.faults import (
     fault_summary,
     faults_path,
     read_faults,
+    read_tool_errors,
+    read_warnings,
+    record_tool_error,
     recurring,
+    tool_errors_path,
 )
 
 
@@ -130,3 +134,36 @@ def test_a_full_ledger_rotates_and_both_files_are_read(isolated: Path, monkeypat
 
     assert faults_path().with_name("faults.1.jsonl").is_file()
     assert len(list(read_faults())) == 2
+
+
+def test_warnings_go_to_their_own_ledger_signed_by_the_message_before_its_values(isolated: Path) -> None:
+    configure_logging("INFO")
+    try:
+        logger = logging.getLogger("tasque2.sticky")
+        logger.warning("Could not pin %d sticky note(s) in %s", 2, "thread-a")
+        logger.warning("Could not pin %d sticky note(s) in %s", 5, "thread-b")
+        logger.warning("Something else")
+        logger.info("not a warning")
+        _log_caught(logger)
+    finally:
+        reset_logging()
+
+    entries = list(read_warnings())
+    assert [entry["message"] for entry in entries] == [
+        "Could not pin 2 sticky note(s) in thread-a",
+        "Could not pin 5 sticky note(s) in thread-b",
+        "Something else",
+    ]
+    assert entries[0]["signature"] == entries[1]["signature"] != entries[2]["signature"]
+    assert [entry["message"] for entry in read_faults()] == ["Digest failed"]  # errors stay in the fault ledger
+
+
+def test_a_tool_error_is_recorded_and_a_broken_ledger_never_raises(isolated: Path, monkeypatch) -> None:
+    record_tool_error("memory_get", "KeyError", "no such memory", work_item_id="w1")
+
+    assert [(entry["tool"], entry["error"], entry["work_item_id"]) for entry in read_tool_errors()] == [
+        ("memory_get", "no such memory", "w1")
+    ]
+    assert tool_errors_path().name == "tool_errors.jsonl"
+    monkeypatch.setattr("tasque2.ops.faults.tool_errors_path", lambda: Path("Z:/nowhere/that/exists/x.jsonl"))
+    record_tool_error("memory_get", "KeyError", "again")  # no exception escapes

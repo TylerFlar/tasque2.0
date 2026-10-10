@@ -3,7 +3,9 @@
 A provider run starts this server as a child of the agent CLI. Each tool call becomes an
 OpenTelemetry span (``tools/call {name}``) parented to the run's ``invoke_agent`` span
 through ``TRACEPARENT``, and is exported before the call returns because the process tree
-is shut down as soon as the worker submits its result.
+is shut down as soon as the worker submits its result. A call that answers ``{ok: false}``
+or raises is also written to the tool-error ledger (``tasque2.ops.faults``), where the
+Workshop's sweep reads it.
 """
 
 from __future__ import annotations
@@ -19,6 +21,7 @@ from opentelemetry.trace import SpanKind, Status, StatusCode
 
 from tasque2.extensions import registry as extension_registry
 from tasque2.mcp.tools import CORE_TOOLS
+from tasque2.ops.faults import record_tool_error
 from tasque2.telemetry import (
     clean_attributes,
     configure_telemetry,
@@ -62,6 +65,7 @@ def traced(tool: Callable[..., str]) -> Callable[..., str]:
         )
         started = time.perf_counter()
         error_type: str | None = None
+        error: str = ""
         try:
             with get_tracer().start_as_current_span(
                 f"tools/call {name}",
@@ -73,15 +77,18 @@ def traced(tool: Callable[..., str]) -> Callable[..., str]:
             ) as span:
                 try:
                     result = tool(*args, **kwargs)
-                    error_type = _tool_error(result)
+                    error_type, error = _tool_error(result) or (None, "")
                 except Exception as exc:
-                    error_type = type(exc).__name__
+                    error_type, error = type(exc).__name__, str(exc)
                     span.record_exception(exc)
                     raise
                 finally:
                     if error_type:
                         span.set_attribute("error.type", error_type)
                         span.set_status(Status(StatusCode.ERROR))
+                        record_tool_error(
+                            name, error_type, error, work_item_id=os.environ.get("TASQUE2_WORK_ITEM_ID") or None
+                        )
                     _record_duration(started, attributes, error_type)
             return result
         finally:
@@ -97,8 +104,8 @@ def _record_duration(started: float, attributes: dict[str, Any], error_type: str
     instruments().mcp_operation_duration.record(time.perf_counter() - started, metric_attributes)
 
 
-def _tool_error(result: Any) -> str | None:
-    """The error type a tool reported in its JSON envelope, if it reported one."""
+def _tool_error(result: Any) -> tuple[str, str] | None:
+    """The error type and message a tool reported in its JSON envelope, if it reported one."""
     if not isinstance(result, str) or '"ok": false' not in result:
         return None
     try:
@@ -106,7 +113,7 @@ def _tool_error(result: Any) -> str | None:
     except ValueError:
         return None
     if isinstance(payload, dict) and payload.get("ok") is False:
-        return str(payload.get("error_type") or "tool_error")
+        return str(payload.get("error_type") or "tool_error"), str(payload.get("error") or "")
     return None
 
 

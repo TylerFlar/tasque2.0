@@ -4,155 +4,38 @@ plan, a code change holds the code until it is live, and a cold release is annou
 
 from __future__ import annotations
 
-import json
-import subprocess
-from collections.abc import Callable
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
 import pytest
 from sqlalchemy import select
+from workshop_shop import (
+    TEMPLATE,
+    THREAD,
+    _commit,
+    _extension_build,
+    _gate,
+    _git,
+    _other_build,
+    _out,
+    _plan,
+    _template_build,
+    drive,
+    open_shop,
+)
 
-from tasque2.config import get_settings, reset_settings
 from tasque2.daemon.restart import clear_request, read_request
 from tasque2.db import session_scope
-from tasque2.memory import MemoryService
 from tasque2.models import WorkflowNode, WorkflowRun, WorkItem, utc_now
-from tasque2.ops import datarepo
-from tasque2.ops.rehearse import Rehearsal
 from tasque2.ops.release import find_plan, history, save_plan, state
-from tasque2.work.queue import WorkQueue
-from tasque2.work.runner import WorkRunner
 from tasque2.workflows import WorkflowService
-from tasque2.workshop import pipeline, reply, verify
-
-TEMPLATE = "work-templates/cooking/reply.template.md"
-THREAD = "thread-workshop"
-
-
-def _git(repo: Path, *args: str) -> str:
-    return subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True, check=True).stdout.strip()
-
-
-def _init(repo: Path, files: dict[str, str]) -> None:
-    repo.mkdir(parents=True, exist_ok=True)
-    _git(repo, "init", "-q", "-b", "main")
-    _git(repo, "config", "user.email", "tests@example.com")
-    _git(repo, "config", "user.name", "Tests")
-    for name, text in files.items():
-        (repo / name).parent.mkdir(parents=True, exist_ok=True)
-        (repo / name).write_text(text, encoding="utf-8")
-    _git(repo, "add", ".")
-    _git(repo, "commit", "-q", "-m", "base")
+from tasque2.workshop import pipeline, reply
 
 
 @pytest.fixture()
 def shop(fresh_db: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
-    """A core repository with one extension, a config repository with a template and a doctrine document;
-    the suites and the rehearsal report success (each is tested on its own)."""
-    project = tmp_path / "proj"
-    _init(project, {"src/app.py": "x = 1\n", ".gitignore": "extensions/*\ndata/\n"})
-    _init(
-        project / "extensions" / "ext1",
-        {"tool.py": "VALUE = 1\n", "tests/test_tool.py": "def test_tool():\n    pass\n"},
-    )
-    monkeypatch.setenv("TASQUE2_PROJECT_DIR", str(project))
-    monkeypatch.setenv("TASQUE2_EXTENSIONS_DIR", str(project / "extensions"))
-    reset_settings()
-    data = get_settings().resolved_data_dir
-    (data / "work-templates" / "cooking").mkdir(parents=True)
-    (data / TEMPLATE).write_text("Reply.\n", encoding="utf-8")
-    (data / "lanes.json").write_text(json.dumps({"schedules": {}}), encoding="utf-8")
-    with session_scope() as session:
-        MemoryService(session).upsert_canonical(
-            namespace="cooking",
-            canonical_key="cooking_direction",
-            kind="doctrine",
-            content="Cook simply.\n",
-            pinned=True,
-        )
-    datarepo.init(data)
-    suites: list[list[str]] = []
-    monkeypatch.setattr(verify, "_run_command", lambda command, cwd: suites.append(command) or (True, "3 passed"))
-    rehearsed: list[Any] = []
-
-    def fake_rehearse(root: Path, plan: Any, **kwargs: Any) -> Rehearsal:
-        rehearsed.append((plan, kwargs))
-        outcome = Rehearsal()
-        outcome.add("migrate", True)
-        outcome.add("release-apply", True)
-        return outcome
-
-    monkeypatch.setattr("tasque2.ops.rehearse.rehearse", fake_rehearse)
-    monkeypatch.setattr(pipeline, "denied_tools", lambda: ["mcp__tasque2__memory_save"])
-    return {"project": project, "data": data, "suites": suites, "rehearsed": rehearsed}
-
-
-def drive(session, script: dict[str, Callable[[WorkItem], dict[str, Any] | None]], steps: int = 60) -> None:
-    """Advance every change until it waits or ends: function steps run, model runs answer from ``script``
-    (None: the run crashed)."""
-    service, runner = WorkflowService(session), WorkRunner(session)
-    for _ in range(steps):
-        service.tick_runs()
-        claimed = WorkQueue(session).claim_next_ready_work(lease_owner="test")
-        if claimed is None:
-            break
-        item = claimed.work_item
-        if item.worker_kind.startswith("provider."):
-            key = session.get(WorkflowNode, item.workflow_node_id).node_key
-            produced = script[key](item)
-            if produced is None:
-                WorkQueue(session).fail_attempt(claimed.attempt.id, error_type="ProviderError", error_message="crash")
-            else:
-                WorkQueue(session).complete_attempt(claimed.attempt.id, summary="done", produces=produced)
-        else:
-            runner.execute(claimed)
-    service.tick_runs()
-
-
-def _plan(title: str, kind: str, touches: list[str], **extra: Any) -> Callable[[WorkItem], dict[str, Any]]:
-    return lambda item: {
-        "title": title,
-        "kind": kind,
-        "plan": f"1. {title}.",
-        "touches": touches,
-        "questions": [],
-        "evidence": ["you asked"],
-        **extra,
-    }
-
-
-def _commit(root: Path, name: str, text: str, message: str = "the change") -> None:
-    path = root / name
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text, encoding="utf-8")
-    _git(root, "add", "-A")
-    _git(root, "commit", "-q", "-m", message)
-
-
-def _template_build(item: WorkItem) -> dict[str, Any]:
-    _commit(Path(item.context["cwd"]) / "data", TEMPLATE, "Reply, briefly.\n", "Shorter replies")
-    return {"done": True, "changes": ["The cooking reply asks for shorter replies."]}
-
-
-def _extension_build(item: WorkItem) -> dict[str, Any]:
-    ext = Path(item.context["cwd"]) / "extensions" / "ext1"
-    _commit(ext, "tool.py", "VALUE = 2\n")
-    _commit(ext, "tests/test_tool.py", "def test_tool():\n    assert True\n")
-    return {"done": True, "changes": ["The tool's value is 2."], "tests_added": ["tests/test_tool.py"]}
-
-
-def _out(session, run_id: str, key: str) -> dict[str, Any]:
-    return pipeline.node_output(session, run_id, key)
-
-
-def _gate(session, run_id: str) -> WorkflowNode:
-    return session.scalar(
-        select(WorkflowNode).where(
-            WorkflowNode.workflow_run_id == run_id, WorkflowNode.kind == "gate", WorkflowNode.status == "awaiting_input"
-        )
-    )
+    return open_shop(tmp_path, monkeypatch)
 
 
 # --- the paths ------------------------------------------------------------------------------------------------
@@ -188,7 +71,7 @@ def test_a_feature_waits_for_one_tap_and_a_code_change_waits_for_a_restart(shop:
         card = gate.input["card"]
         assert card.startswith("**Workshop: Count to two** (feature; needs your tap")
         assert "ext1 2 files" in card and "Checks: core suite: 3 passed" in card and "rehearsal 2/2" in card
-        assert pipeline.code_holder(session) == change_id
+        assert pipeline.code_holder(session) is None  # a card waiting for a tap holds up no other code change
         assert reply.handle(session, text="nice", thread_id=THREAD, author="owner", referenced=None).startswith(
             "Noted for Count to two"
         )
@@ -203,7 +86,7 @@ def test_a_feature_waits_for_one_tap_and_a_code_change_waits_for_a_restart(shop:
         request = read_request()
         assert request["window"] == "now" and request["switch"][0]["ref"] == f"workshop/{change_id}"
         assert request["release"].endswith(f"{change_id}.json")
-        assert pipeline.code_holder(session) == change_id  # until it is live
+        assert pipeline.code_holder(session) == change_id  # taken again on Ship, until it is live
         plan = find_plan(change_id)
         assert plan.cold and plan.tier == "tap" and plan.thread_id == THREAD and plan.repos[0]["push"] is False
 
@@ -288,10 +171,22 @@ def test_a_crashed_plan_or_an_empty_build_changes_nothing(shop: dict[str, Any]) 
         assert history() == []
 
 
+def _go_live(ext: Path, change_id: str) -> None:
+    """What the respawn does for a queued release: switch the code, record the outcome."""
+    before = _git(ext, "rev-parse", "HEAD")
+    _git(ext, "merge", "--ff-only", "-q", f"workshop/{change_id}")
+    clear_request()
+    plan = find_plan(change_id)
+    plan.outcome = {"ok": True, "at": utc_now().isoformat(), "code": {str(ext): {"before": before, "after": "x"}}}
+    plan.released_at = utc_now().isoformat()
+    save_plan(plan)
+
+
 def test_a_code_change_waits_while_another_holds_the_code(shop: dict[str, Any]) -> None:
     with session_scope() as session:
-        pipeline.start_change(session, request="count to two", thread_id=THREAD)
-        drive(session, {"plan": _plan("Count to two", "feature", ["extension"]), "build": _extension_build})
+        first = pipeline.start_change(session, request="fix the other value", thread_id=THREAD)
+        drive(session, {"plan": _plan("The other value", "fix", ["extension"]), "build": _other_build})
+        assert pipeline.code_holder(session) == first.input["change_id"]  # shipped on its own: queued to go live
         second = pipeline.start_change(session, request="count to three", thread_id=THREAD)
         drive(session, {"plan": _plan("Count to three", "feature", ["extension"])})
         prepare = session.scalar(
@@ -301,10 +196,63 @@ def test_a_code_change_waits_while_another_holds_the_code(shop: dict[str, Any]) 
         )
         assert prepare.status == "ready" and prepare.not_before is not None
         assert "waiting for another code change" in pipeline.status_text(session)
-        reply.handle(session, text="discard", thread_id=THREAD, author="owner", referenced=None)
-        drive(session, {"build": _extension_build}, steps=3)
+        assert reply.handle(session, text="undo", thread_id=THREAD, author="owner", referenced=None).startswith(
+            "Withdrawn: The other value"
+        )
+        drive(session, {}, steps=1)  # the withdrawn release freed the code: the waiting change takes it
         session.refresh(prepare)
-        assert pipeline.code_holder(session) == second.input["change_id"]
+        assert prepare.status == "succeeded" and pipeline.code_holder(session) == second.input["change_id"]
+
+
+def test_a_card_waiting_for_its_tap_holds_up_no_other_code_change(shop: dict[str, Any]) -> None:
+    ext = shop["project"] / "extensions" / "ext1"
+    with session_scope() as session:
+        first = pipeline.start_change(session, request="count to two", thread_id=THREAD)
+        drive(session, {"plan": _plan("Count to two", "feature", ["extension"]), "build": _extension_build})
+        assert _gate(session, first.id).node_key == "ship_gate" and pipeline.code_holder(session) is None
+        second = pipeline.start_change(session, request="fix the other value", thread_id=THREAD)
+        drive(session, {"plan": _plan("The other value", "fix", ["extension"]), "build": _other_build})
+        second_id = second.input["change_id"]
+        assert session.get(WorkflowRun, second.id).status == "completed"  # built and queued while the card waited
+        assert pipeline.code_holder(session) == second_id
+        assert reply.handle(session, text="ship", thread_id=THREAD, author="owner", referenced=None) == (
+            "Ship: Count to two."
+        )
+        drive(session, {})
+        release = session.scalar(
+            select(WorkItem).where(
+                WorkItem.workflow_run_id == first.id, WorkItem.worker_kind == pipeline.RELEASE_WORKER
+            )
+        )
+        assert release.status == "ready" and release.not_before is not None  # waiting for the second to go live
+        checks = len(shop["suites"])
+    _go_live(ext, second_id)
+    with session_scope() as session:
+        pipeline.announce_releases(session)
+        drive(session, {})
+        assert session.get(WorkflowRun, first.id).status == "completed"
+        assert len(shop["suites"]) > checks  # checked again on the live code
+        assert pipeline.code_holder(session) == first.input["change_id"]
+        assert pipeline.report_text(session, session.get(WorkflowRun, first.id))[0].startswith(
+            "**Ready: Count to two**"
+        )
+    branch = f"workshop/{first.input['change_id']}"
+    assert _git(ext, "show", f"{branch}:other.py") == "OTHER = 1"  # moved onto the live code
+    assert _git(ext, "show", f"{branch}:tool.py") == "VALUE = 2"
+    assert _git(ext, "merge-base", "--is-ancestor", "HEAD", branch) == ""
+
+
+def test_a_change_that_no_longer_applies_on_the_live_code_is_not_released(shop: dict[str, Any]) -> None:
+    ext = shop["project"] / "extensions" / "ext1"
+    with session_scope() as session:
+        run = pipeline.start_change(session, request="count to two", thread_id=THREAD)
+        drive(session, {"plan": _plan("Count to two", "feature", ["extension"]), "build": _extension_build})
+        _commit(ext, "tool.py", "VALUE = 3\n", "changed live meanwhile")
+        reply.handle(session, text="ship", thread_id=THREAD, author="owner", referenced=None)
+        drive(session, {})
+        text = pipeline.report_text(session, session.get(WorkflowRun, run.id))[0]
+        assert text.startswith("Not shipped: Count to two.\n- it no longer applies on the live code")
+        assert pipeline.code_holder(session) is None and read_request() is None
 
 
 def test_a_cold_release_is_announced_once_it_is_live_and_undone_by_a_revert_release(shop: dict[str, Any]) -> None:

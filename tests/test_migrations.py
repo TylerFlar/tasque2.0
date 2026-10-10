@@ -34,6 +34,7 @@ CORE_TABLES = {
     "workflow_edges",
     "workflow_nodes",
     "workflow_runs",
+    "workshop_issues",
 }
 
 WORK_ITEMS_WITHOUT_LANE = [
@@ -120,8 +121,8 @@ def test_fresh_database_upgrades_to_heads_and_matches_the_models() -> None:
     status = upgrade_database()
 
     assert status.is_current
-    assert status.head_revisions == ("core_0003",)
-    assert status.current_revisions == ("core_0003",)
+    assert status.head_revisions == ("core_0004",)
+    assert status.current_revisions == ("core_0004",)
     tables = set(inspect(get_engine()).get_table_names())
     assert CORE_TABLES | {"alembic_version", "memory_fts"} <= tables
     assert _schema_differences() == []
@@ -141,7 +142,7 @@ def test_schema_status_reports_an_empty_database_as_behind() -> None:
 
     assert status.current_revisions == ()
     assert status.current_display == "<none>"
-    assert status.head_display == "core_0003"
+    assert status.head_display == "core_0004"
     assert not status.is_current
 
 
@@ -166,7 +167,7 @@ def test_schema_missing_columns_under_an_unknown_revision_is_adopted() -> None:
     columns = {column["name"] for column in inspector.get_columns("work_items")}
     indexes = {index["name"] for index in inspector.get_indexes("work_items")}
     assert status.is_current
-    assert status.current_revisions == ("core_0003",)
+    assert status.current_revisions == ("core_0004",)
     assert {"lane", "traceparent"} <= columns
     assert {
         "ix_work_items_lane",
@@ -191,7 +192,7 @@ def test_a_revision_from_an_unloaded_extension_stops_the_upgrade_untouched() -> 
     with pytest.raises(MigrationError, match=r"gone_0007.*TASQUE2_EXTENSIONS_DIR"):
         upgrade_database()
 
-    assert set(schema_status().current_revisions) == {"core_0003", "gone_0007"}
+    assert set(schema_status().current_revisions) == {"core_0004", "gone_0007"}
 
 
 def test_adoption_creates_missing_tables() -> None:
@@ -249,7 +250,7 @@ def test_extension_revisions_upgrade_with_the_core(isolated: Path) -> None:
 
     status = upgrade_database()
 
-    assert set(status.head_revisions) == {"core_0003", "sample_0001"}
+    assert set(status.head_revisions) == {"core_0004", "sample_0001"}
     assert status.is_current
     assert {"work_items", "discord_stickies", "sample_notes"} <= set(inspect(get_engine()).get_table_names())
 
@@ -263,7 +264,7 @@ def test_a_new_core_revision_upgrades_a_database_already_on_an_extension_branch(
     status = upgrade_database()
 
     assert status.is_current
-    assert set(status.current_revisions) == {"core_0003", "sample_0001"}
+    assert set(status.current_revisions) == {"core_0004", "sample_0001"}
     assert "discord_stickies" in inspect(get_engine()).get_table_names()
 
 

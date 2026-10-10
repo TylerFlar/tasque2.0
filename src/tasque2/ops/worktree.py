@@ -1,12 +1,12 @@
-"""Throwaway git worktrees for a repair or a Workshop change: the core repository, every extension
-repository in it, and (for a change) the config repository rooted at the data directory.
+"""Throwaway git worktrees for a Workshop change: the core repository, every extension repository in it,
+and the config repository rooted at the data directory.
 
-A repair or a change works on its own branch in its own folder, next to the live checkout, so the code
-the daemon runs never changes until the user approves and the restart fast-forwards it. Each worktree
-records the live HEAD it started from and a hash of the live checkout's status, so a check afterwards
-can prove the live checkouts were left alone. A change's config worktree sits at ``<root>/data``, so
-the root is a whole staging Tasque: code, extensions, config, and the database copy a rehearsal puts
-there (ignored by git).
+A change works on its own branch in its own folder, next to the live checkout, so the code the daemon
+runs never changes until the user approves and the restart fast-forwards it. Each worktree records the
+live HEAD it started from and a hash of the live checkout's status, so a check afterwards can prove the
+live checkouts were left alone. A change's config worktree sits at ``<root>/data``, so the root is a
+whole staging Tasque: code, extensions, config, and the database copy a rehearsal puts there (ignored by
+git).
 """
 
 from __future__ import annotations
@@ -55,9 +55,9 @@ def status_hash(repo: Path | str) -> str:
     return hashlib.sha256(git(repo, "status", "--porcelain", "--untracked-files=no").encode("utf-8")).hexdigest()
 
 
-def workspace_root(repair_id: str, kind: str = "repair") -> Path:
+def workspace_root(change_id: str, kind: str = "workshop") -> Path:
     project = get_settings().resolved_project_dir
-    return project.parent / f"{project.name}-{kind}" / repair_id
+    return project.parent / f"{project.name}-{kind}" / change_id
 
 
 def _extension_repos() -> list[Path]:
@@ -67,14 +67,14 @@ def _extension_repos() -> list[Path]:
     return sorted(child for child in root.iterdir() if child.is_dir() and (child / ".git").exists())
 
 
-def create_worktrees(repair_id: str, *, kind: str = "repair", include_data: bool = False) -> list[RepoWorktree]:
+def create_worktrees(change_id: str, *, kind: str = "workshop", include_data: bool = False) -> list[RepoWorktree]:
     """A worktree of the core repository and, nested in it, one of each extension repository (and, with
     ``include_data``, one of the config repository at ``data``)."""
     from tasque2.ops.datarepo import is_repo
 
     project = get_settings().resolved_project_dir
-    root = workspace_root(repair_id, kind)
-    branch = f"{kind}/{repair_id}"
+    root = workspace_root(change_id, kind)
+    branch = f"{kind}/{change_id}"
     made: list[RepoWorktree] = []
     try:
         root.parent.mkdir(parents=True, exist_ok=True)
@@ -109,7 +109,7 @@ def remove_worktrees(worktrees: list[RepoWorktree], *, delete_branches: bool) ->
             shutil.rmtree(tree.path, ignore_errors=True)
             git(tree.live, "worktree", "prune", check=False)
             try:
-                Path(tree.path).parent.rmdir()  # the repairs folder, once its last repair is gone
+                Path(tree.path).parent.rmdir()  # the changes' folder, once its last change is gone
             except OSError:
                 pass
 
@@ -124,7 +124,7 @@ def live_changes(worktrees: list[RepoWorktree]) -> list[str]:
 
 
 def committed_files(tree: RepoWorktree) -> list[str]:
-    """Files the repair branch changed in commits since its base."""
+    """Files the change's branch changed in commits since its base."""
     output = git(tree.path, "diff", "--name-only", f"{tree.base}..HEAD")
     return [line for line in output.splitlines() if line.strip()]
 

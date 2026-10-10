@@ -189,6 +189,7 @@ def test_fake_provider_success_records_the_run_and_its_artifacts(fresh_db: Path)
         assert run.ended_at is not None
         assert {"TASQUE2_RESULT_TOKEN", "TASQUE2_WORK_ITEM_ID", "TASQUE2_SCRATCH_DIR", "TMP"} <= set(run.env_keys)
         assert run.usage["messages"] == 0
+        assert run.usage["prompt_chars"] == len(captured[0].prompt)  # the packet's size, kept for the sweep
         assert run.stderr_artifact_id is None
         assert stream.kind == "provider_stream"
         assert stream.tags == ["provider", "fake", "stream"]

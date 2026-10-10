@@ -620,6 +620,41 @@ class DiscordSticky(TimestampMixin, Base):
     pin_retry_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
 
 
+class WorkshopIssue(TimestampMixin, Base):
+    """One row of the Workshop's ledger: a distinct issue its sweep saw, or an idea a card offered.
+
+    ``key`` names it for good (``fault:<signature>``, ``idea:<slug>``); each sweep that sees it again
+    refreshes ``evidence`` and ``last_seen_at`` and adds to ``count``. ``status`` is where it stands:
+    ``watching`` (seen, not yet worth a look), ``new`` (for triage), ``waiting`` (a fix proposed, waiting
+    for a free slot), ``filed`` (a change or a card is open for it), ``resting`` (until ``rest_until``),
+    ``done`` or ``retired``. ``proposal`` is the fix triage proposed for its group; ``change_id`` and
+    ``workflow_run_id`` the change or card that answers it.
+    """
+
+    __tablename__ = "workshop_issues"
+    __table_args__ = (
+        UniqueConstraint("key", name="uq_workshop_issue_key"),
+        Index("ix_workshop_issues_status", "status", "last_seen_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    key: Mapped[str] = mapped_column(String(240), nullable=False)
+    kind: Mapped[str] = mapped_column(String(16), default="issue", nullable=False)
+    source: Mapped[str] = mapped_column(String(40), nullable=False)
+    title: Mapped[str] = mapped_column(String(240), nullable=False)
+    evidence: Mapped[list[str]] = mapped_column("evidence_json", JSON, default=list, nullable=False)
+    detail: Mapped[dict[str, Any] | None] = mapped_column("detail_json", JSON)
+    first_seen_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False)
+    last_seen_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False)
+    count: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    status: Mapped[str] = mapped_column(String(16), default="watching", nullable=False)
+    rest_until: Mapped[datetime | None] = mapped_column(UTCDateTime())
+    tried_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
+    proposal: Mapped[dict[str, Any] | None] = mapped_column("proposal_json", JSON)
+    change_id: Mapped[str | None] = mapped_column(String(40))
+    workflow_run_id: Mapped[str | None] = mapped_column(String(36))
+
+
 class DiscordMessage(Base):
     __tablename__ = "discord_messages"
     __table_args__ = (

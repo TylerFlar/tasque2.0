@@ -110,15 +110,16 @@ def default_function_registry() -> FunctionWorkerRegistry:
 
 def core_function_workers() -> dict[str, WorkerFunction]:
     """No-model workers the core itself provides for its own schedules."""
-    from tasque2.ops import repair
     from tasque2.ops.backup_runner import backup_worker
-    from tasque2.workshop import pipeline, reply
+    from tasque2.workshop import ideas, pipeline, reply, sweep, triage
 
     return {
         "function.backup": backup_worker,
-        repair.LAUNCH_WORKER: repair.launch_worker,
-        repair.VERIFY_WORKER: repair.verify_worker,
-        repair.MERGE_WORKER: repair.merge_worker,
+        sweep.SWEEP_WORKER: sweep.sweep_worker,
+        triage.FILE_WORKER: triage.file_worker,
+        ideas.LAUNCH_WORKER: ideas.launch_worker,
+        ideas.CARDS_WORKER: ideas.cards_worker,
+        ideas.APPLY_WORKER: ideas.apply_worker,
         pipeline.CLASSIFY_WORKER: pipeline.classify_worker,
         pipeline.PREPARE_WORKER: pipeline.prepare_worker,
         pipeline.VERIFY_WORKER: pipeline.verify_worker,

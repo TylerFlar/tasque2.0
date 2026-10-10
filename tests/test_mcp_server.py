@@ -188,3 +188,33 @@ def test_raising_tool_marks_the_span_and_reraises(spans, metric_points) -> None:
     assert call.attributes["error.type"] == "RuntimeError"
     assert [event.name for event in call.events] == ["exception"]
     assert [point.attributes.get("error.type") for point in _durations(metric_points, "exploding")] == ["RuntimeError"]
+
+
+def test_every_call_that_fails_is_written_to_the_tool_error_ledger(monkeypatch: pytest.MonkeyPatch) -> None:
+    from tasque2.ops.faults import read_tool_errors
+
+    monkeypatch.setenv("TASQUE2_WORK_ITEM_ID", "work-9")
+
+    def refuses(x: str) -> str:
+        """Refuses."""
+        return json.dumps({"ok": False, "error": "x is required.", "error_type": "ValueError"})
+
+    def answers(x: str) -> str:
+        """Answers."""
+        return json.dumps({"ok": True})
+
+    def exploding(x: str) -> str:
+        """Explodes."""
+        raise RuntimeError("boom")
+
+    traced(refuses)(x="1")
+    traced(answers)(x="1")
+    with pytest.raises(RuntimeError):
+        traced(exploding)(x="1")
+
+    entries = list(read_tool_errors())
+    assert [(entry["tool"], entry["error_type"], entry["error"]) for entry in entries] == [
+        ("refuses", "ValueError", "x is required."),
+        ("exploding", "RuntimeError", "boom"),
+    ]
+    assert {entry["work_item_id"] for entry in entries} == {"work-9"}

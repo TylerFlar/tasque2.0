@@ -1,33 +1,41 @@
 """The Workshop's change pipeline: one change to Tasque, from a request to a release, with an undo.
 
-A change starts from a request (the owner's words in the Workshop thread, a fault, the Workshop's own
-sweep) and runs the ``tasque-change`` workflow in its own worktrees (``tasque2.ops.worktree``: the core,
-each extension, and the config repository at ``data``), next to the live checkout:
+A change starts from a request (the owner's words in the Workshop thread, an idea card's Build it, or a
+fix the Workshop's triage filed: ``tasque2.workshop.triage``) and runs the ``tasque-change`` workflow in
+its own worktrees (``tasque2.ops.worktree``: the core, each extension, and the config repository at
+``data``), next to the live checkout:
 
 1. ``plan`` (a model run that reads the change's own checkout; the guard refuses writes outside it):
-   what to change, where and why in at most 25 lines, up to 4 questions with defaults, what it touches.
-   A request that needs no change (a question, a batch of ideas) ends here with its answer;
+   what to change, where and why in at most 25 lines, up to 4 questions with defaults, what it touches
+   and which files. A request that needs no change (a question, a batch of ideas, evidence that no longer
+   holds) ends here with its answer;
 2. ``classify`` (no model): the tier from ``tasque2.workshop.policy``, never from the model;
 3. ``plan_gate``: Approve, Revise or Discard, only for a change whose plan needs approving;
 4. ``prepare`` (no model): Revise starts the change again with the notes typed at the gate, Discard
    ends it; otherwise the worktrees move to the live heads and a change that edits code takes the code
-   lock (one code change at a time, from its build until it is live);
+   lock (one code change at a time, from its build until it is live, freed while its ship card waits);
 5. ``build`` (a model run in the worktrees): a failing test first for a bug, the change, commits;
 6. ``verify`` (no model, ``tasque2.workshop.verify``): the suites, ruff, the privacy and secret scans, a
    rehearsal on a copy of the live database, and the tier again from the real diff (it only rises);
 7. ``ship_gate``: Ship or Discard, unless the change ships on its own;
-8. ``release`` (no model): a config-only change lands at once; code waits for an idle moment (01:00-06:30
-   for a change that ships on its own) and a restart, announced in the thread once it is live;
-9. ``report`` (no model): what changed, with an Undo button.
+8. ``release`` (no model): a config-only change lands at once; code takes the lock again, is moved onto
+   the live code and checked again when the live code moved on while the card waited, then waits for an
+   idle moment (01:00-06:30 for a change that ships on its own) and a restart, announced in the thread
+   once it is live;
+9. ``report`` (no model): what changed, with an Undo button. A change the Workshop filed posts only its
+   cards and its "Live now"; its ledger rows learn how it ended.
 
-Kill switches: ``pause`` (no change starts unless the owner asks for it, and nothing ships on its own),
-and undo. Two releases rolled back within a week pause the Workshop on its own.
+A card nobody answers for 14 days expires (``expire_cards``, run by the sweep): a change's card as a
+Discard, an idea card as a Not now. Kill switches: ``pause`` (no change starts unless the owner asks for
+it, and nothing ships on its own), and undo. Two releases rolled back within a week pause the Workshop on
+its own.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import re
 import secrets
 import sys
 from datetime import datetime, timedelta
@@ -39,7 +47,7 @@ from sqlalchemy.orm import Session, object_session
 
 from tasque2.config import get_settings
 from tasque2.models import WorkflowDefinition, WorkflowNode, WorkflowRun, WorkItem, utc_now
-from tasque2.workshop import policy
+from tasque2.workshop import ledger, policy
 
 logger = logging.getLogger(__name__)
 
@@ -70,8 +78,36 @@ TOUCHES = (
 CODE_TOUCHES = {"core", "extension", "migrations", "dependencies"}
 WAIT_FOR_CODE = timedelta(hours=2)
 ROLLBACKS_TO_PAUSE, ROLLBACK_WINDOW = 2, timedelta(days=7)
+CARD_EXPIRES = timedelta(days=14)
+# The answer an expired card takes: a change's card is discarded, an idea card's idea rests.
+EXPIRED_ANSWERS = {WORKFLOW_NAME: DISCARD, "workshop-idea": "Not now"}
+# Runs of a retired workflow whose worktrees are swept like a change's.
+RETIRED_WORKFLOWS = ("tasque-repair",)
 PAUSE_FILE = "workshop.paused"
 LOCK_FILE = "code.lock"
+# The Tasque tools a Workshop run may call: they read, or submit the run's result. The rest are denied.
+READ_ONLY_TOOLS = {
+    "submit_worker_result",
+    "memory_recall",
+    "memory_list",
+    "memory_get",
+    "memory_get_canonical",
+    "artifact_list",
+    "artifact_get",
+    "artifact_read_text",
+    "work_list",
+    "work_get",
+    "work_events",
+    "schedule_list",
+    "schedule_get",
+    "workflow_list",
+    "reminder_list",
+    "sticky_get",
+    "system_status",
+    "system_health",
+    "weather_now",
+    "discord_history",
+}
 PLAN_TEMPLATE = "work-templates/workshop/plan.template.md"
 BUILD_TEMPLATE = "work-templates/workshop/build.template.md"
 DOCTRINE_KEYS = ["tasque_workshop", "tasque_design"]
@@ -166,7 +202,11 @@ def free_code(session: Session, change_id: str | None = None) -> None:
     _lock_path().unlink(missing_ok=True)
     session.execute(
         update(WorkItem)
-        .where(WorkItem.worker_kind == PREPARE_WORKER, WorkItem.status == "ready", WorkItem.not_before.is_not(None))
+        .where(
+            WorkItem.worker_kind.in_((PREPARE_WORKER, RELEASE_WORKER)),
+            WorkItem.status == "ready",
+            WorkItem.not_before.is_not(None),
+        )
         .values(not_before=None)
     )
 
@@ -195,7 +235,6 @@ def denied_tools() -> list[str]:
     """Every Tasque tool that writes: a Workshop run reads live state, and changes only its own folder."""
     from tasque2.extensions import registry
     from tasque2.mcp.tools import CORE_TOOLS
-    from tasque2.ops.repair import READ_ONLY_TOOLS
 
     names = {tool.__name__ for tool in [*CORE_TOOLS, *registry().mcp_tools]}
     return [f"mcp__tasque2__{name}" for name in sorted(names - READ_ONLY_TOOLS)]
@@ -269,18 +308,22 @@ def definition() -> dict[str, Any]:
     }
 
 
-def ensure_definition(session: Session) -> WorkflowDefinition:
-    """The bundled change workflow, registered or brought up to date."""
+def ensure_bundled(session: Session, name: str, wanted: dict[str, Any]) -> WorkflowDefinition:
+    """A workflow the Workshop bundles, registered or brought up to date."""
     from tasque2.workflows import WorkflowService
 
-    wanted = definition()
-    existing = session.scalar(select(WorkflowDefinition).where(WorkflowDefinition.name == WORKFLOW_NAME))
+    existing = session.scalar(select(WorkflowDefinition).where(WorkflowDefinition.name == name))
     if existing is None:
-        return WorkflowService(session).create_definition(name=WORKFLOW_NAME, version="1", definition=wanted)
+        return WorkflowService(session).create_definition(name=name, version="1", definition=wanted)
     if existing.definition != wanted:
         existing.definition = wanted
         session.flush()
     return existing
+
+
+def ensure_definition(session: Session) -> WorkflowDefinition:
+    """The bundled change workflow, registered or brought up to date."""
+    return ensure_bundled(session, WORKFLOW_NAME, definition())
 
 
 def commands(trees: list[Any]) -> dict[str, str]:
@@ -314,8 +357,12 @@ def start_change(
     notes: list[str] | None = None,
     previous_plan: str | None = None,
     evidence: list[str] | None = None,
+    files: list[str] | None = None,
+    issues: list[str] | None = None,
 ) -> WorkflowRun:
-    """Make the change's worktrees (the live config committed first, doctrine exported) and start its run."""
+    """Make the change's worktrees (the live config committed first, doctrine exported) and start its run.
+    A fix the Workshop filed names the ``files`` triage expects it to touch and the ledger rows (``issues``)
+    it answers."""
     from tasque2.ops import datarepo
     from tasque2.ops.worktree import create_worktrees
     from tasque2.workflows import WorkflowService
@@ -339,6 +386,8 @@ def start_change(
             "notes": list(notes or []),
             "previous_plan": previous_plan,
             "evidence": list(evidence or []),
+            "files": list(files or []),
+            "issues": list(issues or []),
             "paused": bool(reason),
             "live_data": str(get_settings().resolved_data_dir),
             "cwd": root,
@@ -384,6 +433,32 @@ def trees_of(run: WorkflowRun) -> list[Any]:
     return [RepoWorktree.from_data(item) for item in (run.input or {}).get("worktrees") or []]
 
 
+def files_of(value: Any) -> list[str]:
+    """Paths as a change names them: from its checkout's root, with forward slashes."""
+    found: list[str] = []
+    for item in value if isinstance(value, list) else []:
+        path = re.sub(r"^(\./)+", "", str(item).strip().replace("\\", "/")).strip("/")
+        if path and path not in found:
+            found.append(path)
+    return found[:40]
+
+
+def open_changes(session: Session) -> list[WorkflowRun]:
+    return list(
+        session.scalars(
+            select(WorkflowRun)
+            .where(WorkflowRun.name == WORKFLOW_NAME, WorkflowRun.status.in_(OPEN_RUN_STATUSES))
+            .order_by(WorkflowRun.created_at)
+        ).all()
+    )
+
+
+def change_files(session: Session, run: WorkflowRun) -> set[str]:
+    """The files a change touches, as far as anyone has said: triage's guess, then its plan's own list."""
+    planned = node_output(session, run.id, "classify").get("files")
+    return set(files_of((run.input or {}).get("files"))) | set(files_of(planned))
+
+
 def cleanup(session: Session, run: WorkflowRun, *, keep_branches: bool = False) -> None:
     """Remove the change's worktrees (and its branches, unless a release still needs them); free the code."""
     from tasque2.ops.worktree import remove_worktrees
@@ -406,8 +481,11 @@ def _questions(value: Any) -> list[dict[str, str]]:
     return found[:4]
 
 
-def plan_card(title: str, kind: str, plan: dict[str, Any], questions: list[dict[str, str]], why: str) -> str:
-    lines = [f"**Workshop plan: {title}** ({kind}; needs your OK: {why})", ""]
+def plan_card(
+    title: str, kind: str, plan: dict[str, Any], questions: list[dict[str, str]], why: str, *, filed: bool = False
+) -> str:
+    found = "; the Workshop filed it" if filed else ""
+    lines = [f"**Workshop plan: {title}** ({kind}; needs your OK: {why}{found})", ""]
     lines += [line.rstrip() for line in str(plan.get("plan") or "").strip().splitlines()[:25]]
     if questions:
         lines += ["", "**Questions** (type your answers here, then tap a button; unanswered ones take the default):"]
@@ -458,9 +536,10 @@ def classify_worker(work_item: WorkItem) -> dict[str, Any]:
         "tier": tier,
         "why": why,
         "touches": touches,
+        "files": files_of(plan.get("files")),
         "questions": questions,
         "skip_plan_gate": tier != policy.PLAN,
-        "card": plan_card(title, kind, plan, questions, why) if tier == policy.PLAN else "",
+        "card": plan_card(title, kind, plan, questions, why, filed=origin == "workshop") if tier == policy.PLAN else "",
         "profile": "ultra" if kind == "redesign" else "high",
         "needs_code": bool(set(touches) & CODE_TOUCHES),
     }
@@ -505,7 +584,7 @@ def prepare_worker(work_item: WorkItem) -> dict[str, Any]:
     notes = [str(note.get("text") or "") for note in gate.get("notes") or [] if str(note.get("text") or "").strip()]
     if answer == DISCARD:
         cleanup(session, run)
-        return stop("discarded")
+        return stop("expired" if gate.get("expired") else "discarded")
     if answer == REVISE:
         plan = node_output(session, run.id, "plan")
         cleanup(session, run)
@@ -519,7 +598,10 @@ def prepare_worker(work_item: WorkItem) -> dict[str, Any]:
             notes=[*(given.get("notes") or []), *notes],
             previous_plan=str(plan.get("plan") or ""),
             evidence=given.get("evidence"),
+            files=given.get("files"),
+            issues=given.get("issues"),
         )
+        _refile(session, run, again)
         return stop("revised", revision_run_id=again.id)
     change_id = str(given.get("change_id"))
     if classify.get("needs_code"):
@@ -561,24 +643,83 @@ def verify_worker(work_item: WorkItem) -> dict[str, Any]:
         produced = {"silent": True, "stop": True, "skip_ship_gate": True, "reasons": outcome.get("reasons") or []}
         return {"summary": "Not shipped: " + "; ".join(outcome.get("reasons") or [])[:600], "produces": produced}
     auto = outcome["tier"] == policy.AUTO and not paused() and auto_today() < policy.AUTO_PER_DAY
+    if not auto:
+        # A card waiting for the owner never holds up the other code changes: the lock is taken again on Ship.
+        free_code(session, (run.input or {}).get("change_id"))
     produced = {"silent": True, "stop": False, **outcome, "auto_ship": auto, "skip_ship_gate": auto}
     return {"summary": f"Verified ({outcome['tier']}).", "produces": produced}
 
 
+def move_onto_live(run: WorkflowRun) -> list[str]:
+    """Carry each code worktree's commits onto its live checkout's HEAD where the live code moved on since
+    the change was built; returns the repositories moved. Raises ``WorktreeError`` when one does not apply."""
+    from tasque2.ops.worktree import RepoWorktree, WorktreeError, git, status_hash
+
+    moved: list[str] = []
+    fresh = []
+    for tree in trees_of(run):
+        live_head = git(tree.live, "rev-parse", "HEAD")
+        if tree.name == "data" or live_head == tree.base:
+            fresh.append(tree)
+            continue
+        try:
+            git(tree.path, "-c", "core.longpaths=true", "rebase", "-q", "--onto", live_head, tree.base)
+        except WorktreeError as exc:
+            git(tree.path, "rebase", "--abort", check=False)
+            reason = str(exc).rsplit(": ", 1)[-1].strip().splitlines()
+            raise WorktreeError(f"{tree.name}: {reason[-1] if reason else 'the rebase failed'}") from exc
+        moved.append(tree.name)
+        fresh.append(RepoWorktree(tree.name, tree.live, tree.path, tree.branch, live_head, status_hash(tree.live)))
+    if moved:
+        run.input = {**(run.input or {}), "worktrees": [tree.data() for tree in fresh]}
+    return moved
+
+
+def _not_released(session: Session, run: WorkflowRun, problems: list[str]) -> dict[str, Any]:
+    cleanup(session, run)
+    return {"summary": "Not released.", "produces": {"silent": True, "released": False, "problems": problems}}
+
+
 def release_worker(work_item: WorkItem) -> dict[str, Any]:
-    """``function.workshop_release``: config lands now; code is queued for a restart. Never raises."""
+    """``function.workshop_release``: config lands now; code is queued for a restart. Never raises, except
+    to wait for the code lock: a code change that waited for its tap takes the lock again, and is moved onto
+    the live code and checked again when the live code moved on meanwhile."""
     from tasque2.daemon.restart import RestartBusy
     from tasque2.ops.release import ReleasePlan, preflight, queue_cold, release_hot, save_plan
-    from tasque2.ops.worktree import remove_worktrees
+    from tasque2.ops.worktree import WorktreeError, remove_worktrees
+    from tasque2.work.runner import WorkDeferred
+    from tasque2.workshop.verify import verify
 
     session, run = _run(work_item)
     verified = node_output(session, run.id, "verify")
     if verified.get("stop") or not verified.get("ok"):
         return {"summary": "Not released.", "produces": {"silent": True, "released": False}}
-    if str(node_output(session, run.id, "ship_gate").get("answer") or SHIP) != SHIP:
+    gate = node_output(session, run.id, "ship_gate")
+    if str(gate.get("answer") or SHIP) != SHIP:
         cleanup(session, run)
-        return {"summary": "Discarded.", "produces": {"silent": True, "released": False, "discarded": True}}
+        produced = {"silent": True, "released": False, "discarded": True, "expired": bool(gate.get("expired"))}
+        return {"summary": "Expired." if gate.get("expired") else "Discarded.", "produces": produced}
     plan = ReleasePlan.from_dict(verified["release_plan"])
+    if plan.cold and not verified.get("auto_ship"):
+        change_id = str((run.input or {}).get("change_id"))
+        holder = code_holder(session)
+        if holder and holder != change_id:
+            raise WorkDeferred(utc_now() + WAIT_FOR_CODE, f"waiting for change {holder} to go live first")
+        take_code(change_id, run.id)
+        try:
+            moved = move_onto_live(run)
+        except WorktreeError as exc:
+            return _not_released(session, run, [f"it no longer applies on the live code ({str(exc)[:200]})"])
+        if moved:
+            try:
+                again = verify(session, run)
+            except Exception as exc:  # noqa: BLE001 - a check that breaks stops the release, never the run
+                logger.exception("Workshop change %s: checking it again failed", change_id)
+                again = {"ok": False, "reasons": [f"the checks broke: {type(exc).__name__}: {exc}"]}
+            if not again.get("ok"):
+                reasons = [f"checked again on the live code: {reason}" for reason in again.get("reasons") or []]
+                return _not_released(session, run, reasons)
+            plan = ReleasePlan.from_dict(again["release_plan"])
     plan.run_id, plan.thread_id = run.id, run.discord_thread_id
     if not plan.cold:
         try:
@@ -605,8 +746,7 @@ def release_worker(work_item: WorkItem) -> dict[str, Any]:
         except RestartBusy as exc:
             problems = [str(exc)]
     if problems:
-        cleanup(session, run)
-        return {"summary": "Not released.", "produces": {"silent": True, "released": False, "problems": problems}}
+        return _not_released(session, run, problems)
     remove_worktrees(trees_of(run), delete_branches=False)  # the branches stay for the switch
     produced = {"silent": True, "released": True, "kind": "cold", "release_id": plan.id, "window": plan.window}
     return {"summary": "Queued for a restart.", "produces": produced}
@@ -627,6 +767,8 @@ def report_text(session: Session, run: WorkflowRun) -> tuple[str, str | None]:
     prepare = node_output(session, run.id, "prepare")
     if prepare.get("why") == "discarded":
         return f"Dropped: {title}. Nothing changed.", None
+    if prepare.get("why") == "expired":
+        return f"Expired: {title} waited {CARD_EXPIRES.days} days for your OK. Nothing changed; say redo for it.", None
     if prepare.get("why") == "revised":
         return f"Planning {title} again with your notes.", None
     verified = node_output(session, run.id, "verify")
@@ -634,6 +776,8 @@ def report_text(session: Session, run: WorkflowRun) -> tuple[str, str | None]:
         reasons = "\n".join(_lines(verified.get("reasons") or ["it did not pass its checks"], 5))
         return f"Not shipped: {title}.\n{reasons}\nNothing changed. Say redo to try again.", None
     release = node_output(session, run.id, "release")
+    if release.get("expired"):
+        return f"Expired: {title} waited {CARD_EXPIRES.days} days for your tap. Nothing changed; say redo for it.", None
     if release.get("discarded"):
         return f"Dropped: {title}. Nothing changed.", None
     if not release.get("released"):
@@ -654,13 +798,30 @@ def report_text(session: Session, run: WorkflowRun) -> tuple[str, str | None]:
     return "\n".join(lines), None
 
 
+def outcome(session: Session, run: WorkflowRun) -> str:
+    """How a change ended, for the ledger rows it answers: shipped, discarded (or expired), or ended."""
+    release = node_output(session, run.id, "release")
+    if release.get("released"):
+        return ledger.SHIPPED
+    if node_output(session, run.id, "prepare").get("why") in ("discarded", "expired") or release.get("discarded"):
+        return ledger.DISCARDED
+    return ledger.ENDED
+
+
 def report_worker(work_item: WorkItem) -> dict[str, Any]:
-    """``function.workshop_report``: the change's final post."""
+    """``function.workshop_report``: the change's final post. A change the Workshop filed posts only its
+    "Live now" (its cards posted on their own), and its ledger rows learn how it ended."""
     session, run = _run(work_item)
     text, release_id = report_text(session, run)
     produced: dict[str, Any] = {"workshop_report": True}
     if release_id:
         produced["undo_release"] = release_id
+    given = run.input or {}
+    if given.get("origin") == "workshop":
+        if node_output(session, run.id, "prepare").get("why") != "revised":
+            ledger.settle(session, str(given.get("change_id")), outcome(session, run))
+        if not release_id:
+            produced["silent"] = True
     return {"summary": text, "produces": produced}
 
 
@@ -699,8 +860,8 @@ def announce_releases(session: Session) -> int:
             continue
         if plan.undo_of and status == "live":
             mark_undone(plan)
-        if not plan.thread_id:
-            continue
+        if not plan.thread_id or (plan.origin == "workshop" and status != "live"):
+            continue  # a change the Workshop filed says only "Live now"
         undo = status == "live" and not plan.undo_of
         WorkRepository(session).create_work_item(
             title=f"Workshop: {plan.title}"[:240],
@@ -743,21 +904,55 @@ def announce_worker(work_item: WorkItem) -> dict[str, Any]:
 
 
 def sweep_worktrees(session: Session) -> int:
-    """Remove worktrees left by changes that ended (canceled from the controls, say)."""
+    """Remove worktrees left by changes that ended (canceled from the controls, say), and by the runs of a
+    retired workflow."""
     from tasque2.ops.release import find_plan, state
+    from tasque2.ops.worktree import remove_worktrees
 
     removed = 0
-    runs = session.scalars(select(WorkflowRun).where(WorkflowRun.name == WORKFLOW_NAME)).all()
+    runs = session.scalars(select(WorkflowRun).where(WorkflowRun.name.in_((WORKFLOW_NAME, *RETIRED_WORKFLOWS)))).all()
     for run in runs:
         if run.status in OPEN_RUN_STATUSES:
             continue
         trees = trees_of(run)
         if not trees or not any(Path(tree.path).exists() for tree in trees):
             continue
-        plan = find_plan(str((run.input or {}).get("change_id")))
-        cleanup(session, run, keep_branches=plan is not None and state(plan) == "queued")
+        if run.name in RETIRED_WORKFLOWS:
+            remove_worktrees(trees, delete_branches=True)
+        else:
+            plan = find_plan(str((run.input or {}).get("change_id")))
+            cleanup(session, run, keep_branches=plan is not None and state(plan) == "queued")
         removed += 1
     return removed
+
+
+def expire_cards(session: Session, *, now: datetime | None = None) -> int:
+    """Answer each Workshop card nobody answered for ``CARD_EXPIRES``, marked ``expired``: a change's card
+    as a Discard, an idea card as a Not now. Typing a note on a card counts as an answer to wait for."""
+    from tasque2.workflows import WorkflowService
+
+    now = now or utc_now()
+    rows = session.execute(
+        select(WorkflowRun, WorkflowNode)
+        .join(WorkflowNode, WorkflowNode.workflow_run_id == WorkflowRun.id)
+        .where(
+            WorkflowRun.name.in_(list(EXPIRED_ANSWERS)),
+            WorkflowRun.status == "awaiting_input",
+            WorkflowNode.kind == "gate",
+            WorkflowNode.status == "awaiting_input",
+        )
+    ).all()
+    expired = 0
+    for run, node in rows:
+        answer = EXPIRED_ANSWERS[run.name]
+        waited = now - ledger.aware(node.updated_at)
+        if waited < CARD_EXPIRES or answer not in (node.definition or {}).get("choices", []):
+            continue
+        WorkflowService(session).answer_gate(workflow_run_id=run.id, node_key=node.node_key, answer=answer)
+        node.output = {**(node.output or {}), "expired": True}
+        expired += 1
+    session.flush()
+    return expired
 
 
 # --- undo, redo, status ------------------------------------------------------------------------------------
@@ -787,6 +982,8 @@ def undo_by_id(session: Session, release_id: str) -> str:
         outcome = undo_release(session, plan)
     except (UndoError, RuntimeError) as exc:
         return f"Can't undo {plan.title}: {exc}."
+    if outcome.get("kind") == "withdrawn":
+        code_holder(session)  # a release withdrawn before it went live holds the code no longer
     return undo_text(plan, outcome)
 
 
@@ -808,14 +1005,15 @@ def latest_runs(session: Session, *, thread_id: str | None = None, limit: int = 
 
 
 def redo(session: Session, *, thread_id: str | None, author: str | None = None) -> WorkflowRun | None:
-    """Start the newest change that did not ship again, from the same request."""
+    """Start the newest change that did not ship again, from the same request. A change the Workshop filed
+    is not one: its rows go back to the ledger, which files them again in time."""
     for run in latest_runs(session, thread_id=thread_id):
-        if run.status in OPEN_RUN_STATUSES:
+        given = run.input or {}
+        if run.status in OPEN_RUN_STATUSES or given.get("origin") == "workshop":
             continue
         release = node_output(session, run.id, "release")
         if release.get("released") or node_output(session, run.id, "classify").get("answer"):
             continue
-        given = run.input or {}
         return start_change(
             session,
             request=str(given.get("request") or ""),
@@ -827,6 +1025,16 @@ def redo(session: Session, *, thread_id: str | None, author: str | None = None) 
             evidence=given.get("evidence"),
         )
     return None
+
+
+def _refile(session: Session, run: WorkflowRun, again: WorkflowRun) -> None:
+    """The ledger rows a change the Workshop filed answers go with the change planned again in its place
+    (a Revise)."""
+    given = run.input or {}
+    if given.get("origin") == "workshop" and given.get("issues"):
+        ledger.refile(
+            session, str(given.get("change_id")), new_change_id=str(again.input["change_id"]), run_id=again.id
+        )
 
 
 STAGES = (
@@ -873,4 +1081,5 @@ def status_text(session: Session) -> str:
         lines.append("Recent releases:")
         lines += [f"- {plan.created_at[:10]} {plan.title}: {state(plan)}" for plan in reversed(recent)]
     lines.append(f"Shipped on their own today: {auto_today()}/{policy.AUTO_PER_DAY}.")
+    lines += ledger.status_lines(session)
     return "\n".join(lines)

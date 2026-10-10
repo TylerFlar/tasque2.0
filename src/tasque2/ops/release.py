@@ -58,6 +58,7 @@ class ReleasePlan:
     created_at: str = field(default_factory=lambda: utc_now().isoformat())
     # The record: who asked, how it went, whether it was reversed.
     tier: str = ""
+    origin: str = ""
     summary: str = ""
     run_id: str | None = None
     thread_id: str | None = None

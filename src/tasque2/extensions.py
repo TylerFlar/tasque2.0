@@ -12,7 +12,8 @@ directory (``TASQUE2_EXTENSIONS_DIR``, default ``extensions/``), each exposing
 - canonical-key resolvers that choose pinned documents per run;
 - attempt ingestors that run after every successfully completed attempt;
 - schedule gates: code that decides, before a scheduled run is launched, whether it is needed;
-- sticky sections: fields a thread's sticky note shows below its notes, kept current in place.
+- sticky sections: fields a thread's sticky note shows below its notes, kept current in place;
+- signal sources: issues the Workshop's sweep should know about (a decision that took its default).
 
 Extensions load once per process on first use. A broken extension raises: a daemon that
 silently lost its domain tools would corrupt runs far worse than a loud startup failure.
@@ -37,6 +38,7 @@ AttemptIngestor = Callable[[Any, Any, Any], Any]
 CanonicalKeyResolver = Callable[[Any, dict[str, Any]], list[str]]
 ScheduleGate = Callable[[Any, Any, Any], "str | None"]
 StickySection = Callable[[Any, str, Any], "list[dict[str, str]] | None"]
+SignalSource = Callable[[Any, Any], "list[dict[str, Any]]"]
 FunctionWorker = Callable[[Any], Any]
 
 
@@ -56,6 +58,7 @@ class ExtensionRegistry:
     schedule_gates: dict[str, ScheduleGate] = field(default_factory=dict)
     function_workers: dict[str, FunctionWorker] = field(default_factory=dict)
     sticky_sections: list[tuple[str, StickySection]] = field(default_factory=list)
+    signal_sources: list[tuple[str, SignalSource]] = field(default_factory=list)
     extension_names: list[str] = field(default_factory=list)
 
     def add_context_digest(self, key: str, wants: DigestWants, build: DigestBuild) -> None:
@@ -108,6 +111,15 @@ class ExtensionRegistry:
         out of that pass.
         """
         self.sticky_sections.append((name, section))
+
+    def add_signal_source(self, name: str, source: SignalSource) -> None:
+        """Tell the Workshop's sweep (``tasque2.workshop.sweep``) about issues only this extension can see.
+
+        ``source(session, now)`` returns one ``{"key", "title", "evidence"}`` per distinct issue that stands
+        now (``key`` stable for as long as it stands, ``evidence`` a few short lines; ``since`` when it began,
+        when known). It reads the ledgers and never calls out. One that raises is left out of that sweep.
+        """
+        self.signal_sources.append((name, source))
 
     def add_migration_location(self, path: Path | str) -> None:
         """Add an Alembic version directory that upgrades together with the core one."""

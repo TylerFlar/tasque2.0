@@ -136,6 +136,7 @@ def release_plan(run: WorkflowRun, changed: list[Any], files: dict[str, list[str
         db_script=db_script if db_script in data_files else None,
         window="quiet" if tier == policy.AUTO else "now",
         tier=tier,
+        origin=str(given.get("origin") or ""),
         summary="\n".join(str(line).strip() for line in build.get("changes") or [] if str(line).strip())[:1500],
         run_id=run.id,
         thread_id=run.discord_thread_id,
@@ -237,6 +238,9 @@ def verify(session: Session, run: WorkflowRun) -> dict[str, Any]:
         else ("when Tasque restarts in the small hours" if plan.window == "quiet" else "when Tasque restarts next")
     )
     lines = [f"**Workshop: {classify.get('title')}** ({kind}; {TIER_LABELS[tier]}: {why})"]
+    if origin == "workshop":
+        found = [str(line) for line in given.get("evidence") or [] if str(line).strip()][:2]
+        lines.append("The Workshop filed this itself" + (f": {'; '.join(found)}" if found else "."))
     lines += [f"- {line}" for line in plan.summary.splitlines()[:8]]
     lines.append(f"Changed: {' · '.join(sizes)}")
     if doctrine:

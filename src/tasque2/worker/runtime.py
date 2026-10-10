@@ -76,6 +76,8 @@ class ProviderRuntime:
             env.setdefault(key, value)
         cwd = str(contract.get("cwd") or (work_item.context or {}).get("cwd") or settings.resolved_project_dir)
 
+        # The prompt's size is kept with the run, where the Workshop's sweep finds packets over their budget.
+        prompt_size = {"prompt_chars": len(prompt)}
         provider_run = ProviderRun(
             attempt_id=attempt.id,
             provider=provider_name,
@@ -84,6 +86,7 @@ class ProviderRuntime:
             argv=[],
             env_keys=sorted(env),
             status="running",
+            usage=dict(prompt_size),
             started_at=utc_now(),
         )
         session.add(provider_run)
@@ -130,7 +133,7 @@ class ProviderRuntime:
                 argv_record = _redacted_argv(adapter, request)
                 response = adapter.run(request)
                 summary = parse_stream(response.stdout)
-                usage = {**response.usage, **summary.usage_record()}
+                usage = {**prompt_size, **response.usage, **summary.usage_record()}
                 cost = estimate_cost_usd(summary.model or choice.model, summary.usage)
                 if cost is not None:
                     usage["estimated_cost_usd"] = round(cost, 4)

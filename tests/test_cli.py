@@ -959,7 +959,7 @@ def test_doctor_json_without_migrating(fresh_db: Path) -> None:
         "queue",
     }
     assert checks["database.migrations"]["status"] == "ok"
-    assert checks["database.migrations"]["details"]["current"] == "core_0003"
+    assert checks["database.migrations"]["details"]["current"] == "core_0004"
 
 
 def test_doctor_strict_exits_nonzero_only_on_failures(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1087,9 +1087,9 @@ def test_migrate_and_db_status() -> None:
     migrated = cli("migrate").output
     status = cli("db-status").output
 
-    assert "tasque2.sqlite3: core_0003" in migrated
-    assert re.search(r"current\s+.\s+core_0003", status)
-    assert re.search(r"head\s+.\s+core_0003", status)
+    assert "tasque2.sqlite3: core_0004" in migrated
+    assert re.search(r"current\s+.\s+core_0004", status)
+    assert re.search(r"head\s+.\s+core_0004", status)
     assert re.search(r"up to date\s+.\s+True", status)
 
 
@@ -1104,7 +1104,7 @@ def test_backup_create_and_restore(fresh_db: Path, tmp_path: Path) -> None:
 
     assert "backup:" in created and (backup_dir / "tasque2.sqlite3").is_file()
     assert "pass --force to confirm" in refused.output
-    assert "restored:" in restored and "(core_0003)" in restored
+    assert "restored:" in restored and "(core_0004)" in restored
     assert "previous database kept at:" in restored
     listing = cli("list").output
     assert "Kept" in listing

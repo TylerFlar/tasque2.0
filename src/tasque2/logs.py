@@ -13,20 +13,21 @@ _previous_level: int | None = None
 def configure_logging(level: str | None = None) -> None:
     """Send Tasque logs to stderr once per process; TASQUE2_LOG_LEVEL sets the level.
 
-    ERROR records also go to the fault ledger (``tasque2.ops.faults``), where health checks
-    find code faults that callers caught and logged instead of raising.
+    ERROR records also go to the fault ledger and WARNING records to the warning ledger
+    (``tasque2.ops.faults``), where health checks and the Workshop's sweep find what callers caught
+    and logged instead of raising.
     """
     global _previous_level
     if _handlers:
         return
-    from tasque2.ops.faults import FaultLedgerHandler
+    from tasque2.ops.faults import FaultLedgerHandler, WarningLedgerHandler
 
     resolved = (level or os.environ.get("TASQUE2_LOG_LEVEL") or "INFO").upper()
     handler = logging.StreamHandler(sys.stderr)
     handler.setFormatter(logging.Formatter(_FORMAT, datefmt="%Y-%m-%d %H:%M:%S"))
     root = logging.getLogger()
     _previous_level = root.level
-    for added in (handler, FaultLedgerHandler()):
+    for added in (handler, FaultLedgerHandler(), WarningLedgerHandler()):
         root.addHandler(added)
         _handlers.append(added)
     root.setLevel(resolved)

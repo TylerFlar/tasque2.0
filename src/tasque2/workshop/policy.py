@@ -27,7 +27,6 @@ KINDS = ("fix", "tweak", "feature", "redesign")
 SELF = (
     "src/tasque2/workshop/",
     "src/tasque2/ops/privacy.py",
-    "src/tasque2/ops/repair.py",
     "src/tasque2/ops/release.py",
     "src/tasque2/ops/rehearse.py",
     "src/tasque2/ops/worktree.py",
