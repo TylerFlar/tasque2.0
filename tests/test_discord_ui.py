@@ -11,6 +11,7 @@ from tasque2.discord.output import DiscordOutputService
 from tasque2.discord.ui import (
     COLOR_ALERT,
     COLOR_OK,
+    COLOR_WARN,
     DiscordUIAction,
     DiscordUIService,
     build_ops_embed,
@@ -23,9 +24,13 @@ from tasque2.discord.ui import (
 )
 from tasque2.models import WorkflowDefinition, WorkflowNode, WorkflowRun, WorkItem
 from tasque2.ops.status import get_system_status
+from tasque2.work.queue import WorkQueue
 from tasque2.work.repository import WorkRepository
+from tasque2.work.retry import capacity_gate
 from tasque2.work.runner import WorkRunner
 from tasque2.workflows import WorkflowService
+
+WEEKLY_LIMIT = "You've hit your weekly limit · resets Oct 13, 1pm (America/Los_Angeles)"
 
 
 def _custom_ids(view) -> list[str]:
@@ -349,6 +354,39 @@ def test_ops_panel_posts_once_and_updates_when_counts_change(fresh_db: Path) -> 
         assert edited["title"] == "tasque ops panel"
         assert "ready **1**" in edited["fields"][0]["value"]
         assert service.refresh_control_panel(channel_id="ops", gateway=gateway) is False
+
+
+def test_ops_panel_shows_a_usage_hold_with_a_button_that_releases_it(fresh_db: Path) -> None:
+    gateway = FakeDiscordGateway()
+    with session_scope() as session:
+        service = DiscordOutputService(session)
+        first = service.ensure_control_panel(channel_id="ops", gateway=gateway)
+        work = WorkRepository(session).create_work_item(
+            title="Limited", task_instruction="Apply.", worker_kind="provider.default"
+        )
+        queue = WorkQueue(session)
+        claimed = queue.claim_next_ready_work(lease_owner="daemon")
+        queue.fail_attempt(claimed.attempt.id, error_type="TransientProviderError", error_message=WEEKLY_LIMIT)
+
+        assert service.refresh_control_panel(channel_id="ops", gateway=gateway) is True
+        _channel, message_id, _content, embed, view = gateway.edited_messages[-1]
+        assert message_id == first.message_id
+        assert embed["fields"][0]["name"] == "Usage limit"
+        held = embed["fields"][0]["value"]
+        assert WEEKLY_LIMIT in held
+        assert "Model runs wait until <t:" in held and "**1** run parked until <t:" in held
+        assert embed["color"] == COLOR_WARN
+        assert _custom_ids(view) == ["t2:usage:back"]
+
+        reply = DiscordUIService(session).handle_action(parse_custom_id("t2:usage:back"))
+
+        assert "1 parked run requeued" in reply
+        assert not capacity_gate.is_closed()
+        assert session.get(WorkItem, work.id).not_before is None
+        assert service.refresh_control_panel(channel_id="ops", gateway=gateway) is True
+        _channel, _message_id, _content, embed, view = gateway.edited_messages[-1]
+        assert [field["name"] for field in embed["fields"]] == ["Jobs", "In flight", "Workflows", "Schedules", "DLQ"]
+        assert view is None
 
 
 def test_ops_panel_flags_unresolved_dead_letters(fresh_db: Path) -> None:

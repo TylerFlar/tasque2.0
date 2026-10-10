@@ -142,13 +142,19 @@ def limit_retry_delay_seconds(
     return max(60, min(delay, LIMIT_RETRY_MAX_SECONDS))
 
 
+def is_limit_stop(error_type: str | None, error_message: str | None) -> bool:
+    """Whether a failed attempt stopped on a provider usage limit (the failure that closes the gate)."""
+    return (error_type or "") in TRANSIENT_ERROR_TYPES and _LIMIT_MESSAGE_RE.search(error_message or "") is not None
+
+
 class ProviderCapacityGate:
     """Process-local hold on provider claims after an account-wide limit stop.
 
     A usage limit applies to every run, so after one stop the daemon stops claiming
     provider work until the stated reset instead of spending an attempt per item on an
     instant failure. Each item's own ``not_before`` still carries its retry, so a restarted
-    daemon simply relearns the gate from the next stop.
+    daemon simply relearns the gate from the next stop. When usage comes back before the
+    reset, the ops panel's Usage is back button opens it (``WorkQueue.release_usage_hold``).
     """
 
     def __init__(self) -> None:

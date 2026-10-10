@@ -19,7 +19,7 @@ from tasque2.config import get_settings
 from tasque2.events import record_event
 from tasque2.models import FailedWork, ProviderRun, WorkAttempt, WorkDependency, WorkItem, utc_now
 from tasque2.telemetry import instruments
-from tasque2.work.retry import capacity_gate, decide_retry
+from tasque2.work.retry import capacity_gate, decide_retry, is_limit_stop
 
 TERMINAL_WORK_STATUSES = {"succeeded", "dead_letter", "canceled"}
 _CLAIM_WINDOW = 50
@@ -29,6 +29,20 @@ _CLAIM_WINDOW = 50
 class ClaimedWork:
     work_item: WorkItem
     attempt: WorkAttempt
+
+
+@dataclass(frozen=True)
+class UsageHold:
+    """Model runs a usage limit holds back: the daemon's capacity gate, and the items parked until the reset."""
+
+    gate_until: datetime | None
+    parked: int
+    parked_until: datetime | None
+    reason: str | None
+
+    @property
+    def active(self) -> bool:
+        return self.gate_until is not None or self.parked > 0
 
 
 class WorkQueue:
@@ -107,16 +121,67 @@ class WorkQueue:
         return None
 
     def ready_count(self, *, now: datetime | None = None) -> int:
-        """How many items are ready to claim now (dependencies and the capacity gate aside)."""
+        """How many items are ready to claim now (dependencies and lane caps aside). Provider work the capacity
+        gate holds does not count, so a tick starts no workers that could claim nothing."""
         now = now or utc_now()
-        return int(
-            self.session.scalar(
-                select(func.count())
-                .select_from(WorkItem)
-                .where(WorkItem.status == "ready", or_(WorkItem.not_before.is_(None), WorkItem.not_before <= now))
-            )
-            or 0
+        query = (
+            select(func.count())
+            .select_from(WorkItem)
+            .where(WorkItem.status == "ready", or_(WorkItem.not_before.is_(None), WorkItem.not_before <= now))
         )
+        if capacity_gate.is_closed(now):
+            query = query.where(~WorkItem.worker_kind.startswith("provider."))
+        return int(self.session.scalar(query) or 0)
+
+    def usage_hold(self, *, now: datetime | None = None) -> UsageHold:
+        """What a usage limit holds back right now (the ops panel shows it)."""
+        now = now or utc_now()
+        parked = self._limit_parked(now)
+        latest = max((attempt for _item, attempt in parked), key=lambda attempt: attempt.ended_at or now, default=None)
+        return UsageHold(
+            gate_until=capacity_gate.until() if capacity_gate.is_closed(now) else None,
+            parked=len(parked),
+            parked_until=min((item.not_before for item, _attempt in parked if item.not_before), default=None),
+            reason=latest.error_message if latest is not None else None,
+        )
+
+    def release_usage_hold(self, *, now: datetime | None = None) -> int:
+        """Usage came back before the stated reset: open the capacity gate and requeue the items parked for the
+        limit; returns how many. Should the limit still hold, the next run stops on it and the hold comes back."""
+        now = now or utc_now()
+        capacity_gate.reset()
+        parked = self._limit_parked(now)
+        for work_item, _attempt in parked:
+            held_until = work_item.not_before
+            work_item.not_before = None
+            self._event(
+                "work.limit_hold_released",
+                work_item,
+                summary="Usage is back: released from the usage-limit hold",
+                payload={"held_until": held_until.isoformat() if held_until else None},
+            )
+        self.session.flush()
+        return len(parked)
+
+    def _limit_parked(self, now: datetime) -> list[tuple[WorkItem, WorkAttempt]]:
+        """Ready items waiting out a usage limit: their latest attempt stopped on it, and their retry is to come."""
+        latest_attempt = (
+            select(func.max(WorkAttempt.attempt_number))
+            .where(WorkAttempt.work_item_id == WorkItem.id)
+            .correlate(WorkItem)
+            .scalar_subquery()
+        )
+        rows = self.session.execute(
+            select(WorkItem, WorkAttempt)
+            .join(WorkAttempt, WorkAttempt.work_item_id == WorkItem.id)
+            .where(
+                WorkItem.status == "ready",
+                WorkItem.not_before > now,
+                WorkAttempt.attempt_number == latest_attempt,
+                WorkAttempt.status == "failed",
+            )
+        ).all()
+        return [(item, attempt) for item, attempt in rows if is_limit_stop(attempt.error_type, attempt.error_message)]
 
     def heartbeat_running_attempts(
         self,

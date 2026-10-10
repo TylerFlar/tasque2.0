@@ -509,6 +509,56 @@ def test_capacity_gate_only_extends_and_is_capped() -> None:
     assert not capacity_gate.is_closed()
 
 
+def test_ready_count_leaves_out_provider_work_the_gate_holds(fresh_db: Path) -> None:
+    with session_scope() as session:
+        _create(session, "Apply", worker_kind="provider.default")
+        _create(session, "Local bookkeeping")
+        queue = WorkQueue(session)
+        now = utc_now()
+        assert queue.ready_count(now=now) == 2
+
+        capacity_gate.hold_until(now + timedelta(minutes=30))
+
+        assert queue.ready_count(now=now) == 1
+        assert queue.ready_count(now=now + timedelta(minutes=31)) == 2
+
+
+def test_usage_is_back_opens_the_gate_and_requeues_only_limit_parked_work(fresh_db: Path) -> None:
+    now = utc_now()
+    with session_scope() as session:
+        queue = WorkQueue(session)
+        crashed = _create(session, "Crashed", worker_kind="provider.default")
+        claimed = queue.claim_next_ready_work(lease_owner="daemon", now=now)
+        queue.fail_attempt(
+            claimed.attempt.id,
+            error_type="TransientProviderError",
+            error_message="API Error: socket closed unexpectedly",
+            now=now,
+        )
+        limited = _create(session, "Limited", worker_kind="provider.default")
+        claimed = queue.claim_next_ready_work(lease_owner="daemon", now=now)
+        assert claimed.work_item.id == limited.id
+        queue.fail_attempt(
+            claimed.attempt.id, error_type="TransientProviderError", error_message=SESSION_LIMIT, now=now
+        )
+        later = _create(session, "Later", worker_kind="provider.default", not_before=now + timedelta(hours=2))
+
+        hold = queue.usage_hold(now=now)
+        assert hold.active and hold.gate_until is not None
+        assert (hold.parked, hold.reason) == (1, SESSION_LIMIT)
+        assert hold.parked_until == session.get(WorkItem, limited.id).not_before
+
+        assert queue.release_usage_hold(now=now) == 1
+
+        assert not capacity_gate.is_closed(now)
+        assert session.get(WorkItem, limited.id).not_before is None
+        assert session.get(WorkItem, crashed.id).not_before == now + timedelta(seconds=TRANSIENT_RETRY_DELAY_SECONDS)
+        assert session.get(WorkItem, later.id).not_before == now + timedelta(hours=2)
+        assert len(_events(session, limited.id, "work.limit_hold_released")) == 1
+        assert not queue.usage_hold(now=now).active
+        assert queue.claim_next_ready_work(lease_owner="daemon", now=now).work_item.id == limited.id
+
+
 def test_limit_stops_are_counted_per_lane(fresh_db: Path, metric_points) -> None:
     lane = "queue-test-limit-lane"
     with session_scope() as session:

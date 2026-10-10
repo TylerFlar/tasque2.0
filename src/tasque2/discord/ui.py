@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
 from sqlalchemy import select
@@ -12,7 +13,7 @@ from tasque2.models import WorkflowNode, WorkflowRun, WorkItem
 from tasque2.ops.reports import ReportService
 from tasque2.ops.status import SystemStatus
 from tasque2.sticky import StickyView
-from tasque2.work.queue import WorkQueue
+from tasque2.work.queue import UsageHold, WorkQueue
 from tasque2.workflows import WorkflowService
 
 CUSTOM_ID_PREFIX = "t2"
@@ -112,7 +113,14 @@ def result_view(produces: dict[str, Any] | None, default: Any | None) -> Any | N
     return build_undo_view(str(release_id)) if release_id else default
 
 
-def build_ops_embed(status: SystemStatus) -> dict[str, Any]:
+def build_ops_view(hold: UsageHold | None) -> Any | None:
+    """The ops panel's button while a usage limit holds model runs: release them when usage is back early."""
+    if hold is None or not hold.active:
+        return None
+    return _view("usage", None, [("Usage is back", "success", "back", None)])
+
+
+def build_ops_embed(status: SystemStatus, hold: UsageHold | None = None) -> dict[str, Any]:
     ready, running = status.work_items.get("ready", 0), status.work_items.get("running", 0)
     paused, dead = status.work_items.get("paused", 0), status.work_items.get("dead_letter", 0)
     jobs = " - ".join(
@@ -145,9 +153,12 @@ def build_ops_embed(status: SystemStatus) -> dict[str, Any]:
             "inline": False,
         },
     ]
+    held = hold is not None and hold.active
+    if held:
+        fields.insert(0, {"name": "Usage limit", "value": _usage_hold_text(hold), "inline": False})
     if status.failed_work_unresolved:
         color = COLOR_ALERT
-    elif status.ready_work or status.running_work or active_runs:
+    elif status.ready_work or status.running_work or active_runs or held:
         color = COLOR_WARN
     else:
         color = COLOR_OK
@@ -229,6 +240,8 @@ class DiscordUIService:
         self.session = session
 
     def handle_action(self, action: DiscordUIAction) -> str:
+        if action.scope == "usage" and action.action == "back":
+            return self._usage_back()
         if not action.entity_id:
             raise ValueError(f"{action.scope}:{action.action} requires an entity id.")
         if action.scope == "work":
@@ -284,6 +297,15 @@ class DiscordUIService:
         node = WorkflowService(self.session).answer_gate(workflow_run_id=workflow_run_id, node_key=key, answer=answer)
         return f"Answered workflow gate `{node.node_key}`."
 
+    def _usage_back(self) -> str:
+        """The ops panel's Usage is back: open the capacity gate and requeue what the limit parked."""
+        released = WorkQueue(self.session).release_usage_hold()
+        requeued = f"{released} parked run{'' if released == 1 else 's'} requeued" if released else "nothing was parked"
+        return (
+            f"Usage is back: model runs start again ({requeued}). "
+            "If the limit still holds, the first run stops on it and the hold comes back."
+        )
+
     def _work_action(self, action: str, work_item_id: str) -> str:
         queue = WorkQueue(self.session)
         transitions = {
@@ -329,7 +351,7 @@ def effective_node_status(node: WorkflowNode) -> str:
     return node.status
 
 
-def _view(scope: str, entity_id: str, buttons: list[tuple[str, str, str, int | None]]) -> Any | None:
+def _view(scope: str, entity_id: str | None, buttons: list[tuple[str, str, str, int | None]]) -> Any | None:
     try:
         import discord
     except ImportError:
@@ -412,6 +434,23 @@ def _truncate_lines(lines: list[str], limit: int) -> str:
 
 def _format_counts(counts: dict[str, int]) -> str:
     return ", ".join(f"{key}={value}" for key, value in sorted(counts.items())) or "(none)"
+
+
+def _usage_hold_text(hold: UsageHold) -> str:
+    """The ops panel's usage-limit field: why model runs wait, until when, and the way out when usage is back."""
+    lines = [f"> {' '.join(hold.reason.split())[:300]}"] if hold.reason else []
+    if hold.gate_until is not None:
+        lines.append(f"Model runs wait until {_timestamp(hold.gate_until, 't')} ({_timestamp(hold.gate_until, 'R')}).")
+    if hold.parked and hold.parked_until is not None:
+        runs = "run" if hold.parked == 1 else "runs"
+        lines.append(f"**{hold.parked}** {runs} parked until {_timestamp(hold.parked_until, 'f')}.")
+    lines.append("Usage back early? Press **Usage is back**.")
+    return "\n".join(lines)[:EMBED_FIELD_LIMIT]
+
+
+def _timestamp(moment: datetime, style: str) -> str:
+    """A Discord timestamp, shown in each viewer's own time zone (``R`` shows it relative to now)."""
+    return f"<t:{int(moment.timestamp())}:{style}>"
 
 
 def _truncate(content: str, limit: int = 1900) -> str:

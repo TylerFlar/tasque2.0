@@ -35,6 +35,7 @@ from tasque2.discord.ui import (
     CONTROL_PANEL_VERSION,
     build_gate_card_view,
     build_ops_embed,
+    build_ops_view,
     build_sticky_embed,
     build_work_controls_view,
     build_workflow_controls_view,
@@ -59,6 +60,7 @@ from tasque2.models import (
 )
 from tasque2.ops.status import get_system_status
 from tasque2.sticky import StickyService
+from tasque2.work.queue import WorkQueue
 
 logger = logging.getLogger(__name__)
 
@@ -169,8 +171,9 @@ class DiscordOutputService:
     def ensure_control_panel(self, *, channel_id: str, gateway: DiscordGateway) -> DiscordSentMessage | None:
         if self._control_panel_event(channel_id) is not None:
             return None
-        embed = build_ops_embed(get_system_status(self.session))
-        sent = gateway.send_embed(channel_id=channel_id, embed=embed)
+        hold = WorkQueue(self.session).usage_hold()
+        embed = build_ops_embed(get_system_status(self.session), hold)
+        sent = gateway.send_embed(channel_id=channel_id, embed=embed, view=build_ops_view(hold))
         self._record_outbound(sent, content=str(embed.get("title") or "ops panel"))
         self._event(
             "discord.control_panel_posted",
@@ -191,12 +194,19 @@ class DiscordOutputService:
         if event is None:
             return False
         payload = dict(event.payload or {})
-        embed = build_ops_embed(get_system_status(self.session))
+        hold = WorkQueue(self.session).usage_hold()
+        embed = build_ops_embed(get_system_status(self.session), hold)
         signature = _signature(embed)
         if not payload.get("discord_message_id") or payload.get("signature") == signature:
             return False
         try:
-            gateway.edit_message(channel_id=channel_id, message_id=str(payload["discord_message_id"]), embed=embed)
+            # the Usage is back button comes and goes with the usage-limit field, so the signature covers it
+            gateway.edit_message(
+                channel_id=channel_id,
+                message_id=str(payload["discord_message_id"]),
+                embed=embed,
+                view=build_ops_view(hold),
+            )
         except Exception:  # noqa: BLE001 - the stored signature is unchanged, so the next pass retries the edit
             return False
         event.payload = {**payload, "signature": signature}

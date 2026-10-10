@@ -9,9 +9,9 @@ hidden, and checks it comes up healthy. If it does not, the respawn resets the r
 where they were and starts the previous code again.
 
 Windows: ``"now"`` waits only for an idle moment; ``"quiet"`` also waits for the small hours
-(01:00-06:30 local), unless the request is a day old. An idle moment has no work waiting, no
-model-backed schedule due within 15 minutes, and no message from the user in the last 15 (the bot
-does not catch up on messages sent while it is down).
+(01:00-06:30 local), unless the request is a day old. An idle moment has no work waiting (model
+work a usage limit holds aside), no model-backed schedule due within 15 minutes, and no message
+from the user in the last 15 (the bot does not catch up on messages sent while it is down).
 """
 
 from __future__ import annotations
@@ -24,11 +24,11 @@ from datetime import datetime, time, timedelta
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from tasque2.config import get_settings
-from tasque2.models import DiscordMessage, Schedule, WorkItem, utc_now
+from tasque2.models import DiscordMessage, Schedule, utc_now
 
 REQUEST_FILE = "daemon.restart.json"
 RESULT_FILE = "daemon.restart.result.json"
@@ -112,15 +112,13 @@ def _local_time(moment: datetime) -> time:
 
 
 def waiting_reason(session: Session, request: dict[str, Any], *, now: datetime | None = None) -> str | None:
-    """Why the restart must wait, or None when the window is open."""
+    """Why the restart must wait, or None when the window is open. Model work a usage limit holds is not
+    waiting on anything a restart would interrupt, so it does not count."""
     from tasque2.schedules import ScheduleService
+    from tasque2.work.queue import WorkQueue
 
     now = now or utc_now()
-    if session.scalar(
-        select(func.count())
-        .select_from(WorkItem)
-        .where(WorkItem.status == "ready", or_(WorkItem.not_before.is_(None), WorkItem.not_before <= now))
-    ):
+    if WorkQueue(session).ready_count(now=now):
         return "work is waiting"
     last_inbound = session.scalar(
         select(func.max(DiscordMessage.created_at)).where(DiscordMessage.direction == "inbound")

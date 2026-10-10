@@ -16,8 +16,9 @@ from tasque2.daemon import respawn
 from tasque2.daemon.restart import read_request, request_restart, waiting_reason
 from tasque2.daemon.service import Daemon
 from tasque2.db import session_scope
-from tasque2.models import DiscordMessage, WorkItem
+from tasque2.models import DiscordMessage, WorkItem, utc_now
 from tasque2.schedules import ScheduleService
+from tasque2.work.retry import capacity_gate
 
 NIGHT = datetime(2026, 10, 7, 10, 0, tzinfo=UTC)  # 03:00 in Los Angeles
 DAY = datetime(2026, 10, 7, 20, 0, tzinfo=UTC)  # 13:00 in Los Angeles
@@ -83,6 +84,17 @@ def test_work_a_due_model_run_or_an_active_user_holds_the_restart(fresh_db: Path
         # and the no-model watch at 03:25 does not count
         later = NIGHT + timedelta(minutes=20)
         assert waiting_reason(session, _request("now"), now=later) == "memory-consolidation is due"
+
+
+def test_model_work_a_usage_limit_holds_does_not_hold_the_restart(fresh_db: Path, la: None) -> None:
+    with session_scope() as session:
+        session.add(WorkItem(title="queued", task_instruction="x", worker_kind="provider.default", status="ready"))
+        session.flush()
+        assert waiting_reason(session, _request("now"), now=NIGHT) == "work is waiting"
+
+        capacity_gate.hold_until(utc_now() + timedelta(hours=1))
+
+        assert waiting_reason(session, _request("now"), now=NIGHT) is None
 
 
 def test_a_restart_request_validates_and_round_trips(isolated: Path) -> None:
