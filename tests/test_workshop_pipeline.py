@@ -4,7 +4,9 @@ plan, a code change holds the code until it is live, and a cold release is annou
 
 from __future__ import annotations
 
-from datetime import timedelta
+import asyncio
+import json
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +28,7 @@ from workshop_shop import (
 )
 
 from tasque2.daemon.restart import clear_request, read_request
+from tasque2.daemon.service import Daemon
 from tasque2.db import session_scope
 from tasque2.models import WorkflowNode, WorkflowRun, WorkItem, utc_now
 from tasque2.ops.release import find_plan, history, save_plan, state
@@ -293,10 +296,68 @@ def test_a_cold_release_is_announced_once_it_is_live_and_undone_by_a_revert_rele
     assert read_request()["release"].endswith(f"undo-{change_id}.json")
 
 
+def _daemon_turn(daemon: Daemon, monkeypatch: pytest.MonkeyPatch, *, at: datetime) -> None:
+    """One turn of the daemon's loop at ``at``: a tick, the release pass when one is due, then a stop."""
+
+    async def stop(draining: bool) -> None:
+        daemon._stop.set()
+
+    monkeypatch.setattr("tasque2.daemon.service.utc_now", lambda: at)
+    monkeypatch.setattr(daemon, "_sleep", stop)
+    daemon._stop = asyncio.Event()
+    asyncio.run(daemon._tick_loop())
+
+
+def test_a_release_recorded_after_the_daemon_started_is_announced_by_its_loop(
+    shop: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ext, lock = shop["project"] / "extensions" / "ext1", pipeline._lock_path()
+
+    def posts(session) -> list[WorkItem]:
+        return list(session.scalars(select(WorkItem).where(WorkItem.worker_kind == pipeline.ANNOUNCE_WORKER)))
+
+    def holder() -> str:
+        return json.loads(lock.read_text(encoding="utf-8"))["change_id"]
+
+    with session_scope() as session:
+        first = pipeline.start_change(session, request="fix the other value", thread_id=THREAD)
+        drive(session, {"plan": _plan("The other value", "fix", ["extension"]), "build": _other_build})
+        second = pipeline.start_change(session, request="count to three", thread_id=THREAD)
+        drive(session, {"plan": _plan("Count to three", "feature", ["extension"])})
+        first_id, second_id = first.input["change_id"], second.input["change_id"]
+        prepare_id = session.scalar(
+            select(WorkItem.id).where(
+                WorkItem.workflow_run_id == second.id, WorkItem.worker_kind == pipeline.PREPARE_WORKER
+            )
+        )
+    daemon = Daemon(discord=False, max_claims=0)
+    daemon._announce_releases()  # as it starts, the release still reads as queued
+    with session_scope() as session:
+        assert posts(session) == [] and session.get(WorkItem, prepare_id).not_before is not None
+    assert holder() == first_id
+    _go_live(ext, first_id)  # the respawn records the outcome once the new daemon is up and healthy
+    later = utc_now() + timedelta(minutes=1)
+    _daemon_turn(daemon, monkeypatch, at=later)
+    with session_scope() as session:
+        [post] = posts(session)
+        assert post.discord_thread_id == THREAD and post.task_instruction.startswith("**Live now: The other value**")
+        assert not lock.exists()
+        prepare = session.get(WorkItem, prepare_id)
+        assert prepare.status == "ready" and prepare.not_before is None  # woken
+        drive(session, {}, steps=1)
+        session.refresh(prepare)
+        assert prepare.status == "succeeded"
+    assert holder() == second_id
+    _daemon_turn(daemon, monkeypatch, at=later + timedelta(minutes=1))
+    with session_scope() as session:
+        assert len(posts(session)) == 1
+    assert holder() == second_id
+
+
 def test_two_rollbacks_in_a_week_pause_the_workshop(shop: dict[str, Any]) -> None:
     from tasque2.ops.release import ReleasePlan
 
-    for number in (1, 2):
+    def roll_back(number: int) -> None:
         save_plan(
             ReleasePlan(
                 id=f"r{number}",
@@ -307,6 +368,9 @@ def test_two_rollbacks_in_a_week_pause_the_workshop(shop: dict[str, Any]) -> Non
                 thread_id=THREAD,
             )
         )
+
+    for number in (1, 2):
+        roll_back(number)
     with session_scope() as session:
         assert pipeline.announce_releases(session) == 2
         texts = [item.task_instruction for item in session.scalars(select(WorkItem)).all()]
@@ -317,6 +381,14 @@ def test_two_rollbacks_in_a_week_pause_the_workshop(shop: dict[str, Any]) -> Non
             pipeline.start_change(session, request="sweep", origin="workshop")
         run = pipeline.start_change(session, request="the owner's own ask still starts", thread_id=THREAD)
         assert run.input["paused"] is True
+    assert pipeline.resume()
+    with session_scope() as session:
+        assert pipeline.announce_releases(session) == 0
+    assert pipeline.paused() is None  # the owner's resume holds until another release is rolled back
+    roll_back(3)
+    with session_scope() as session:
+        assert pipeline.announce_releases(session) == 1
+    assert pipeline.paused() == "3 releases rolled back within a week"
 
 
 # --- the thread ----------------------------------------------------------------------------------------------

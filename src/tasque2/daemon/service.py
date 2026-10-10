@@ -18,13 +18,15 @@ import tasque2
 from tasque2.config import Settings, get_settings
 from tasque2.daemon import control, restart
 from tasque2.daemon.pool import WorkPool
-from tasque2.daemon.tick import DaemonTick, TickResult
+from tasque2.daemon.tick import DaemonTick, IntervalGate, TickResult
 from tasque2.db import session_scope
 from tasque2.models import utc_now
 from tasque2.ops.status import work_status_counts
 from tasque2.telemetry import instruments
 
 logger = logging.getLogger(__name__)
+
+ANNOUNCE_SECONDS = 60
 
 
 class DaemonAlreadyRunning(RuntimeError):
@@ -44,13 +46,14 @@ class Daemon:
         self._stop: asyncio.Event | None = None
         self._stop_requests = 0
         self._restart_wait: str | None = None
+        self._announce_gate = IntervalGate()
 
     async def run(self) -> None:
         self._stop = asyncio.Event()
         restore_signals = self._install_signal_handlers(asyncio.get_running_loop())
         instruments().observe_queue(_queue_counts)
         bot, bot_task = self._start_discord()
-        await asyncio.to_thread(self._after_start)
+        await asyncio.to_thread(self._announce_releases)
         logger.info(
             "Tasque daemon %s started (pid %s, concurrency %s)",
             tasque2.__version__,
@@ -89,6 +92,7 @@ class Daemon:
                     logger.info("Tick: %s", result.describe())
             except Exception:  # noqa: BLE001 - one failed tick must not stop the daemon
                 logger.exception("Daemon tick failed")
+            await asyncio.to_thread(self._announce_releases)
             try:
                 control.write_state(
                     started_at=self.started_at,
@@ -111,14 +115,18 @@ class Daemon:
                     return
             await self._sleep(draining)
 
-    def _after_start(self) -> None:
-        """Once per start: say how a release that restarted the daemon went (the Workshop)."""
+    def _announce_releases(self) -> None:
+        """Say how a release that restarted the daemon went (the Workshop): as the daemon starts, then at most
+        once every ``ANNOUNCE_SECONDS``, since the respawn records a release's outcome only once the new
+        daemon is up and healthy."""
+        if not self._announce_gate.claim(utc_now(), ANNOUNCE_SECONDS):
+            return
         try:
             from tasque2.workshop.pipeline import announce_releases
 
             with session_scope() as session:
                 announce_releases(session)
-        except Exception:  # noqa: BLE001 - a start never fails on its announcements
+        except Exception:  # noqa: BLE001 - a failed pass is logged, and the daemon goes on
             logger.exception("Could not announce the Workshop's releases")
 
     def _restart_due(self) -> bool:

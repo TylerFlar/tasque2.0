@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -125,6 +126,29 @@ def test_a_respawn_that_cannot_start_drops_the_request_and_the_daemon_keeps_goin
     asyncio.run(daemon._tick_loop())
     assert read_request() is None
     assert slept == [False]  # it carried on ticking instead of handing over
+
+
+def test_a_release_pass_that_fails_is_logged_and_the_loop_goes_on(
+    fresh_db: Path, la: None, monkeypatch, caplog
+) -> None:
+    daemon = Daemon(discord=False)
+
+    def unreadable(session) -> int:
+        raise OSError("the releases folder cannot be read")
+
+    slept: list[bool] = []
+
+    async def sleep_once(draining: bool) -> None:
+        slept.append(draining)
+        daemon._stop.set()
+
+    monkeypatch.setattr("tasque2.workshop.pipeline.announce_releases", unreadable)
+    monkeypatch.setattr(daemon, "_sleep", sleep_once)
+    daemon._stop = asyncio.Event()
+    with caplog.at_level(logging.ERROR, logger="tasque2.daemon.service"):
+        asyncio.run(daemon._tick_loop())
+    assert "Could not announce the Workshop's releases" in caplog.text
+    assert slept == [False]  # it carried on to its next tick
 
 
 # ------------------------------------------------------------------------------ the respawn process

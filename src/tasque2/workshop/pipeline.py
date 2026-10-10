@@ -845,17 +845,19 @@ def _why(plan: Any) -> str:
 
 def announce_releases(session: Session) -> int:
     """Post how each cold release went (once), record undos, pause after repeated rollbacks, free the code
-    lock and sweep leftover worktrees. The daemon runs it when it starts."""
+    lock and sweep leftover worktrees. The daemon runs it as it starts and then once a minute, so every step
+    is safe to repeat."""
     from tasque2.ops.release import history, mark_undone, save_plan, state
     from tasque2.work.repository import WorkRepository
 
-    posted = 0
+    posted, rolled_back_now = 0, False
     for plan in history():
         if plan.announced or plan.outcome is None or not plan.cold:
             continue
         status = state(plan)
         plan.announced = True
         save_plan(plan)
+        rolled_back_now = rolled_back_now or status == "failed"
         if status == "canceled":
             continue
         if plan.undo_of and status == "live":
@@ -875,12 +877,13 @@ def announce_releases(session: Session) -> int:
             lane=LANE,
         )
         posted += 1
-    since = utc_now() - ROLLBACK_WINDOW
-    rolled_back = [
-        plan for plan in history() if state(plan) == "failed" and _at((plan.outcome or {}).get("at")) >= since
-    ]
-    if len(rolled_back) >= ROLLBACKS_TO_PAUSE and not paused():
-        pause(f"{len(rolled_back)} releases rolled back within a week")
+    if rolled_back_now:  # counted only then, so the owner's resume holds until the next rollback
+        since = utc_now() - ROLLBACK_WINDOW
+        rolled_back = [
+            plan for plan in history() if state(plan) == "failed" and _at((plan.outcome or {}).get("at")) >= since
+        ]
+        if len(rolled_back) >= ROLLBACKS_TO_PAUSE and not paused():
+            pause(f"{len(rolled_back)} releases rolled back within a week")
     code_holder(session)
     sweep_worktrees(session)
     return posted
