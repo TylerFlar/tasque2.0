@@ -94,6 +94,7 @@ def configure_telemetry(role: str, *, settings: Settings | None = None) -> Telem
         _state.tracer_provider = _install_tracing(mode, resource)
         _state.meter_provider = _install_metrics(mode, resource)
         _state.logger_provider, _state.log_handler = _install_logging(mode, resource)
+        # The providers are built with shutdown_on_exit=False, so this is their only shutdown.
         atexit.register(shutdown_telemetry)
         logger.info("Telemetry enabled (%s) for role %s", mode.value, role)
         return mode
@@ -147,7 +148,7 @@ def _install_tracing(mode: TelemetryMode, resource: Resource):
     from opentelemetry.sdk.trace import TracerProvider
     from opentelemetry.sdk.trace.export import BatchSpanProcessor, ConsoleSpanExporter
 
-    provider = TracerProvider(resource=resource)
+    provider = TracerProvider(resource=resource, shutdown_on_exit=False)
     if mode is TelemetryMode.OTLP:
         from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
 
@@ -172,7 +173,9 @@ def _install_metrics(mode: TelemetryMode, resource: Resource):
         exporter = OTLPMetricExporter()
     else:
         exporter = ConsoleMetricExporter()
-    provider = MeterProvider(resource=resource, metric_readers=[PeriodicExportingMetricReader(exporter)])
+    provider = MeterProvider(
+        resource=resource, metric_readers=[PeriodicExportingMetricReader(exporter)], shutdown_on_exit=False
+    )
     metrics.set_meter_provider(provider)
     return provider
 
@@ -188,7 +191,7 @@ def _install_logging(mode: TelemetryMode, resource: Resource):
         exporter = OTLPLogExporter()
     else:
         exporter = ConsoleLogExporter()
-    provider = LoggerProvider(resource=resource)
+    provider = LoggerProvider(resource=resource, shutdown_on_exit=False)
     provider.add_log_record_processor(BatchLogRecordProcessor(exporter))
     set_logger_provider(provider)
     handler = LoggingHandler(level=logging.INFO, logger_provider=provider)

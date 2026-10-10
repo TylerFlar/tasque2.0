@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import logging
+import os
+import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 from opentelemetry import baggage, trace
@@ -184,6 +188,29 @@ def test_shutdown_telemetry_detaches_the_log_handler_and_stops_the_providers(mon
     assert tracer_provider.calls == [("shutdown", None)]
     assert meter_provider.calls == [("shutdown", None)]
     assert telemetry_active() is False
+
+
+_EXIT_PROBE = """
+from tasque2.config import Settings
+from tasque2.telemetry import configure_telemetry, instruments, span
+
+configure_telemetry("cli", settings=Settings(telemetry="console"))
+with span("exit probe"):
+    instruments().work_runs.add(1)
+"""
+
+
+def test_telemetry_is_shut_down_once_when_the_process_exits(isolated: Path) -> None:
+    # Exit handlers only run when an interpreter really exits, so a fresh one runs the code under test.
+    env = {**os.environ, "PYTHONPATH": str(Path(tasque2.__file__).resolve().parents[1])}
+    result = subprocess.run(
+        [sys.executable, "-c", _EXIT_PROBE], cwd=isolated, env=env, capture_output=True, text=True, timeout=60
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert '"name": "exit probe"' in result.stdout
+    assert '"name": "tasque.work.runs"' in result.stdout
+    assert "shutdown can only be called once" not in result.stdout + result.stderr
 
 
 def test_resource_names_the_service_after_the_role(monkeypatch: pytest.MonkeyPatch) -> None:
