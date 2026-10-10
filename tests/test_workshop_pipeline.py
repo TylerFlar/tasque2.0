@@ -31,6 +31,7 @@ from tasque2.daemon.restart import clear_request, read_request
 from tasque2.daemon.service import Daemon
 from tasque2.db import session_scope
 from tasque2.models import WorkflowNode, WorkflowRun, WorkItem, utc_now
+from tasque2.ops import datarepo
 from tasque2.ops.release import find_plan, history, save_plan, state
 from tasque2.workflows import WorkflowService
 from tasque2.workshop import pipeline, reply
@@ -62,6 +63,25 @@ def test_a_tweak_ships_on_its_own_and_undoes(shop: dict[str, Any]) -> None:
         assert pipeline.undo_by_id(session, change_id) == "Undone: Shorter cooking replies is reversed."
     assert (shop["data"] / TEMPLATE).read_text(encoding="utf-8") == "Reply.\n"
     assert state(find_plan(change_id)) == "undone"
+
+
+def test_a_config_change_ships_when_the_live_config_moved_on_while_it_was_built(shop: dict[str, Any]) -> None:
+    def build_while_others_move(item: WorkItem) -> dict[str, Any]:
+        produced = _template_build(item)
+        (shop["data"] / "work-templates" / "daybook").mkdir(parents=True, exist_ok=True)
+        (shop["data"] / "work-templates" / "daybook" / "brief.template.md").write_text("Brief.\n", encoding="utf-8")
+        datarepo.snapshot("before another change")  # another change began meanwhile
+        return produced
+
+    script = {"plan": _plan("Shorter cooking replies", "tweak", ["templates"]), "build": build_while_others_move}
+    with session_scope() as session:
+        run = pipeline.start_change(session, request="make cooking replies shorter", thread_id=THREAD)
+        drive(session, script)
+        text, release_id = pipeline.report_text(session, session.get(WorkflowRun, run.id))
+        assert text.startswith("**Live now: Shorter cooking replies**") and release_id
+    assert (shop["data"] / TEMPLATE).read_text(encoding="utf-8") == "Reply, briefly.\n"
+    assert (shop["data"] / "work-templates" / "daybook" / "brief.template.md").is_file()
+    assert _git(shop["data"], "branch", "--list", "workshop/*") == ""
 
 
 def test_a_feature_waits_for_one_tap_and_a_code_change_waits_for_a_restart(shop: dict[str, Any]) -> None:

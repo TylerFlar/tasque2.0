@@ -302,14 +302,15 @@ def merge_config(plan: ReleasePlan) -> str | None:
 
 
 def rebase_branch(repo: Path, branch: str, *, onto: str, base: str) -> None:
-    """Carry ``branch``'s commits since ``base`` onto ``onto`` in a temporary worktree, so the live
-    working tree never shows the branch."""
+    """Carry ``branch``'s commits since ``base`` onto ``onto`` in a temporary detached worktree, so the
+    live working tree never shows the branch and the branch may still be checked out elsewhere (the
+    change's own worktree); the branch then points at the carried commits."""
     import shutil
     import tempfile
 
     place = Path(tempfile.mkdtemp(prefix="tasque-rebase-"))
     shutil.rmtree(place, ignore_errors=True)
-    added = _git(repo, "worktree", "add", "-q", str(place), branch)
+    added = _git(repo, "worktree", "add", "-q", "--detach", str(place), branch)
     if added.returncode != 0:
         raise RuntimeError(f"cannot check out {branch} to carry it over: {added.stderr.strip()[:300]}")
     try:
@@ -317,6 +318,10 @@ def rebase_branch(repo: Path, branch: str, *, onto: str, base: str) -> None:
         if result.returncode != 0:
             _git(place, "rebase", "--abort")
             raise RuntimeError(f"the change no longer applies cleanly: {result.stderr.strip()[:300]}")
+        carried = _git(place, "rev-parse", "HEAD").stdout.strip()
+        moved = _git(repo, "update-ref", f"refs/heads/{branch}", carried)
+        if moved.returncode != 0:
+            raise RuntimeError(f"cannot move {branch} to the carried commits: {moved.stderr.strip()[:300]}")
     finally:
         _git(repo, "worktree", "remove", "--force", str(place))
         shutil.rmtree(place, ignore_errors=True)

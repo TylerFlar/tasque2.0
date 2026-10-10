@@ -211,12 +211,15 @@ def merge_config(data: Path, release: dict[str, Any]) -> tuple[str | None, str |
     if git(str(data), "merge-base", "--is-ancestor", prior, branch).returncode != 0:
         place = Path(tempfile.mkdtemp(prefix="tasque-rebase-"))
         shutil.rmtree(place, ignore_errors=True)
-        added = git(str(data), "worktree", "add", "-q", str(place), branch)
+        added = git(str(data), "worktree", "add", "-q", "--detach", str(place), branch)
         if added.returncode != 0:
             return prior, f"cannot check out the config branch: {added.stderr.strip()[:300]}"
         moved = git(str(place), "rebase", "-q", "--onto", prior, base)
         if moved.returncode != 0:
             git(str(place), "rebase", "--abort")
+        else:
+            carried = git(str(place), "rev-parse", "HEAD").stdout.strip()
+            moved = git(str(data), "update-ref", f"refs/heads/{branch}", carried)
         git(str(data), "worktree", "remove", "--force", str(place))
         shutil.rmtree(place, ignore_errors=True)
         if moved.returncode != 0:

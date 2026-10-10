@@ -722,6 +722,9 @@ def release_worker(work_item: WorkItem) -> dict[str, Any]:
             plan = ReleasePlan.from_dict(again["release_plan"])
     plan.run_id, plan.thread_id = run.id, run.discord_thread_id
     if not plan.cold:
+        # The worktrees go first: the release merges (and may carry) the config branch, never a tree that
+        # still holds it.
+        remove_worktrees(trees_of(run), delete_branches=False)
         try:
             outcome = release_hot(session, plan)
         except Exception as exc:  # noqa: BLE001 - reported to the owner, recorded as a fault

@@ -151,6 +151,19 @@ def test_a_live_edit_to_another_file_is_carried_along(config: Path, tmp_path: Pa
     ]
 
 
+def test_a_change_still_checked_out_in_its_worktree_is_carried_along(config: Path, tmp_path: Path) -> None:
+    plan = _change(config, tmp_path)
+    held = tmp_path / "still-there"
+    _git(config, "worktree", "add", "-q", str(held), "workshop/c1")  # the change's own tree, not yet removed
+    week = config / "work-templates" / "cooking" / "week.template.md"
+    week.write_text("Week, as a worker changed it.\n", encoding="utf-8")
+    with session_scope() as session:
+        assert release_hot(session, plan)["ok"] is True
+    assert week.read_text(encoding="utf-8") == "Week, as a worker changed it.\n"
+    assert (config / TEMPLATE).read_text(encoding="utf-8") == "Reply, changed.\n"
+    assert _git(config, "rev-parse", "workshop/c1") == datarepo.head(config)
+
+
 # --- a cold release, carried out by the respawn ---------------------------------------------------
 
 
@@ -210,8 +223,9 @@ def cold(tmp_path: Path) -> dict[str, Path]:
     _git(data, "init", "-q", "-b", "main")
     _git(data, "config", "user.email", "tests@example.com")
     _git(data, "config", "user.name", "Tests")
-    (data / ".gitignore").write_text("/*\n!/.gitignore\n!/lanes.json\n", encoding="utf-8")
+    (data / ".gitignore").write_text("/*\n!/.gitignore\n!/lanes.json\n!/week.md\n", encoding="utf-8")
     (data / "lanes.json").write_text("{}\n", encoding="utf-8")
+    (data / "week.md").write_text("Week.\n", encoding="utf-8")
     _git(data, "add", ".")
     _git(data, "commit", "-q", "-m", "config")
     base = _git(data, "rev-parse", "HEAD")
@@ -288,6 +302,20 @@ def test_a_cold_release_switches_code_and_config_and_runs_the_new_code_once(cold
     plan = json.loads(cold["plan"].read_text(encoding="utf-8"))
     assert plan["data"]["head"] == _git(cold["data"], "rev-parse", "HEAD") and plan["released_at"]
     assert (cold["data"] / "backups" / "pre-release-c2" / "tasque2.sqlite3").is_file()
+
+
+def test_a_cold_release_carries_its_config_branch_onto_a_live_edit_wherever_it_is_checked_out(
+    cold: dict[str, Path], tmp_path: Path
+) -> None:
+    _git(cold["data"], "worktree", "add", "-q", str(tmp_path / "still-there"), "workshop/c2")  # the change's own tree
+    week = cold["data"] / "week.md"
+    week.write_text("Week, as a worker changed it.\n", encoding="utf-8")  # not committed yet
+    assert _respawn(cold, healthy=True, apply_ok=True) == 0
+    assert week.read_text(encoding="utf-8") == "Week, as a worker changed it.\n"
+    assert (cold["data"] / "lanes.json").read_text(encoding="utf-8") == '{"threads": {}}\n'
+    assert _git(cold["data"], "rev-parse", "workshop/c2") == _git(cold["data"], "rev-parse", "HEAD")
+    plan = json.loads(cold["plan"].read_text(encoding="utf-8"))  # its record brackets the change's own commits
+    assert _git(cold["data"], "diff", "--name-only", f"{plan['data']['base']}..{plan['data']['head']}") == "lanes.json"
 
 
 @pytest.mark.parametrize(("healthy", "apply_ok"), [(True, False), (False, True)])
