@@ -33,7 +33,9 @@ DENIED_COMMANDS = (
     (r"\bgit\b[^\n|;&]*\b(push|checkout|switch|reset|rebase|worktree|stash)\b", "git that moves or publishes branches"),
     (r"\bgit\b[^\n|;&]*\bbranch\b[^\n|;&]*\s-(d|D|-delete)\b", "deleting a branch"),
     (
-        r"\btasque2(\.exe)?\b[^\n|;&]*\b(daemon|daemon-stop|daemon-restart|schedule-fire-now|release-apply)\b",
+        # the tasque2 command itself (bare, by its path, quoted or not, or python -m), then the subcommand
+        r"(?<![\w.-])tasque2(\.exe|\.cli)?(\.__main__)?[\"']?\s+[\"']?"
+        r"(daemon|daemon-stop|daemon-restart|schedule-fire-now|release-apply)(?![\w-])",
         "the daemon's commands",
     ),
     (r"\b(taskkill|stop-process|kill|pkill|schtasks)\b", "stopping processes or scheduling tasks"),

@@ -49,7 +49,6 @@ def test_writes_stay_inside_the_change(places: dict[str, str]) -> None:
         ("git -C {root} push origin HEAD", "moves or publishes"),
         ("git checkout main", "moves or publishes"),
         ("git branch -D workshop/c1", "deleting a branch"),
-        ("tasque2 daemon-restart --now", "daemon"),
         ("uv sync --frozen", "installing packages"),
         ("pip install requests", "installing packages"),
         ("Get-Content .env", ".env"),
@@ -59,6 +58,31 @@ def test_writes_stay_inside_the_change(places: dict[str, str]) -> None:
 def test_commands_stay_away_from_the_live_install(places: dict[str, str], command: str, refused: str | None) -> None:
     reason = _decide(places, "Bash", command=command.format(**places))
     assert (reason is None) if refused is None else (reason is not None and refused in reason), reason
+
+
+@pytest.mark.parametrize(
+    ("command", "refused"),
+    [
+        ("tasque2 daemon-restart --now", True),
+        ("tasque2.exe daemon", True),
+        ('"C:/x/.venv/Scripts/tasque2.exe" daemon-stop', True),
+        ("python -m tasque2 release-apply --plan p.json", True),
+        ("uv run tasque2 schedule-fire-now x", True),
+        ("python -m tasque2.cli daemon-stop", True),
+        ("python -m tasque2.__main__ daemon", True),
+        ('"{python}" -m tasque2 daemon-restart', True),
+        ("ruff check src/tasque2/daemon/respawn.py", False),
+        ("git add src/tasque2/daemon/restart.py", False),
+        ("python -m pytest tests/test_restart.py -k daemon", False),
+        ("python -m pytest src/tasque2/daemon", False),
+        ('"{python}" -m ruff check src/tasque2/daemon/respawn.py', False),
+        ('cd "{root}" && "{python}" -m pytest -q tests/test_restart.py -k daemon', False),
+        ("tasque2 daemon-status", False),
+    ],
+)
+def test_the_cli_is_refused_not_paths_that_name_it(places: dict[str, str], command: str, refused: bool) -> None:
+    reason = _decide(places, "Bash", command=command.format(**places))
+    assert (reason is not None and "the daemon's commands" in reason) if refused else (reason is None), reason
 
 
 def test_a_build_works_offline_and_a_plan_may_research(places: dict[str, str]) -> None:
