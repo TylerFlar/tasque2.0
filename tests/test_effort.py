@@ -7,7 +7,6 @@ from typer.testing import CliRunner
 
 from tasque2.cli import app
 from tasque2.db import session_scope
-from tasque2.localtime import in_quiet_hours, quiet_window
 from tasque2.models import DiscordMessage, DiscordThread, WorkItem, utc_now
 from tasque2.ops.effort import effort_report
 
@@ -37,12 +36,7 @@ def _thread(session, thread_id: str, lane: str) -> None:
     )
 
 
-def test_effort_report_counts_posts_asks_quiet_hours_and_pushback_per_thread(fresh_db: Path, monkeypatch) -> None:
-    monkeypatch.setenv("TASQUE2_QUIET_HOURS", "22:00-08:00")
-    monkeypatch.setenv("TASQUE2_TIMEZONE", "UTC")
-    from tasque2.config import reset_settings
-
-    reset_settings()
+def test_effort_report_counts_posts_asks_and_pushback_per_thread(fresh_db: Path) -> None:
     day = utc_now().replace(hour=12, minute=0, second=0, microsecond=0) - timedelta(days=1)
     with session_scope() as session:
         _thread(session, "t-career", "career")
@@ -60,7 +54,6 @@ def test_effort_report_counts_posts_asks_quiet_hours_and_pushback_per_thread(fre
     rows = {row["label"]: row for row in report["threads"]}
     assert rows["career"]["posts"] == 3
     assert rows["career"]["ask_share"] == 0.67
-    assert rows["career"]["quiet_hours_share"] == 0.33
     assert rows["career"]["inbound"] == 2
     assert rows["career"]["pushback"] == 1
     assert rows["kitchen"]["ask_share"] == 0.0
@@ -80,27 +73,3 @@ def test_effort_command_prints_the_totals_and_a_table(fresh_db: Path) -> None:
     assert result.exit_code == 0, result.output
     assert "1 posts" in result.output
     assert "daybook" in result.output
-
-
-def test_quiet_window_parses_crosses_midnight_and_can_be_turned_off(isolated: Path, monkeypatch) -> None:
-    from tasque2.config import reset_settings
-
-    monkeypatch.setenv("TASQUE2_TIMEZONE", "UTC")
-    monkeypatch.setenv("TASQUE2_QUIET_HOURS", "22:00-08:00")
-    reset_settings()
-    base = datetime(2026, 10, 6, tzinfo=utc_now().tzinfo)
-    assert in_quiet_hours(base.replace(hour=23))
-    assert in_quiet_hours(base.replace(hour=7, minute=59))
-    assert not in_quiet_hours(base.replace(hour=8))
-    assert not in_quiet_hours(base.replace(hour=15))
-
-    monkeypatch.setenv("TASQUE2_QUIET_HOURS", "13:00-14:00")
-    reset_settings()
-    assert in_quiet_hours(base.replace(hour=13, minute=30))
-    assert not in_quiet_hours(base.replace(hour=14, minute=1))
-
-    for off in ("", "nonsense", "09:00-09:00"):
-        monkeypatch.setenv("TASQUE2_QUIET_HOURS", off)
-        reset_settings()
-        assert quiet_window() is None
-        assert not in_quiet_hours(base.replace(hour=23))

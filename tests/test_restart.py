@@ -30,24 +30,23 @@ def la(monkeypatch: pytest.MonkeyPatch) -> None:
     reset_settings()
 
 
-def _request(window: str = "quiet", at: datetime = NIGHT) -> dict:
-    return {"requested_at": at.isoformat(), "reason": "test", "window": window, "switch": []}
+def _request(at: datetime = NIGHT) -> dict:
+    return {"requested_at": at.isoformat(), "reason": "test", "switch": []}
 
 
-def test_an_idle_night_opens_the_quiet_window(fresh_db: Path, la: None) -> None:
+def test_an_idle_moment_opens_the_restart_at_any_hour(fresh_db: Path, la: None) -> None:
     with session_scope() as session:
         assert waiting_reason(session, _request(), now=NIGHT) is None
-        assert waiting_reason(session, _request(), now=DAY) == "waiting for the quiet hours"
-        assert waiting_reason(session, _request("now"), now=DAY) is None
-        # a day-old request stops waiting for the small hours
-        assert waiting_reason(session, _request(at=DAY - timedelta(hours=25)), now=DAY) is None
+        assert waiting_reason(session, _request(at=DAY), now=DAY) is None
+        # a request written before the small-hours window was retired still goes at the next idle moment
+        assert waiting_reason(session, {**_request(at=DAY), "window": "quiet"}, now=DAY) is None
 
 
 def test_work_a_due_model_run_or_an_active_user_holds_the_restart(fresh_db: Path, la: None) -> None:
     with session_scope() as session:
         session.add(WorkItem(title="queued", task_instruction="x", worker_kind="function.echo", status="ready"))
         session.flush()
-        assert waiting_reason(session, _request("now"), now=NIGHT) == "work is waiting"
+        assert waiting_reason(session, _request(), now=NIGHT) == "work is waiting"
         session.query(WorkItem).delete()
 
         session.add(
@@ -61,8 +60,8 @@ def test_work_a_due_model_run_or_an_active_user_holds_the_restart(fresh_db: Path
             )
         )
         session.flush()
-        assert waiting_reason(session, _request("now"), now=NIGHT) == "the user is active"
-        assert waiting_reason(session, _request("now"), now=NIGHT + timedelta(minutes=20)) is None
+        assert waiting_reason(session, _request(), now=NIGHT) == "the user is active"
+        assert waiting_reason(session, _request(), now=NIGHT + timedelta(minutes=20)) is None
 
         ScheduleService(session).create_schedule(
             name="memory-consolidation",
@@ -83,35 +82,33 @@ def test_work_a_due_model_run_or_an_active_user_holds_the_restart(fresh_db: Path
         # 03:20 local: the user went quiet 25 minutes ago, the 03:30 model run is due within 15 minutes,
         # and the no-model watch at 03:25 does not count
         later = NIGHT + timedelta(minutes=20)
-        assert waiting_reason(session, _request("now"), now=later) == "memory-consolidation is due"
+        assert waiting_reason(session, _request(), now=later) == "memory-consolidation is due"
 
 
 def test_model_work_a_usage_limit_holds_does_not_hold_the_restart(fresh_db: Path, la: None) -> None:
     with session_scope() as session:
         session.add(WorkItem(title="queued", task_instruction="x", worker_kind="provider.default", status="ready"))
         session.flush()
-        assert waiting_reason(session, _request("now"), now=NIGHT) == "work is waiting"
+        assert waiting_reason(session, _request(), now=NIGHT) == "work is waiting"
 
         capacity_gate.hold_until(utc_now() + timedelta(hours=1))
 
-        assert waiting_reason(session, _request("now"), now=NIGHT) is None
+        assert waiting_reason(session, _request(), now=NIGHT) is None
 
 
 def test_a_restart_request_validates_and_round_trips(isolated: Path) -> None:
-    with pytest.raises(ValueError, match="window"):
-        request_restart(reason="x", window="soon")
     with pytest.raises(ValueError, match="repo and ref"):
         request_restart(reason="x", switch=[{"repo": "."}])
     request_restart(reason="repair", switch=[{"repo": ".", "ref": "repair/a", "push": True}])
     request = read_request()
-    assert request["window"] == "quiet" and request["switch"][0]["ref"] == "repair/a"
+    assert request["reason"] == "repair" and request["switch"][0]["ref"] == "repair/a"
     assert request["switch"][0]["push"] is True and request["switch"][0]["branch"] == "main"
 
 
-def test_the_daemon_restarts_only_when_the_window_is_open(fresh_db: Path, la: None, monkeypatch) -> None:
+def test_the_daemon_restarts_only_at_an_idle_moment(fresh_db: Path, la: None, monkeypatch) -> None:
     daemon = Daemon(discord=False)
     assert daemon._restart_due() is False  # nothing requested
-    request_restart(reason="test", window="now")
+    request_restart(reason="test")
     assert daemon._restart_due() is True
     monkeypatch.setattr("tasque2.daemon.restart.waiting_reason", lambda *a, **k: "the user is active")
     assert daemon._restart_due() is False
@@ -121,7 +118,7 @@ def test_a_respawn_that_cannot_start_drops_the_request_and_the_daemon_keeps_goin
     fresh_db: Path, la: None, monkeypatch
 ) -> None:
     daemon = Daemon(discord=False)
-    request_restart(reason="test", window="now")
+    request_restart(reason="test")
 
     def cannot_start(**kwargs) -> None:
         raise OSError("no process for you")
@@ -219,7 +216,7 @@ def _kill_stand_in(data: Path) -> None:
 
 def _write_request(data: Path, repo: Path) -> None:
     (data / "daemon.restart.json").write_text(
-        json.dumps({"reason": "repair", "window": "now", "switch": [{"repo": str(repo), "ref": "repair/a"}]}),
+        json.dumps({"reason": "repair", "switch": [{"repo": str(repo), "ref": "repair/a"}]}),
         encoding="utf-8",
     )
 

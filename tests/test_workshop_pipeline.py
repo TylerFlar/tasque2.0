@@ -107,7 +107,7 @@ def test_a_feature_waits_for_one_tap_and_a_code_change_waits_for_a_restart(shop:
         text, undo = pipeline.report_text(session, run)
         assert text.startswith("**Ready: Count to two**") and "at the next idle moment" in text and undo is None
         request = read_request()
-        assert request["window"] == "now" and request["switch"][0]["ref"] == f"workshop/{change_id}"
+        assert request["switch"][0]["ref"] == f"workshop/{change_id}"
         assert request["release"].endswith(f"{change_id}.json")
         assert pipeline.code_holder(session) == change_id  # taken again on Ship, until it is live
         plan = find_plan(change_id)
@@ -285,7 +285,7 @@ def test_a_cold_release_is_announced_once_it_is_live_and_undone_by_a_revert_rele
         change_id = run.input["change_id"]
         assert session.get(WorkflowRun, run.id).status == "completed"  # a fix with a test ships on its own
         plan = find_plan(change_id)
-        assert plan.window == "quiet" and plan.tier == "auto"
+        assert plan.tier == "auto"
     # what the respawn does: switch, record the outcome
     ext = shop["project"] / "extensions" / "ext1"
     before = _git(ext, "rev-parse", "HEAD")

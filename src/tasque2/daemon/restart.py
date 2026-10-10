@@ -1,17 +1,16 @@
-"""Restart the daemon at a quiet moment, optionally switching repositories to new commits first.
+"""Restart the daemon at an idle moment, optionally switching repositories to new commits first.
 
-A restart request is ``daemon.restart.json`` in the data directory: why, which window to wait for,
-and an optional ``switch``, a list of repositories to fast-forward to a ref (and whether to push
-the result). The daemon checks it every tick. Once the window opens and nothing is in flight, it
-stops claiming work and hands over to ``tasque2.daemon.respawn``, a standard-library-only process
-that waits for this daemon to exit, fast-forwards each repository, starts the daemon again
-hidden, and checks it comes up healthy. If it does not, the respawn resets the repositories to
-where they were and starts the previous code again.
+A restart request is ``daemon.restart.json`` in the data directory: why, and an optional
+``switch``, a list of repositories to fast-forward to a ref (and whether to push the result). The
+daemon checks it every tick. Once the moment is idle and nothing is in flight, it stops claiming
+work and hands over to ``tasque2.daemon.respawn``, a standard-library-only process that waits for
+this daemon to exit, fast-forwards each repository, starts the daemon again hidden, and checks it
+comes up healthy. If it does not, the respawn resets the repositories to where they were and
+starts the previous code again.
 
-Windows: ``"now"`` waits only for an idle moment; ``"quiet"`` also waits for the small hours
-(01:00-06:30 local), unless the request is a day old. An idle moment has no work waiting (model
-work a usage limit holds aside), no model-backed schedule due within 15 minutes, and no message
-from the user in the last 15 (the bot does not catch up on messages sent while it is down).
+An idle moment has no work waiting (model work a usage limit holds aside), no model-backed
+schedule due within 15 minutes, and no message from the user in the last 15 (the bot does not
+catch up on messages sent while it is down).
 """
 
 from __future__ import annotations
@@ -20,7 +19,7 @@ import json
 import os
 import subprocess
 import sys
-from datetime import datetime, time, timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -32,11 +31,8 @@ from tasque2.models import DiscordMessage, Schedule, utc_now
 
 REQUEST_FILE = "daemon.restart.json"
 RESULT_FILE = "daemon.restart.result.json"
-WINDOWS = ("quiet", "now")
-QUIET_FROM, QUIET_UNTIL = time(1, 0), time(6, 30)
 LOOKAHEAD = timedelta(minutes=15)
 USER_IDLE = timedelta(minutes=15)
-STALE_REQUEST = timedelta(hours=24)
 
 
 class RestartBusy(RuntimeError):
@@ -51,14 +47,10 @@ def result_path() -> Path:
     return get_settings().resolved_data_dir / RESULT_FILE
 
 
-def request_restart(
-    *, reason: str, window: str = "quiet", switch: list[dict[str, Any]] | None = None, release: str | None = None
-) -> Path:
+def request_restart(*, reason: str, switch: list[dict[str, Any]] | None = None, release: str | None = None) -> Path:
     """Ask the daemon to restart; ``switch`` entries are ``{repo, ref, push?, remote?, branch?}``. ``release``
     is a release plan's path (``tasque2.ops.release``): the respawn also merges its config, runs its
     ``release-apply`` with the new code, and restores the database snapshot if anything fails."""
-    if window not in WINDOWS:
-        raise ValueError(f"window must be one of {', '.join(WINDOWS)}")
     pending = read_request()
     if pending and (pending.get("switch") or pending.get("release")) and (switch or release):
         raise RestartBusy(f"another restart is waiting to go live: {pending.get('reason')}")
@@ -77,7 +69,7 @@ def request_restart(
         )
     path = request_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {"requested_at": utc_now().isoformat(), "reason": reason, "window": window, "switch": entries}
+    payload = {"requested_at": utc_now().isoformat(), "reason": reason, "switch": entries}
     if release:
         payload["release"] = str(Path(release).resolve())
     temporary = path.with_suffix(".tmp")
@@ -105,15 +97,9 @@ def read_result() -> dict[str, Any] | None:
         return None
 
 
-def _local_time(moment: datetime) -> time:
-    from tasque2.localtime import _to_local
-
-    return _to_local(moment).time()
-
-
 def waiting_reason(session: Session, request: dict[str, Any], *, now: datetime | None = None) -> str | None:
-    """Why the restart must wait, or None when the window is open. Model work a usage limit holds is not
-    waiting on anything a restart would interrupt, so it does not count."""
+    """Why the restart must wait, or None at an idle moment. Model work a usage limit holds is not waiting
+    on anything a restart would interrupt, so it does not count."""
     from tasque2.schedules import ScheduleService
     from tasque2.work.queue import WorkQueue
 
@@ -134,14 +120,6 @@ def waiting_reason(session: Session, request: dict[str, Any], *, now: datetime |
         upcoming = service.next_fire_time(schedule, now=now)
         if upcoming is not None and upcoming <= now + LOOKAHEAD:
             return f"{schedule.name} is due"
-    if request.get("window") == "quiet":
-        try:
-            requested = datetime.fromisoformat(str(request.get("requested_at")))
-        except ValueError:
-            requested = now
-        local = _local_time(now)
-        if not (QUIET_FROM <= local < QUIET_UNTIL) and now - requested < STALE_REQUEST:
-            return "waiting for the quiet hours"
     return None
 
 

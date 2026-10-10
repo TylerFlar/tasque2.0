@@ -152,9 +152,7 @@ def test_a_rolled_back_restart_a_stalled_one_and_a_long_waiting_choice_are_named
         encoding="utf-8",
     )
     request_path().write_text(
-        json.dumps(
-            {"requested_at": (now - timedelta(days=3)).isoformat(), "reason": "repair 2", "window": "now", "switch": []}
-        ),
+        json.dumps({"requested_at": (now - timedelta(days=3)).isoformat(), "reason": "repair 2", "switch": []}),
         encoding="utf-8",
     )
     with session_scope() as session:

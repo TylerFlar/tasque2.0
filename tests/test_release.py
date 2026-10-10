@@ -246,7 +246,6 @@ def cold(tmp_path: Path) -> dict[str, Path]:
         json.dumps(
             {
                 "reason": "release",
-                "window": "now",
                 "switch": [{"repo": str(code), "ref": "workshop/c2"}],
                 "release": str(plan_file),
             }

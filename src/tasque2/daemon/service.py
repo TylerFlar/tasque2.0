@@ -111,7 +111,7 @@ class Daemon:
                     logger.exception("Could not start the respawn process; the restart request is dropped")
                     restart.clear_request()
                 else:
-                    logger.info("Restarting at a quiet moment: the respawn process takes over")
+                    logger.info("Restarting at an idle moment: the respawn process takes over")
                     return
             await self._sleep(draining)
 
@@ -130,7 +130,7 @@ class Daemon:
             logger.exception("Could not announce the Workshop's releases")
 
     def _restart_due(self) -> bool:
-        """A restart was requested and its window is open (logged once per change while it waits)."""
+        """A restart was requested and the moment is idle (why it waits is logged once per change)."""
         request = restart.read_request()
         if request is None:
             self._restart_wait = None

@@ -44,10 +44,8 @@ from tasque2.discord.ui import (
 )
 from tasque2.discord.uploads import DiscordFileUpload
 from tasque2.events import record_event
-from tasque2.localtime import in_quiet_hours
 from tasque2.models import (
     Artifact,
-    DiscordMessage,
     DiscordThread,
     ProviderRun,
     WorkAttempt,
@@ -69,11 +67,6 @@ ACTIVE_RUN_STATUSES = {"active", "awaiting_input", "paused"}
 TERMINAL_RUN_STATUSES = {"completed", "failed", "canceled"}
 TEXT_SUFFIXES = {".md", ".txt", ".json", ".log"}
 STICKY_PIN_RETRY = timedelta(minutes=10)
-# Work that answers the user posts at once, quiet hours or not; so do reminders, which post the
-# time the user asked for. Everything else waits for morning unless its run marks it urgent or
-# the user has been active recently (they are up, so nothing is gained by holding).
-REPLY_SOURCES = {"discord", "discord_reply_followup", "discord_attachment", "cli"}
-AWAKE_WINDOW = timedelta(minutes=60)
 # Recording a message Discord already accepted waits out another writer's lock: the attempts, and the
 # pause before the n-th retry (n times this many seconds).
 RECORD_ATTEMPTS = 8
@@ -104,20 +97,14 @@ class DiscordOutputService:
         self.refresh_control_panel(channel_id=channels.ops, gateway=gateway)
         self.refresh_workflow_panels(channel_id=channels.chains, gateway=gateway, limit=limit)
         posted = 0
-        quiet = self._quiet_now()
         for run in self._pending_workflow_runs(limit):
-            if quiet and not self._urgent_run(run):
-                continue
             if self.post_workflow_result(workflow_run_id=run.id, channel_id=channels.jobs, gateway=gateway):
                 posted += 1
         for work_item in self._pending_work_items(max(limit - posted, 0)):
-            if quiet and self._held_for_quiet_hours(work_item):
-                continue
             channel_id = channels.dlq if work_item.status == "dead_letter" else channels.jobs
             self.post_work_result(work_item_id=work_item.id, channel_id=channel_id, gateway=gateway)
             posted += 1
-        if not quiet:
-            posted += self.post_gate_cards(gateway=gateway)
+        posted += self.post_gate_cards(gateway=gateway)
         self.refresh_stickies(gateway=gateway)
         return posted
 
@@ -596,28 +583,6 @@ class DiscordOutputService:
 
         self._record_sent(record)
         return sent
-
-    def _quiet_now(self) -> bool:
-        """Quiet hours are on and the user has not been active in the last hour."""
-        if not in_quiet_hours():
-            return False
-        last_inbound = self.session.scalar(
-            select(func.max(DiscordMessage.created_at)).where(DiscordMessage.direction == "inbound")
-        )
-        if last_inbound is None:
-            return True
-        if last_inbound.tzinfo is None:
-            last_inbound = last_inbound.replace(tzinfo=utc_now().tzinfo)
-        return utc_now() - last_inbound > AWAKE_WINDOW
-
-    def _held_for_quiet_hours(self, work_item: WorkItem) -> bool:
-        if work_item.source_kind in REPLY_SOURCES or work_item.worker_kind == "function.notify":
-            return False
-        attempt = self._latest_attempt(work_item.id)
-        return not (attempt is not None and (attempt.produces or {}).get("urgent"))
-
-    def _urgent_run(self, run: WorkflowRun) -> bool:
-        return any((attempt.produces or {}).get("urgent") for _node, attempt in self._final_attempts(run))
 
     def _pending_workflow_runs(self, limit: int) -> list[WorkflowRun]:
         if limit <= 0:

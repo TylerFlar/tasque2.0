@@ -6,8 +6,7 @@ are free:
 1. ``ideas`` (a model run that reads Tasque and the web, and never writes): one idea per free slot, at
    least 2 exploratory, steered by what became of the earlier ones (``history``: built, rested, declined);
 2. ``cards`` (no model, ``function.workshop_idea_cards``): each idea not declined, resting or already on
-   a card gets a ledger row and its own ``workshop-idea`` run: a card in the Workshop thread, posted
-   once quiet hours end.
+   a card gets a ledger row and its own ``workshop-idea`` run: a card in the Workshop thread.
 
 A card's answer (``function.workshop_idea_apply``): Build it starts a change as the user's own ask, with
 any note typed in reply to the card; Not now rests the idea 60 days; Never retires it. A card left

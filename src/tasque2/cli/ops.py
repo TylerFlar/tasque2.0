@@ -493,7 +493,7 @@ def effort(
     days: Annotated[int, typer.Option("--days", "-d", help="Window in days.")] = 30,
     as_json: Annotated[bool, typer.Option("--json")] = False,
 ) -> None:
-    """What Tasque asks of its user, per thread: posts a week, ask share, quiet-hour posts, pushback."""
+    """What Tasque asks of its user, per thread: posts a week, ask share, pushback."""
     from tasque2.ops.effort import effort_report
 
     with cli_session_scope() as session:
@@ -504,17 +504,15 @@ def effort(
     totals = report["totals"]
     echo(
         f"{report['window']['days']} days: {totals['posts']} posts ({totals['posts_per_week']}/week), "
-        f"{totals['ask_share']:.0%} ask something, {totals['quiet_hours_share']:.0%} in quiet hours; "
-        f"{totals['inbound']} messages back, {totals['pushback']} pushback"
+        f"{totals['ask_share']:.0%} ask something; {totals['inbound']} messages back, {totals['pushback']} pushback"
     )
-    table = PlainTable("Thread", "Posts/wk", "Median chars", "Asks", "Quiet hrs", "Inbound", "Pushback")
+    table = PlainTable("Thread", "Posts/wk", "Median chars", "Asks", "Inbound", "Pushback")
     for row in report["threads"]:
         table.add_row(
             row["label"],
             str(row["posts_per_week"]),
             str(row["median_chars"]),
             f"{row['ask_share']:.0%}",
-            f"{row['quiet_hours_share']:.0%}",
             str(row["inbound"]),
             str(row["pushback"]),
         )

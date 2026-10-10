@@ -143,7 +143,7 @@ def test_a_deferred_worker_waits_without_failing_and_runs_again(fresh_db: Path) 
 
 
 def test_a_deferred_item_does_not_hold_a_restart(fresh_db: Path) -> None:
-    request = {"requested_at": utc_now().isoformat(), "reason": "t", "window": "now", "switch": []}
+    request = {"requested_at": utc_now().isoformat(), "reason": "t", "switch": []}
     with session_scope() as session:
         later = WorkItem(
             title="w", task_instruction="x", worker_kind="function.echo", not_before=utc_now() + timedelta(hours=1)
@@ -159,9 +159,9 @@ def test_a_deferred_item_does_not_hold_a_restart(fresh_db: Path) -> None:
 def test_a_pending_switch_is_never_replaced(isolated: Path, tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()
-    request_restart(reason="release one", window="now", switch=[{"repo": str(repo), "ref": "a"}])
+    request_restart(reason="release one", switch=[{"repo": str(repo), "ref": "a"}])
     with pytest.raises(RestartBusy, match="release one"):
-        request_restart(reason="release two", window="now", switch=[{"repo": str(repo), "ref": "b"}])
+        request_restart(reason="release two", switch=[{"repo": str(repo), "ref": "b"}])
     assert read_request()["reason"] == "release one"
 
 

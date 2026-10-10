@@ -223,7 +223,7 @@ def _waiting_gates(session: Session, now: datetime) -> list[dict[str, Any]]:
 
 
 def _restarts(session: Session, now: datetime, since: datetime) -> dict[str, Any]:
-    """A restart still waiting for its window, and the last restart's outcome when it fell in the window."""
+    """A restart still waiting for an idle moment, and the last restart's outcome when it fell in the window."""
     report: dict[str, Any] = {"pending": None, "last": None, "attention": []}
     request = restart.read_request()
     if request is not None:

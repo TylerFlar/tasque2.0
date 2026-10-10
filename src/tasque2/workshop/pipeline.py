@@ -751,7 +751,7 @@ def release_worker(work_item: WorkItem) -> dict[str, Any]:
     if problems:
         return _not_released(session, run, problems)
     remove_worktrees(trees_of(run), delete_branches=False)  # the branches stay for the switch
-    produced = {"silent": True, "released": True, "kind": "cold", "release_id": plan.id, "window": plan.window}
+    produced = {"silent": True, "released": True, "kind": "cold", "release_id": plan.id}
     return {"summary": "Queued for a restart.", "produces": produced}
 
 
@@ -792,11 +792,11 @@ def report_text(session: Session, run: WorkflowRun) -> tuple[str, str | None]:
     if release.get("kind") == "hot":
         lines = [f"**Live now: {title}** ({how.lower()}: {verified.get('why')})", *changes, "Tap Undo to reverse it."]
         return "\n".join(lines), str(release["release_id"])
-    when = "in the small hours (01:00-06:30)" if release.get("window") == "quiet" else "at the next idle moment"
     lines = [
         f"**Ready: {title}** ({verified.get('why')})",
         *changes,
-        f"It goes live when Tasque restarts {when}; I'll post here once it's live. Say undo to stop it.",
+        "It goes live when Tasque restarts at the next idle moment; I'll post here once it's live. "
+        "Say undo to stop it.",
     ]
     return "\n".join(lines), None
 
@@ -1081,7 +1081,7 @@ def status_text(session: Session) -> str:
             lines.append(f"- {str(title)[:70]}: {stage(session, run)}")
     waiting = [plan for plan in history() if state(plan) == "queued"]
     for plan in waiting:
-        lines.append(f"Waiting to go live: {plan.title} ({'small hours' if plan.window == 'quiet' else 'next idle'})")
+        lines.append(f"Waiting to go live: {plan.title} (next idle moment)")
     recent = [plan for plan in history() if state(plan) != "queued"][-5:]
     if recent:
         lines.append("Recent releases:")

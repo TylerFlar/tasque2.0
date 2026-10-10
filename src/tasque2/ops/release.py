@@ -54,7 +54,6 @@ class ReleasePlan:
     migrations: bool = False
     db_script: str | None = None  # a path in the config repository
     after_start: list[dict[str, Any]] = field(default_factory=list)
-    window: str = "now"
     created_at: str = field(default_factory=lambda: utc_now().isoformat())
     # The record: who asked, how it went, whether it was reversed.
     tier: str = ""
@@ -341,15 +340,14 @@ def release_hot(session: Session, plan: ReleasePlan) -> dict[str, Any]:
 
 
 def queue_cold(plan: ReleasePlan) -> Path:
-    """A change with code: the plan goes to the respawn at the next window (``plan.window``). Raises
-    ``RestartBusy`` while another release waits to go live (it would be replaced)."""
+    """A change with code: the plan goes to the respawn at the next idle moment. Raises ``RestartBusy`` while
+    another release waits to go live (it would be replaced)."""
     from tasque2.daemon.restart import request_restart
 
     path = save_plan(plan)
     try:
         request_restart(
             reason=f"release {plan.id}: {plan.title}"[:200],
-            window=plan.window,
             switch=[
                 {"repo": repo["live"], "ref": repo["branch"], "push": repo.get("push", False)} for repo in plan.repos
             ],
@@ -465,7 +463,6 @@ def undo_release(session: Session, plan: ReleasePlan) -> dict[str, Any]:
         db_script_ref=(plan.data or {}).get("head"),
         db_script_undo=True,
         pre_switch=[["migrate", "--to", *plan.revision_before[:1]]] if plan.migrations and plan.revision_before else [],
-        window="now",
         tier=plan.tier,
         thread_id=plan.thread_id,
         run_id=plan.run_id,

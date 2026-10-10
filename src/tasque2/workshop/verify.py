@@ -134,7 +134,6 @@ def release_plan(run: WorkflowRun, changed: list[Any], files: dict[str, list[str
         lock_changed="uv.lock" in (files.get("core") or []),
         migrations=any("/migrations/" in f"/{name}" or name.startswith("alembic/") for name in every),
         db_script=db_script if db_script in data_files else None,
-        window="quiet" if tier == policy.AUTO else "now",
         tier=tier,
         origin=str(given.get("origin") or ""),
         summary="\n".join(str(line).strip() for line in build.get("changes") or [] if str(line).strip())[:1500],
@@ -232,11 +231,7 @@ def verify(session: Session, run: WorkflowRun) -> dict[str, Any]:
     sizes = [_shortstat(tree) for tree in changed]
     data_tree = next((tree for tree in changed if tree.name == "data"), None)
     doctrine = doctrine_sizes(data_tree) if data_tree is not None else []
-    when = (
-        "at once (no code)"
-        if not plan.cold
-        else ("when Tasque restarts in the small hours" if plan.window == "quiet" else "when Tasque restarts next")
-    )
+    when = "when Tasque restarts next" if plan.cold else "at once (no code)"
     lines = [f"**Workshop: {classify.get('title')}** ({kind}; {TIER_LABELS[tier]}: {why})"]
     if origin == "workshop":
         found = [str(line) for line in given.get("evidence") or [] if str(line).strip()][:2]

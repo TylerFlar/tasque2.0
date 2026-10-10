@@ -58,7 +58,6 @@ class Settings(BaseSettings):
     project_dir: Path | None = Field(default=None)
     timezone: str = Field(default="America/Los_Angeles")
     reminder_default_time: str = Field(default="11:00")
-    quiet_hours: str = Field(default="22:00-08:00")
 
     weather_latitude: float = Field(default=32.7157)
     weather_longitude: float = Field(default=-117.1611)

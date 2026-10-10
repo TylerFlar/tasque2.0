@@ -80,13 +80,12 @@ def test_the_card_posts_once_into_the_runs_thread_with_a_button_per_choice(fresh
         assert buttons == [("Merge and restart", f"t2:gate:0:{run.id}"), ("Discard", f"t2:gate:1:{run.id}")]
 
 
-def test_quiet_hours_hold_the_card(fresh_db: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("tasque2.discord.output.in_quiet_hours", lambda *args, **kwargs: True)
+def test_the_output_pass_posts_the_card(fresh_db: Path) -> None:
     gateway = FakeDiscordGateway()
     with session_scope() as session:
         _started(session)
         DiscordOutputService(session).post_pending_updates(gateway=gateway, channels=CHANNELS)
-    assert not any(content == "Fix ready: tests pass." for _channel, content in gateway.sent_messages)
+    assert ("thread-accounts", "Fix ready: tests pass.") in gateway.sent_messages
 
 
 def test_a_button_answers_the_gate_and_the_run_moves_on(fresh_db: Path) -> None:
