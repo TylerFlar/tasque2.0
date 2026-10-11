@@ -11,6 +11,7 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
+from tasque2.memory import canonical_budget
 from tasque2.models import Artifact, Memory, Schedule, WorkEvent, WorkflowDefinition, WorkflowRun, WorkItem
 from tasque2.templates import read_template_file
 from tasque2.text import truncate
@@ -131,6 +132,7 @@ def memory_data(memory: Memory | None, *, full: bool = False) -> dict[str, Any] 
         "id": memory.id,
         "namespace": memory.namespace,
         "kind": memory.kind,
+        **_length(memory),
         "content": memory.content if full else truncate(memory.content, 1200),
         "tags": memory.tags or [],
         "canonical_key": memory.canonical_key,
@@ -151,9 +153,18 @@ def memory_ack(memory: Memory) -> dict[str, Any]:
         "namespace": memory.namespace,
         "kind": memory.kind,
         "canonical_key": memory.canonical_key,
-        "chars": len(memory.content),
+        **_length(memory),
         "updated_at": iso(memory.updated_at),
     }
+
+
+def _length(memory: Memory) -> dict[str, int]:
+    """A memory's length in characters, and the cap its canonical document declares, if any."""
+    length = {"chars": len(memory.content)}
+    declared = canonical_budget(memory.content) if memory.canonical_key else None
+    if declared is not None:
+        length["max_chars"] = declared
+    return length
 
 
 def artifact_data(artifact: Artifact, *, full: bool = False) -> dict[str, Any]:

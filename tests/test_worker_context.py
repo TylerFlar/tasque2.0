@@ -236,10 +236,11 @@ def test_documents_the_run_pins_arrive_whole_and_recalled_ones_as_excerpts() -> 
 
     for recalled in (recalled_note, recalled_doctrine):
         assert recalled["content_compacted"] is True
-        assert recalled["content_chars"] == len(content)
+        assert recalled["chars"] == len(content)
         assert len(recalled["content"]) < len(content)
     assert pinned_doctrine["content"] == content
     assert "content_compacted" not in pinned_doctrine
+    assert "chars" not in pinned_doctrine
 
 
 def test_packet_delivers_pinned_documents_whole_and_recall_hits_excerpted(fresh_db: Path) -> None:
@@ -278,10 +279,10 @@ def test_declared_budget_flags_documents_over_it() -> None:
     over = memory_data(_memory(over_content, canonical_key="ledger"))
     within = memory_data(_memory(f"{marker}\nshort", canonical_key="ledger"))
 
-    assert over["max_chars"] == 200
+    assert (over["chars"], over["max_chars"]) == (len(over_content), 200)
     assert over["over_budget"] is True
     assert over["compact_this_run"].startswith(f"ledger is {len(over_content)} characters against its 200 budget.")
-    assert within["max_chars"] == 200
+    assert (within["chars"], within["max_chars"]) == (len(f"{marker}\nshort"), 200)
     assert "over_budget" not in within
 
 
@@ -635,6 +636,12 @@ def test_worker_contract_keeps_the_run_one_shot_and_in_the_foreground() -> None:
     assert "The run is headless and one-shot." in WORKER_CONTRACT
     assert "Run everything in the foreground and wait for it." in WORKER_CONTRACT
     assert "Call `submit_worker_result` exactly once, as your last action" in WORKER_CONTRACT
+
+
+def test_worker_contract_edits_part_of_a_document_in_place() -> None:
+    assert "`memory_edit_canonical`, which swaps one exact passage" in WORKER_CONTRACT
+    assert "`memory_upsert_canonical` only when most of it changes" in WORKER_CONTRACT
+    assert "shorten another passage first" in WORKER_CONTRACT
 
 
 def test_worker_contract_writes_doctrine_in_plain_words() -> None:

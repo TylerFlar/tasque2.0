@@ -279,7 +279,10 @@ def adaptive_memory_limit(context: dict[str, Any] | None) -> int | None:
 
 
 def memory_data(memory: Memory, *, query: str = "", pinned: bool = True) -> dict[str, Any]:
-    """A memory as the packet carries it: pinned documents whole (up to their budget), others excerpted."""
+    """A memory as the packet carries it: pinned documents whole (up to their budget), others excerpted.
+
+    An excerpt or a capped document also carries its full length, ``chars``.
+    """
     budget = MEMORY_PINNED_CHARS if pinned else MEMORY_CONTENT_CHARS
     declared = canonical_budget(memory.content) if pinned else None
     if declared is not None and declared <= MEMORY_DECLARED_MAX_CHARS:
@@ -297,8 +300,9 @@ def memory_data(memory: Memory, *, query: str = "", pinned: bool = True) -> dict
         "pinned": memory.pinned,
         "updated_at": memory.updated_at.isoformat(timespec="minutes") if memory.updated_at else None,
     }
+    if trimmed or declared is not None:
+        data["chars"] = len(memory.content)
     if trimmed:
-        data["content_chars"] = len(memory.content)
         data["content_compacted"] = True
     if declared is not None:
         data["max_chars"] = declared

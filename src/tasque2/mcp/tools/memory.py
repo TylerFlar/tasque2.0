@@ -104,6 +104,14 @@ def memory_upsert_canonical(
     )
 
 
+def memory_edit_canonical(namespace: str, canonical_key: str, old_text: str, new_text: str) -> str:
+    """Change one passage of a canonical document: ``old_text`` must appear in it exactly once and
+    is replaced by ``new_text`` (an empty ``new_text`` deletes it). The document keeps its kind,
+    tags, pinned flag and ``max_chars`` cap; the previous version is archived. Answers with the
+    document's new ``chars`` and its ``max_chars``."""
+    return run_json(lambda: _edit(namespace, canonical_key, old_text, new_text))
+
+
 def memory_update(
     memory_id: str,
     content: str | None = None,
@@ -235,6 +243,20 @@ def _upsert(**fields: Any) -> dict[str, Any]:
             source_kind="mcp",
             work_item_id=caller.id if caller is not None else None,
             pinned=bool(fields["pinned"]),
+        )
+        return {"ok": True, "memory": memory_ack(memory)}
+
+
+def _edit(namespace: str, canonical_key: str, old_text: str, new_text: str) -> dict[str, Any]:
+    with session_scope() as session:
+        caller = calling_work_item(session)
+        memory = MemoryService(session).edit_canonical(
+            namespace=required(namespace, "namespace"),
+            canonical_key=required(canonical_key, "canonical_key"),
+            old_text=old_text or "",
+            new_text=new_text or "",
+            source_kind="mcp",
+            work_item_id=caller.id if caller is not None else None,
         )
         return {"ok": True, "memory": memory_ack(memory)}
 

@@ -76,9 +76,11 @@ when your turn ends; nothing resumes it.
 - Start with `memory_recall` for anything the packet does not already hold.
 - Record one new fact with `memory_create`; change or remove one fact in place with
   `memory_update` or `memory_delete`. Prefer small atomic memories to growing documents.
-- Rewrite a whole canonical document with `memory_upsert_canonical` only when its job is to hold
-  one current state or a lane's rules. A document with a `<!-- tasque:max_chars=N -->` marker is
-  capped at N characters: keep the marker and compact the content to fit.
+- A canonical document holds one current state or a lane's rules. Change part of it with
+  `memory_edit_canonical`, which swaps one exact passage; rewrite it whole with
+  `memory_upsert_canonical` only when most of it changes. A `<!-- tasque:max_chars=N -->` marker
+  caps it at N characters, and the packet and memory reads give its `chars` beside `max_chars`:
+  keep the marker, and to add to a full document, shorten another passage first.
 - When the user corrects a rule, preference or plan, write the correction into the lane's doctrine
   document so every future run follows it. Write what they mean as a short plain instruction;
   never quote their words in doctrine.

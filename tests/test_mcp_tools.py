@@ -190,6 +190,94 @@ def test_memory_tools_report_budget_refusals(fresh_db: Path) -> None:
     assert current["memory"]["content"].startswith("compact")
 
 
+def test_memory_edit_canonical_swaps_one_passage_and_answers_with_its_length(
+    fresh_db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    caller_id = _caller(monkeypatch)
+    content = "Balance: 120.\nNext bill: rent.\n\n<!-- tasque:max_chars=200 -->"
+    written = _ok(
+        tools.memory_upsert_canonical(
+            namespace="finance",
+            canonical_key="finance_state",
+            kind="summary",
+            content=content,
+            tags=["state"],
+            pinned=True,
+        )
+    )
+
+    edited = _ok(
+        tools.memory_edit_canonical(
+            namespace="finance", canonical_key="finance_state", old_text="Balance: 120.", new_text="Balance: 95."
+        )
+    )
+
+    assert (written["memory"]["chars"], written["memory"]["max_chars"]) == (len(content), 200)
+    ack = edited["memory"]
+    assert "content" not in ack
+    assert ack["id"] != written["memory"]["id"]
+    assert (ack["chars"], ack["max_chars"]) == (len(content) - 1, 200)
+    current = _ok(tools.memory_get_canonical(namespace="finance", canonical_key="finance_state"))["memory"]
+    assert current["id"] == ack["id"]
+    assert current["content"] == content.replace("120", "95")
+    assert (current["chars"], current["max_chars"]) == (len(content) - 1, 200)
+    assert (current["kind"], current["tags"], current["pinned"]) == ("summary", ["state"], True)
+    with session_scope() as session:
+        row = session.get(Memory, ack["id"])
+        assert (row.work_item_id, row.source_kind) == (caller_id, "mcp")
+
+
+def test_memory_edit_canonical_reports_refusals_without_the_text(fresh_db: Path) -> None:
+    content = "- paid rent\n- paid rent\n<!-- tasque:max_chars=80 -->"
+    written = _ok(
+        tools.memory_upsert_canonical(namespace="finance", canonical_key="finance_log", kind="summary", content=content)
+    )
+
+    def edit(old_text: str, new_text: str, canonical_key: str = "finance_log") -> dict[str, Any]:
+        return _error(
+            tools.memory_edit_canonical(
+                namespace="finance", canonical_key=canonical_key, old_text=old_text, new_text=new_text
+            )
+        )
+
+    missing = edit("- paid water", "- paid gas")
+    repeated = edit("- paid rent\n", "")
+    marker = edit("max_chars=80", "max_chars=800")
+    over = edit("- paid rent\n- paid rent", "- paid rent, on time\n" * 4)
+
+    for refused in (missing, repeated, marker):
+        assert refused["error_type"] == "MemoryEditRefused"
+        assert "finance/finance_log" in refused["error"]
+    assert "2 times" in repeated["error"]
+    assert over["error_type"] == "MemoryBudgetExceeded"
+    for refused in (missing, repeated, marker, over):
+        assert "paid" not in refused["error"]
+    assert edit("a", "b", canonical_key="nothing_here")["error_type"] == "KeyError"
+    assert edit("", "b")["error_type"] == "ValueError"
+    current = _ok(tools.memory_get_canonical(namespace="finance", canonical_key="finance_log"))["memory"]
+    assert current["id"] == written["memory"]["id"]
+    assert current["content"] == content
+
+
+def test_memory_reads_give_each_memorys_length_and_its_documents_cap(fresh_db: Path) -> None:
+    rules = "Weekday rules.\n<!-- tasque:max_chars=500 -->"
+    note = " ".join(["Weekday note."] * 150)
+    doc_id = _ok(
+        tools.memory_upsert_canonical(namespace="global", canonical_key="rules", kind="doctrine", content=rules)
+    )["memory"]["id"]
+    note_id = _ok(tools.memory_create(namespace="global", kind="note", content=note))["memory"]["id"]
+
+    listed = {item["id"]: item for item in _ok(tools.memory_list(namespace="global"))["items"]}
+    recalled = {item["id"]: item for item in _ok(tools.memory_recall(query="weekday", namespace="global"))["items"]}
+    fetched = _ok(tools.memory_get(memory_id=note_id))["memory"]
+
+    for items in (listed, recalled):
+        assert (items[doc_id]["chars"], items[doc_id]["max_chars"]) == (len(rules), 500)
+        assert items[note_id]["chars"] == len(note) > len(items[note_id]["content"])
+        assert "max_chars" not in items[note_id]
+    assert fetched["chars"] == len(fetched["content"]) == len(note)
+
+
 def test_memory_archive_and_delete(fresh_db: Path) -> None:
     kept = _ok(tools.memory_create(namespace="global", kind="note", content="Keep me around."))
     archived = _ok(tools.memory_create(namespace="global", kind="note", content="Archive me."))

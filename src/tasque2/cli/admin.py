@@ -171,7 +171,7 @@ def _print_packet(item, context_packet: dict, prompt_chars: int) -> None:
     memories = PlainTable("Memory", "Delivered", "Full", "How")
     for memory in context_packet.get("memories") or []:
         delivered = len(memory.get("content") or "")
-        full = memory.get("content_chars", delivered)
+        full = memory.get("chars", delivered)
         memories.add_row(
             f"{memory['namespace']}/{memory.get('canonical_key') or memory['kind']}",
             f"{delivered:,}",

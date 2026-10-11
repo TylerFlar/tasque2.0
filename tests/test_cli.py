@@ -751,6 +751,29 @@ def test_memory_show_prints_a_canonical_document_exactly(fresh_db: Path) -> None
     assert "Give a memory id" in cli_error("memory-show", code=2).output
 
 
+def test_packet_shows_an_excerpted_memorys_full_length(fresh_db: Path) -> None:
+    archive = "Rule archive line.\n" * 400
+    with session_scope() as session:
+        MemoryService(session).upsert_canonical(
+            namespace="global", canonical_key="rule_archive", kind="summary", content=archive
+        )
+        work_id = (
+            WorkRepository(session)
+            .create_work_item(
+                title="Rule review",
+                task_instruction="Review the rule archive.",
+                worker_kind="manual",
+                context={"memory_queries": ["rule archive"]},
+            )
+            .id
+        )
+
+    row = next(line for line in cli("packet", work_id).output.splitlines() if "global/rule_archive" in line)
+
+    assert f"{len(archive):,}" in row
+    assert "excerpt" in row
+
+
 def test_memory_ingest_text_makes_a_file_searchable(fresh_db: Path, tmp_path: Path) -> None:
     source = tmp_path / "notes.txt"
     source.write_text("Bread rises overnight in the fridge.\n\nBake at 250C.", encoding="utf-8")

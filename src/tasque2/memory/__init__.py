@@ -3,6 +3,7 @@
 from tasque2.memory.service import (
     CANONICAL_BUDGET_RE,
     MemoryBudgetExceeded,
+    MemoryEditRefused,
     MemoryService,
     ScoredMemory,
     canonical_budget,
@@ -13,6 +14,7 @@ from tasque2.memory.service import (
 __all__ = [
     "CANONICAL_BUDGET_RE",
     "MemoryBudgetExceeded",
+    "MemoryEditRefused",
     "MemoryService",
     "ScoredMemory",
     "canonical_budget",

@@ -277,4 +277,4 @@ def test_worker_context_delivers_relevant_middle_of_large_ledger(fresh_db: Path)
     assert "COOKINGTARGETMARKER" in delivered["content"]
     assert "TAILMARKER" not in delivered["content"]
     assert delivered["content_compacted"] is True
-    assert delivered["content_chars"] == len(big_doc)
+    assert delivered["chars"] == len(big_doc)

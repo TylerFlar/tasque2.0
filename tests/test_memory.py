@@ -9,7 +9,14 @@ from sqlalchemy import select
 from tasque2.artifacts import ArtifactStore
 from tasque2.config import get_settings
 from tasque2.db import session_scope
-from tasque2.memory import MemoryBudgetExceeded, MemoryService, canonical_budget, expire_ttl_memories, safe_fts_query
+from tasque2.memory import (
+    MemoryBudgetExceeded,
+    MemoryEditRefused,
+    MemoryService,
+    canonical_budget,
+    expire_ttl_memories,
+    safe_fts_query,
+)
 from tasque2.memory.ingest import MemoryIngestService
 from tasque2.models import Memory, WorkEvent, utc_now
 from tasque2.work.repository import WorkRepository
@@ -497,6 +504,139 @@ def test_update_memory_carries_the_budget_marker_forward(fresh_db: Path) -> None
 
         with pytest.raises(MemoryBudgetExceeded):
             service.update_memory(memory.id, content="y" * 300)
+
+
+def test_edit_canonical_swaps_one_passage_and_keeps_the_document_as_it_was(fresh_db: Path) -> None:
+    with session_scope() as session:
+        service = MemoryService(session)
+        old = service.upsert_canonical(
+            namespace="finance",
+            canonical_key="finance_state",
+            kind="doctrine",
+            content="Balance: 120.\nNext bill: rent on the 1st.\nStale line.\n\n<!-- tasque:max_chars=200 -->\n",
+            tags=["finance", "state"],
+            pinned=True,
+        )
+
+        edited = service.edit_canonical(
+            namespace="finance", canonical_key="finance_state", old_text="Balance: 120.", new_text="Balance: 95."
+        )
+        trimmed = service.edit_canonical(
+            namespace="finance", canonical_key="finance_state", old_text="Stale line.\n", new_text=""
+        )
+
+        assert trimmed.content == "Balance: 95.\nNext bill: rent on the 1st.\n\n<!-- tasque:max_chars=200 -->\n"
+        assert (trimmed.kind, trimmed.tags, trimmed.pinned) == ("doctrine", ["finance", "state"], True)
+        assert session.get(Memory, old.id).superseded_by == edited.id
+        assert session.get(Memory, edited.id).superseded_by == trimmed.id
+        assert service.get_canonical(namespace="finance", canonical_key="finance_state").id == trimmed.id
+
+
+def test_edit_canonical_refuses_a_missing_or_repeated_passage(fresh_db: Path) -> None:
+    with session_scope() as session:
+        service = MemoryService(session)
+        log = service.upsert_canonical(
+            namespace="finance", canonical_key="finance_log", kind="summary", content="- paid rent\n- paid rent\n"
+        )
+
+        with pytest.raises(MemoryEditRefused) as missing:
+            service.edit_canonical(
+                namespace="finance", canonical_key="finance_log", old_text="paid water", new_text="paid gas"
+            )
+        with pytest.raises(MemoryEditRefused) as repeated:
+            service.edit_canonical(
+                namespace="finance", canonical_key="finance_log", old_text="- paid rent", new_text=""
+            )
+        with pytest.raises(KeyError):
+            service.edit_canonical(namespace="finance", canonical_key="no_such_doc", old_text="a", new_text="b")
+        with pytest.raises(ValueError, match="old_text is required"):
+            service.edit_canonical(namespace="finance", canonical_key="finance_log", old_text="", new_text="b")
+
+        assert "finance/finance_log" in str(missing.value)
+        assert "2 times" in str(repeated.value)
+        for refusal in (missing, repeated):
+            assert "paid" not in str(refusal.value)
+        assert service.get_canonical(namespace="finance", canonical_key="finance_log").id == log.id
+
+
+def test_edit_canonical_never_empties_a_document(fresh_db: Path) -> None:
+    with session_scope() as session:
+        service = MemoryService(session)
+        note = service.upsert_canonical(namespace="global", canonical_key="note", kind="summary", content="Only line.")
+
+        with pytest.raises(MemoryEditRefused, match="leave global/note empty"):
+            service.edit_canonical(namespace="global", canonical_key="note", old_text="Only line.", new_text=" ")
+
+        assert service.get_canonical(namespace="global", canonical_key="note").id == note.id
+
+
+def test_edit_canonical_holds_the_document_to_its_budget(fresh_db: Path) -> None:
+    with session_scope() as session:
+        service = MemoryService(session)
+        state = service.upsert_canonical(
+            namespace="health",
+            canonical_key="health_state",
+            kind="summary",
+            content="compact\n<!-- tasque:max_chars=60 -->\n",
+        )
+
+        with pytest.raises(MemoryBudgetExceeded) as excinfo:
+            service.edit_canonical(
+                namespace="health", canonical_key="health_state", old_text="compact", new_text="x" * 100
+            )
+
+        assert excinfo.value.max_chars == 60
+        assert service.get_canonical(namespace="health", canonical_key="health_state").id == state.id
+
+
+def test_edit_canonical_leaves_the_budget_marker_as_it_is(fresh_db: Path) -> None:
+    marker = "<!-- tasque:max_chars=300 -->"
+    with session_scope() as session:
+        service = MemoryService(session)
+        pointer = service.upsert_canonical(
+            namespace="career", canonical_key="career_state", kind="summary", content=f"pointer\n\n{marker}\n"
+        )
+
+        for old_text, new_text in (
+            ("max_chars=300", "max_chars=900"),
+            (f"\n\n{marker}", ""),
+            ("pointer", "pointer <!-- tasque:max_chars=50 -->"),
+        ):
+            with pytest.raises(MemoryEditRefused, match="career/career_state"):
+                service.edit_canonical(
+                    namespace="career", canonical_key="career_state", old_text=old_text, new_text=new_text
+                )
+        assert service.get_canonical(namespace="career", canonical_key="career_state").id == pointer.id
+
+        kept = service.edit_canonical(
+            namespace="career",
+            canonical_key="career_state",
+            old_text=f"pointer\n\n{marker}",
+            new_text=f"pointer\nnext step\n\n{marker}",
+        )
+        assert kept.content == f"pointer\nnext step\n\n{marker}\n"
+
+
+def test_edit_canonical_can_cap_an_uncapped_document(fresh_db: Path) -> None:
+    with session_scope() as session:
+        service = MemoryService(session)
+        service.upsert_canonical(namespace="career", canonical_key="career_notes", kind="summary", content="Notes.")
+
+        with pytest.raises(MemoryBudgetExceeded):
+            service.edit_canonical(
+                namespace="career",
+                canonical_key="career_notes",
+                old_text="Notes.",
+                new_text="Notes.\n<!-- tasque:max_chars=20 -->",
+            )
+        capped = service.edit_canonical(
+            namespace="career",
+            canonical_key="career_notes",
+            old_text="Notes.",
+            new_text="Notes.\n<!-- tasque:max_chars=200 -->",
+        )
+
+        assert canonical_budget(capped.content) == 200
 
 
 def test_update_memory_leaves_non_canonical_rows_unbounded(fresh_db: Path) -> None:

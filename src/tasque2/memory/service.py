@@ -50,6 +50,10 @@ class MemoryBudgetExceeded(ValueError):
         )
 
 
+class MemoryEditRefused(ValueError):
+    """A passage edit that cannot apply; the message names the document, never its text."""
+
+
 def canonical_budget(content: str | None) -> int | None:
     """The ``<!-- tasque:max_chars=N -->`` budget a document declares, if any."""
     if not content:
@@ -276,6 +280,59 @@ class MemoryService:
                 payload={"superseded_by": new.id, "canonical_key": canonical_key},
             )
         return new
+
+    def edit_canonical(
+        self,
+        *,
+        namespace: str,
+        canonical_key: str,
+        old_text: str,
+        new_text: str,
+        source_kind: str | None = None,
+        work_item_id: str | None = None,
+    ) -> Memory:
+        """Replace the one passage of the active canonical document that matches ``old_text``.
+
+        The edit is written through ``upsert_canonical`` with the document's kind, tags and
+        pinned flag, so its budget holds and the previous version is archived. It never
+        changes or removes a budget marker, empties a document or creates one.
+        """
+        if not old_text:
+            raise ValueError("old_text is required.")
+        current = self.get_canonical(namespace=namespace, canonical_key=canonical_key)
+        name = f"{namespace}/{canonical_key}"
+        if current is None:
+            raise KeyError(f"No canonical document {name} to edit.")
+        found = _occurrences(current.content, old_text)
+        if found == 0:
+            raise MemoryEditRefused(
+                f"old_text is not in {name}; copy the passage exactly as the document has it, "
+                "line breaks and spacing included."
+            )
+        if found > 1:
+            raise MemoryEditRefused(
+                f"old_text appears {found} times in {name}; include more of the passage around it so it matches once."
+            )
+        content = current.content.replace(old_text, new_text, 1)
+        if not content.strip():
+            raise MemoryEditRefused(f"The edit would leave {name} empty.")
+        markers = _markers(current.content)
+        if markers and _markers(content) != markers:
+            raise MemoryEditRefused(
+                f"The edit would change the max_chars marker of {name}; leave the marker line out of the edit "
+                "or exactly as it is."
+            )
+        return self.upsert_canonical(
+            namespace=namespace,
+            canonical_key=canonical_key,
+            kind=current.kind,
+            content=content,
+            tags=list(current.tags or []),
+            source_kind=source_kind,
+            work_item_id=work_item_id,
+            pinned=current.pinned,
+            ttl_days=current.ttl_days,
+        )
 
     def archive_memory(self, memory_id: str) -> Memory:
         memory = self._get(memory_id)
@@ -564,6 +621,19 @@ def expire_ttl_memories(session: Session, *, now: datetime | None = None, limit:
     if expired:
         session.flush()
     return expired
+
+
+def _occurrences(text: str, passage: str) -> int:
+    """How many places ``passage`` starts in ``text``, overlapping ones included."""
+    count, start = 0, text.find(passage)
+    while start != -1:
+        count += 1
+        start = text.find(passage, start + 1)
+    return count
+
+
+def _markers(content: str) -> list[str]:
+    return [match.group(0) for match in CANONICAL_BUDGET_RE.finditer(content)]
 
 
 def _epoch(value: datetime | None) -> float:
