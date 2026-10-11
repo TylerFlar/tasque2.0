@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -10,6 +11,7 @@ import discord
 import pytest
 from opentelemetry.trace import SpanKind
 from sqlalchemy import select
+from sqlalchemy.exc import OperationalError
 
 from tasque2.config import Settings, reset_settings
 from tasque2.db import session_scope
@@ -417,3 +419,183 @@ def test_referenced_message_id_reads_the_reply_reference() -> None:
     assert _referenced_message_id(SimpleNamespace(reference=SimpleNamespace(message_id=12, resolved=None))) == "12"
     resolved = SimpleNamespace(reference=SimpleNamespace(message_id=None, resolved=SimpleNamespace(id=34)))
     assert _referenced_message_id(resolved) == "34"
+
+
+# --- messages sent while Tasque was away --------------------------------------------------------------------
+
+
+def _at(minutes_ago: float) -> datetime:
+    return datetime.now(UTC) - timedelta(minutes=minutes_ago)
+
+
+def _snowflake(moment: datetime) -> int:
+    return discord.utils.time_snowflake(moment)
+
+
+class _Away:
+    """A channel or thread as the catch-up reads it: its last message id, and a history filtered by ``after``."""
+
+    def _away(self, messages: list[SimpleNamespace], last_message_id: int | None = None) -> None:
+        self.messages = messages
+        newest = messages[-1].id if messages else None
+        self.last_message_id = last_message_id if last_message_id is not None else newest
+        self.history_calls: list[dict[str, Any]] = []
+
+    async def history(self, *, after=None, limit=None, oldest_first=None):
+        self.history_calls.append({"after": after, "limit": limit, "oldest_first": oldest_first})
+        for message in self.messages:
+            if after is None or discord.utils.snowflake_time(message.id) > after:
+                yield message
+
+
+class _AwayChannel(_Away, _Channel):
+    def __init__(self, channel_id: int, messages: list[SimpleNamespace], last_message_id: int | None = None) -> None:
+        super().__init__(channel_id)
+        self._away(messages, last_message_id)
+
+
+class _AwayThread(_Away, _Thread):
+    def __init__(self, thread_id: int, messages: list[SimpleNamespace], last_message_id: int | None = None) -> None:
+        super().__init__(thread_id)
+        self._away(messages, last_message_id)
+
+
+def _away_message(channel, minutes_ago: float, content: str, **fields: Any) -> SimpleNamespace:
+    message = _message(id=_snowflake(_at(minutes_ago)), channel=channel, content=content, **fields)
+    for item in channel.messages:
+        assert item.id < message.id, "messages are listed oldest first"
+    channel.messages.append(message)
+    channel.last_message_id = message.id
+    return message
+
+
+def _catch_up(bot: TasqueBot, since: datetime | None, intake: _AwayChannel, threads: list) -> list[dict[str, Any]]:
+    seen = _deliver(bot, _message(author=_Author(bot=True)))  # stubs routing and typing; routes nothing itself
+    bot.get_channel = lambda channel_id: intake if channel_id == intake.id else None
+
+    async def active_threads() -> list:
+        return threads
+
+    bot_module.TasqueBot.guilds = [SimpleNamespace(active_threads=active_threads)]
+    try:
+        asyncio.run(bot._catch_up(since))
+    finally:
+        del bot_module.TasqueBot.guilds
+    return seen["routes"]
+
+
+def test_catch_up_routes_the_users_messages_sent_while_tasque_was_away(fresh_db: Path) -> None:
+    intake = _AwayChannel(100, [])
+    _away_message(intake, 30, "before the restart")
+    missed = _away_message(intake, 5, "sent while Tasque was down")
+    saved = _away_message(intake, 4, "seen already")
+    _away_message(intake, 3, "a bot's post", author=_Author(bot=True))
+    thread = _AwayThread(300, [])
+    thread_reply = _away_message(thread, 2, "and in a thread")
+    quiet_thread = _AwayThread(301, [_message(id=_snowflake(_at(60)), content="old")])
+    empty_thread = _AwayThread(302, [], last_message_id=None)
+    with session_scope() as session:
+        DiscordService(session).record_message(
+            discord_message_id=str(saved.id),
+            discord_channel_id="100",
+            discord_thread_id=None,
+            direction="inbound",
+            author="user#0001",
+            content_preview="seen already",
+        )
+    since = _at(10)
+
+    routes = _catch_up(TasqueBot(_settings()), since, intake, [thread, quiet_thread, empty_thread])
+
+    assert [route["discord_message_id"] for route in routes] == [str(missed.id), str(thread_reply.id)]
+    assert routes[1]["thread_id"] == "300" and routes[1]["channel_id"] == "300"
+    assert intake.history_calls == [{"after": since, "limit": bot_module.CATCH_UP_LIMIT, "oldest_first": True}]
+    assert len(thread.history_calls) == 1
+    assert quiet_thread.history_calls == [] and empty_thread.history_calls == []
+
+
+def test_catch_up_looks_back_a_day_at_most(fresh_db: Path) -> None:
+    intake = _AwayChannel(100, [])
+    _away_message(intake, 3 * 24 * 60, "long ago")
+    recent = _away_message(intake, 1, "recent")
+
+    routes = _catch_up(TasqueBot(_settings()), _at(5 * 24 * 60), intake, [])
+
+    assert [route["discord_message_id"] for route in routes] == [str(recent.id)]
+    [call] = intake.history_calls
+    assert _at(24 * 60 + 1) < call["after"] < _at(24 * 60 - 1)
+    assert _catch_up(TasqueBot(_settings()), None, intake, []) == [route for route in routes]
+
+
+def test_on_ready_catches_up_from_the_newest_saved_message_then_from_the_disconnect(fresh_db: Path) -> None:
+    with session_scope() as session:
+        message = DiscordService(session).record_message(
+            discord_message_id="m-last",
+            discord_channel_id="100",
+            discord_thread_id=None,
+            direction="outbound",
+            author="tasque",
+            content_preview="the last word before the restart",
+        )
+        newest = message.created_at
+    bot = TasqueBot(_settings())
+    seen: list[datetime | None] = []
+
+    async def catch_up(since: datetime | None) -> None:
+        seen.append(since)
+
+    async def output_loop() -> None:
+        return None
+
+    bot._catch_up = catch_up
+    bot._output_loop = output_loop
+
+    async def main() -> None:
+        await bot.on_ready()
+        await asyncio.sleep(0)
+        before = datetime.now(UTC)
+        await bot.on_disconnect()
+        await bot.on_disconnect()  # the first disconnect is the one that counts
+        await bot.on_ready()
+        await asyncio.sleep(0)
+        assert before <= seen[1] <= datetime.now(UTC)
+        await bot.on_disconnect()
+        await bot.on_resumed()  # the gateway replayed what was missed
+        await bot.on_ready()
+        await asyncio.sleep(0)
+
+    asyncio.run(main())
+    assert seen[0] == newest and seen[2] == newest
+
+
+def test_a_message_that_meets_a_busy_database_is_routed_after_a_pause(
+    fresh_db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pauses: list[float] = []
+    monkeypatch.setattr(bot_module.time, "sleep", pauses.append)
+    original = DiscordService.handle_intake_message
+    failures = {"busy": 1}
+
+    def busy_once(self, **fields: Any):
+        if failures["busy"]:
+            failures["busy"] -= 1
+            raise OperationalError("INSERT", {}, Exception("database is locked"))
+        return original(self, **fields)
+
+    monkeypatch.setattr(DiscordService, "handle_intake_message", busy_once)
+    bot = TasqueBot(_settings())
+
+    result = _route(bot, discord_message_id="m-busy", content="Sent while the database was busy.")
+
+    assert result is not None and result.action == "work_queued"
+    assert pauses == [bot_module.ROUTE_PAUSE_SECONDS]
+    with session_scope() as session:
+        assert session.scalar(select(DiscordMessage).where(DiscordMessage.discord_message_id == "m-busy")) is not None
+
+    def broken(self, **fields: Any):
+        raise OperationalError("INSERT", {}, Exception("no such table: discord_messages"))
+
+    monkeypatch.setattr(DiscordService, "handle_intake_message", broken)
+    with pytest.raises(OperationalError):
+        _route(bot, discord_message_id="m-broken")
+    assert pauses == [bot_module.ROUTE_PAUSE_SECONDS]  # only a busy database is waited out

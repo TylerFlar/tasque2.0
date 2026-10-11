@@ -1,20 +1,39 @@
-"""The Discord client: intake and reply routing, button actions, and the output loop."""
+"""The Discord client: intake and reply routing, button actions, the output loop, and the messages the user
+sent while Tasque was away.
+
+A message is routed as it arrives. When the database is busy (another writer holds SQLite's lock past its
+timeout), the message is tried again after a pause, as the records of sent messages are, rather than dropped.
+When the client connects with a new session (at start-up, or after a disconnect Discord could not resume),
+it reads back what the user sent meanwhile: the intake channel and the active threads with messages since
+Tasque last listened (the newest saved message at start-up, the disconnect after that), a day back at most,
+oldest first, routing each message it never saved without holding up the start.
+"""
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import time
+from datetime import UTC, datetime, timedelta
 
 import discord
 from opentelemetry.trace import SpanKind
+from sqlalchemy import func, select
+from sqlalchemy.exc import OperationalError
 
 from tasque2.config import Settings, get_settings
 from tasque2.db import session_scope
 from tasque2.discord.gateway import DiscordPyGateway
-from tasque2.discord.output import DiscordOutputService, OutputChannels
+from tasque2.discord.output import (
+    RECORD_ATTEMPTS,
+    RECORD_PAUSE_SECONDS,
+    DiscordOutputService,
+    OutputChannels,
+    database_busy,
+)
 from tasque2.discord.routing import DiscordAttachmentPayload, DiscordRouteResult, DiscordService
 from tasque2.discord.ui import DiscordUIService, is_modal_action, parse_custom_id
-from tasque2.models import WorkItem
+from tasque2.models import DiscordMessage, WorkItem, utc_now
 from tasque2.telemetry import span
 
 logger = logging.getLogger(__name__)
@@ -22,6 +41,13 @@ logger = logging.getLogger(__name__)
 WAITING_STATUSES = {"ready", "running", "cancel_requested"}
 TYPING_ACTIONS = {"work_queued", "work_reply_recorded", "workflow_reply_followup_recorded"}
 TYPING_INTERVAL_SECONDS = 8.0
+# How far back the messages sent while Tasque was away are read, and how many per channel.
+CATCH_UP_WINDOW = timedelta(days=1)
+CATCH_UP_LIMIT = 100
+# A message that meets a busy database is tried again, as the records of sent messages are: the attempts,
+# and the pause before the n-th retry (n times this many seconds: about a minute in all).
+ROUTE_ATTEMPTS = RECORD_ATTEMPTS
+ROUTE_PAUSE_SECONDS = RECORD_PAUSE_SECONDS
 
 
 def output_channels(settings: Settings) -> OutputChannels:
@@ -55,11 +81,25 @@ class TasqueBot(discord.Client):
         self.intake_channel_id = (self.settings.discord_intake_channel_id or "").strip()
         self.allowed_users = self.settings.allowed_discord_user_ids
         self._output_task: asyncio.Task | None = None
+        self._catch_up_task: asyncio.Task | None = None
+        self._away_since: datetime | None = None
 
     async def on_ready(self) -> None:
+        """A new session: the first, or one Discord could not resume. What the user sent meanwhile is read
+        back without holding up the start."""
         logger.info("Discord connected as %s", self.user)
+        since = self._away_since or await asyncio.to_thread(_newest_saved_message_at)
+        self._away_since = None
+        self._catch_up_task = asyncio.create_task(self._catch_up(since))
         if self._output_task is None:
             self._output_task = asyncio.create_task(self._output_loop())
+
+    async def on_disconnect(self) -> None:
+        if self._away_since is None:
+            self._away_since = utc_now()
+
+    async def on_resumed(self) -> None:
+        self._away_since = None  # the gateway replayed what was missed
 
     async def on_message(self, message: discord.Message) -> None:
         # System messages (thread renames, pins) are authored by the acting user, so only
@@ -123,9 +163,37 @@ class TasqueBot(discord.Client):
         await interaction.followup.send(content=content[:1900], ephemeral=True)
 
     async def close(self) -> None:
-        if self._output_task is not None:
-            self._output_task.cancel()
+        for task in (self._output_task, self._catch_up_task):
+            if task is not None:
+                task.cancel()
         await super().close()
+
+    async def _catch_up(self, since: datetime | None) -> None:
+        """Route the messages the user sent while Tasque was away: the intake channel's and each active
+        thread's with messages since ``since``, a day back at most, oldest first; one already saved is skipped."""
+        after = max(moment for moment in (since, utc_now() - CATCH_UP_WINDOW) if moment is not None)
+        routed = 0
+        try:
+            for channel in await self._channels_with_messages_since(after):
+                async for message in channel.history(after=after, limit=CATCH_UP_LIMIT, oldest_first=True):
+                    if await asyncio.to_thread(_saved, str(message.id)):
+                        continue
+                    await self.on_message(message)
+                    routed += 1
+        except Exception:  # noqa: BLE001 - nothing else waits on it; what failed is logged
+            logger.exception("Could not read back the messages sent while Tasque was away")
+        if routed:
+            logger.info("Routed %d message(s) sent while Tasque was away", routed)
+
+    async def _channels_with_messages_since(self, after: datetime) -> list:
+        """The intake channel and the active threads whose last message is newer than ``after``."""
+        intake = self.get_channel(int(self.intake_channel_id))
+        if intake is None:
+            intake = await self.fetch_channel(int(self.intake_channel_id))
+        channels = [intake]
+        for guild in self.guilds:
+            channels.extend(await guild.active_threads())
+        return [channel for channel in channels if _newer_than(getattr(channel, "last_message_id", None), after)]
 
     def _route(
         self,
@@ -138,8 +206,39 @@ class TasqueBot(discord.Client):
         attachments: list[DiscordAttachmentPayload],
         referenced: str | None,
     ) -> DiscordRouteResult | None:
+        """Route one message; when the database is busy, try again after a pause rather than drop it."""
         if not self._routable(channel_id, thread_id, referenced):
             return None
+        fields = {
+            "discord_message_id": discord_message_id,
+            "channel_id": channel_id,
+            "thread_id": thread_id,
+            "author": author,
+            "content": content,
+            "attachments": attachments,
+            "referenced": referenced,
+        }
+        for attempt in range(1, ROUTE_ATTEMPTS + 1):
+            try:
+                return self._route_once(**fields)
+            except OperationalError as exc:
+                if not database_busy(exc) or attempt == ROUTE_ATTEMPTS:
+                    raise
+                logger.warning("The database was busy routing a Discord message; trying again (%d)", attempt)
+                time.sleep(ROUTE_PAUSE_SECONDS * attempt)
+        return None
+
+    def _route_once(
+        self,
+        *,
+        discord_message_id: str,
+        channel_id: str,
+        thread_id: str | None,
+        author: str,
+        content: str,
+        attachments: list[DiscordAttachmentPayload],
+        referenced: str | None,
+    ) -> DiscordRouteResult:
         is_intake = channel_id == self.intake_channel_id
         with (
             span(
@@ -238,6 +337,25 @@ def _waiting_on(work_item_id: str) -> bool:
     with session_scope() as session:
         work_item = session.get(WorkItem, work_item_id)
         return work_item is not None and work_item.status in WAITING_STATUSES
+
+
+def _saved(discord_message_id: str) -> bool:
+    with session_scope() as session:
+        found = session.scalar(select(DiscordMessage.id).where(DiscordMessage.discord_message_id == discord_message_id))
+        return found is not None
+
+
+def _newest_saved_message_at() -> datetime | None:
+    """When the newest message on record (sent or received) was saved: where a start-up's catch-up begins."""
+    with session_scope() as session:
+        moment = session.scalar(select(func.max(DiscordMessage.created_at)))
+    if moment is None:
+        return None
+    return moment if moment.tzinfo else moment.replace(tzinfo=UTC)
+
+
+def _newer_than(message_id: int | str | None, after: datetime) -> bool:
+    return message_id is not None and discord.utils.snowflake_time(int(message_id)) > after
 
 
 def _referenced_message_id(message: discord.Message) -> str | None:

@@ -61,6 +61,7 @@ class ReleasePlan:
     summary: str = ""
     run_id: str | None = None
     thread_id: str | None = None
+    quiet: bool = False  # the Workshop's own change, shipped quietly: nothing is posted about it
     undo_of: str | None = None
     db_script_ref: str | None = None  # the commit to load the script from (an undo's comes from the original)
     db_script_undo: bool = False  # run the script's revert (an undo) rather than its apply

@@ -173,32 +173,71 @@ def test_a_pending_switch_is_never_replaced(isolated: Path, tmp_path: Path) -> N
     [
         ("user", "tweak", ["templates"], 0, policy.AUTO),
         ("user", "tweak", ["doctrine", "extension"], 0, policy.AUTO),
+        ("user", "feature", ["extension", "routine"], 0, policy.AUTO),
+        ("user", "fix", ["core"], 0, policy.AUTO),
+        ("user", "tweak", ["migrations"], 0, policy.AUTO),
         ("fault", "fix", ["extension"], 0, policy.AUTO),
-        ("workshop", "fix", ["templates"], 0, policy.AUTO),
+        ("workshop", "fix", ["templates", "routine"], 0, policy.AUTO),
+        ("workshop", "feature", ["schedules"], 0, policy.AUTO),
+        ("model", "tweak", ["templates"], 0, policy.AUTO),
         ("user", "tweak", ["templates"], 1, policy.PLAN),
-        ("user", "feature", ["extension"], 0, policy.TAP),
-        ("workshop", "feature", ["schedules"], 0, policy.TAP),
-        ("user", "fix", ["core"], 0, policy.TAP),
-        ("user", "tweak", ["migrations"], 0, policy.TAP),
         ("user", "redesign", ["templates"], 0, policy.PLAN),
         ("user", "tweak", ["goals"], 0, policy.PLAN),
+        ("user", "tweak", ["standing_rules"], 0, policy.PLAN),
         ("user", "tweak", ["lanes"], 0, policy.PLAN),
+        ("user", "tweak", ["dependencies"], 0, policy.PLAN),
         ("user", "fix", ["self"], 0, policy.PLAN),
-        ("model", "fix", ["templates"], 0, policy.PLAN),
+        ("workshop", "feature", ["schedules", "routine"], 0, policy.PLAN),
+        ("model", "tweak", ["templates", "routine"], 0, policy.PLAN),
     ],
 )
 def test_the_tier_comes_from_who_asked_and_what_it_touches(origin, kind, touches, questions, tier) -> None:
     assert policy.classify(origin=origin, kind=kind, touches=touches, questions=questions)[0] == tier
 
 
+def test_the_card_says_why_it_is_the_owners_call_and_a_paused_workshop_pitches_everything() -> None:
+    assert policy.classify(origin="user", kind="tweak", touches=["templates"], paused=True) == (
+        policy.PLAN,
+        "the Workshop is paused",
+    )
+    assert policy.classify(origin="user", kind="tweak", touches=["goals", "self"])[1] == (
+        "it touches your goals, the Workshop's safety net"
+    )
+    assert policy.classify(origin="workshop", kind="feature", touches=["routine"])[1] == (
+        "the Workshop's own idea, and it would change your day"
+    )
+    assert policy.classify(origin="workshop", kind="fix", touches=["core"])[1] == "a fix"
+    assert policy.classify(origin="user", kind="feature", touches=["core"])[1] == "your own ask"
+    assert policy.classify(origin="workshop", kind="tweak", touches=["core"])[1] == "nothing in it is your call"
+
+
 def test_the_real_diff_only_raises_the_tier() -> None:
     assert policy.touches_from_diff({"data": ["work-templates/cooking/reply.template.md"]}) == {"data"}
     assert policy.touches_from_diff({"data": ["lanes.json"]}) == {"data", "schedules"}
+    assert policy.touches_from_diff({"data": ["doctrine/global/tasque_workshop.md"]}) == {"doctrine", "self"}
     assert policy.touches_from_diff({"core": ["src/tasque2/workshop/policy.py"]}) == {"core", "self"}
+    assert policy.touches_from_diff({"core": ["src/tasque2/workshop/pipeline.py"]}) == {"core"}
     assert policy.touches_from_diff({"personal": ["migrations/0009.py"]}) == {"extension", "migrations"}
-    assert policy.final_tier(policy.AUTO, origin="user", kind="tweak", files={"core": ["src/app.py"]})[0] == policy.TAP
+    assert policy.final_tier(policy.AUTO, origin="user", kind="tweak", files={"core": ["src/app.py"]})[0] == policy.AUTO
+    raised = policy.final_tier(policy.AUTO, origin="user", kind="tweak", files={"core": ["src/tasque2/ops/privacy.py"]})
+    assert raised == (policy.PLAN, "it touches the Workshop's safety net")
     planned = policy.final_tier(policy.PLAN, origin="user", kind="tweak", files={"data": ["workflows/x.json"]})
     assert planned == (policy.PLAN, "as planned")
+
+
+def test_a_build_waits_for_a_tap_only_when_it_strays_from_its_plan_or_the_workshop_was_paused() -> None:
+    safety_net = {"core": ["src/tasque2/workshop/guard.py"]}
+    assert policy.late_tap(["extension"], {"ext1": ["tool.py"]}, paused_since_plan=False) is None
+    assert policy.late_tap(["extension"], safety_net, paused_since_plan=False) == (
+        "its plan did not say it touches the Workshop's safety net"
+    )
+    assert policy.late_tap(["self"], safety_net, paused_since_plan=False) is None
+    assert policy.late_tap(["self"], {"core": ["uv.lock"]}, paused_since_plan=False) == (
+        "its plan did not say it touches a new package"
+    )
+    assert policy.late_tap(["extension"], {"ext1": ["tool.py"]}, paused_since_plan=True) == (
+        "you paused the Workshop while it was built"
+    )
 
 
 # --- the Undo button ----------------------------------------------------------------------------------------

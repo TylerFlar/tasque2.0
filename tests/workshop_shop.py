@@ -138,6 +138,14 @@ def _extension_build(item: WorkItem) -> dict[str, Any]:
     return {"done": True, "changes": ["The tool's value is 2."], "tests_added": ["tests/test_tool.py"]}
 
 
+def _self_build(item: WorkItem) -> dict[str, Any]:
+    """An extension change whose build also edits the Workshop's safety net, which its plan did not name."""
+    root = Path(item.context["cwd"])
+    _commit(root / "extensions" / "ext1", "tool.py", "VALUE = 2\n")
+    _commit(root, "src/tasque2/workshop/policy.py", "AUTO_PER_DAY = 4\n", "a looser limit")
+    return {"done": True, "changes": ["The tool's value is 2.", "The Workshop ships four a day."]}
+
+
 def _other_build(item: WorkItem) -> dict[str, Any]:
     ext = Path(item.context["cwd"]) / "extensions" / "ext1"
     _commit(ext, "other.py", "OTHER = 1\n")

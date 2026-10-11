@@ -6,29 +6,34 @@ its own worktrees (``tasque2.ops.worktree``: the core, each extension, and the c
 ``data``), next to the live checkout:
 
 1. ``plan`` (a model run that reads the change's own checkout; the guard refuses writes outside it):
-   what to change, where and why in at most 25 lines, up to 4 questions with defaults, what it touches
-   and which files. A request that needs no change (a question, a batch of ideas, evidence that no longer
-   holds) ends here with its answer;
-2. ``classify`` (no model): the tier from ``tasque2.workshop.policy``, never from the model;
-3. ``plan_gate``: Approve, Revise or Discard, only for a change whose plan needs approving;
+   what to change, where and why in at most 25 lines, a pitch of a few plain lines for the owner, up to 4
+   questions with defaults, what it touches and which files. A request that needs no change (a question,
+   a batch of ideas, evidence that no longer holds) ends here with its answer;
+2. ``classify`` (no model): the tier from ``tasque2.workshop.policy``, never from the model: a pitch to
+   approve first, or shipping on its own;
+3. ``plan_gate``: Approve, Revise or Discard, only for a change whose pitch needs approving;
 4. ``prepare`` (no model): Revise starts the change again with the notes typed at the gate, Discard
    ends it; otherwise the worktrees move to the live heads and a change that edits code takes the code
-   lock (one code change at a time, from its build until it is live, freed while its ship card waits);
+   lock (one code change at a time, from its build until it is live, freed while it waits for a tap or
+   for the next day);
 5. ``build`` (a model run in the worktrees): a failing test first for a bug, the change, commits;
 6. ``verify`` (no model, ``tasque2.workshop.verify``): the suites, ruff, the privacy and secret scans, a
-   rehearsal on a copy of the live database, and the tier again from the real diff (it only rises);
-7. ``ship_gate``: Ship or Discard, unless the change ships on its own;
-8. ``release`` (no model): a config-only change lands at once; code takes the lock again, is moved onto
-   the live code and checked again when the live code moved on while the card waited, then waits for an
-   idle moment (01:00-06:30 for a change that ships on its own) and a restart, announced in the thread
-   once it is live;
-9. ``report`` (no model): what changed, with an Undo button. A change the Workshop filed posts only its
-   cards and its "Live now"; its ledger rows learn how it ended.
+   rehearsal on a copy of the live database, and whether the build needs one tap after all (it touches
+   what its plan did not name, or the owner paused the Workshop while it was built);
+7. ``ship_gate``: Ship or Discard, only for that rare tap;
+8. ``release`` (no model): a config-only change lands at once; code waits for an idle moment and a
+   restart. One of the Workshop's own changes past ``AUTO_PER_DAY`` for the day waits for the next day.
+   A code change that waited takes the lock again, and is moved onto the live code and checked again
+   when the live code moved on meanwhile;
+9. ``report`` (no model): the owner hears of a change they asked for or approved: "Live now" with an Undo
+   button (a cold release is announced once it is live), or one line when it could not ship. The
+   Workshop's other changes ship quietly: status lists them, and undo still works. A change the Workshop
+   filed tells its ledger rows how it ended.
 
 A card nobody answers for 14 days expires (``expire_cards``, run by the sweep): a change's card as a
 Discard, an idea card as a Not now. Kill switches: ``pause`` (no change starts unless the owner asks for
-it, and nothing ships on its own), and undo. Two releases rolled back within a week pause the Workshop on
-its own.
+it, and every change shows its pitch first), and undo. Two releases rolled back within a week pause the
+Workshop on its own.
 """
 
 from __future__ import annotations
@@ -46,7 +51,7 @@ from sqlalchemy import select, update
 from sqlalchemy.orm import Session, object_session
 
 from tasque2.config import get_settings
-from tasque2.models import WorkflowDefinition, WorkflowNode, WorkflowRun, WorkItem, utc_now
+from tasque2.models import WorkAttempt, WorkflowDefinition, WorkflowNode, WorkflowRun, WorkItem, utc_now
 from tasque2.workshop import ledger, policy
 
 logger = logging.getLogger(__name__)
@@ -74,11 +79,15 @@ TOUCHES = (
     "migrations",
     "dependencies",
     "self",
+    "routine",
 )
 CODE_TOUCHES = {"core", "extension", "migrations", "dependencies"}
 WAIT_FOR_CODE = timedelta(hours=2)
 ROLLBACKS_TO_PAUSE, ROLLBACK_WINDOW = 2, timedelta(days=7)
 CARD_EXPIRES = timedelta(days=14)
+# A pitch's lines on a card, and a change's lines in its "Live now".
+PITCH_LINES = 8
+CHANGE_LINES = 4
 # The answer an expired card takes: a change's card is discarded, an idea card's idea rests.
 EXPIRED_ANSWERS = {WORKFLOW_NAME: DISCARD, "workshop-idea": "Not now"}
 # Runs of a retired workflow whose worktrees are swept like a change's.
@@ -115,8 +124,8 @@ PLAN_FALLBACK = """\
 # Workshop: plan one change to Tasque
 Plan the change the packet's task context asks for (`request`, with any `notes` and `previous_plan`),
 reading your own checkout (your working directory) and changing nothing. Follow the pinned
-`tasque_workshop` document. `produces`: {title, kind, no_change, answer, plan, touches, questions,
-evidence, packets}.
+`tasque_workshop` document. `produces`: {title, kind, no_change, answer, pitch, plan, touches,
+questions, evidence, packets}.
 """
 BUILD_FALLBACK = """\
 # Workshop: build one planned change to Tasque
@@ -212,7 +221,7 @@ def free_code(session: Session, change_id: str | None = None) -> None:
 
 
 def auto_today(now: datetime | None = None) -> int:
-    """Changes that shipped on their own today (local time)."""
+    """The Workshop's own changes released today (local time): held to ``policy.AUTO_PER_DAY``."""
     from tasque2.localtime import local_date
     from tasque2.ops.release import history
 
@@ -223,7 +232,7 @@ def auto_today(now: datetime | None = None) -> int:
             created = datetime.fromisoformat(plan.created_at)
         except ValueError:
             continue
-        if plan.tier == policy.AUTO and not plan.undo_of and local_date(created) == today:
+        if policy.own(plan.origin) and not plan.undo_of and local_date(created) == today:
             count += 1
     return count
 
@@ -482,23 +491,24 @@ def _questions(value: Any) -> list[dict[str, str]]:
 
 
 def plan_card(
-    title: str, kind: str, plan: dict[str, Any], questions: list[dict[str, str]], why: str, *, filed: bool = False
+    title: str, plan: dict[str, Any], questions: list[dict[str, str]], why: str, *, filed: bool = False
 ) -> str:
+    """The pitch: a few plain lines on what the owner would notice and what they decide."""
     found = "; the Workshop filed it" if filed else ""
-    lines = [f"**Workshop plan: {title}** ({kind}; needs your OK: {why}{found})", ""]
-    lines += [line.rstrip() for line in str(plan.get("plan") or "").strip().splitlines()[:25]]
+    lines = [f"**Workshop: {title}** (needs your OK: {why}{found})", ""]
+    pitch = str(plan.get("pitch") or plan.get("plan") or "").strip().splitlines()
+    lines += [line.rstrip() for line in pitch[:PITCH_LINES]]
     if questions:
         lines += ["", "**Questions** (type your answers here, then tap a button; unanswered ones take the default):"]
         for number, item in enumerate(questions, start=1):
             default = f" _(default: {item['default']})_" if item["default"] else ""
             lines.append(f"{number}. {item['question']}{default}")
-    evidence = [str(item) for item in plan.get("evidence") or [] if str(item).strip()][:4]
+    evidence = [str(item) for item in plan.get("evidence") or [] if str(item).strip()][:2]
     if evidence:
         lines += ["", "Why: " + "; ".join(evidence)]
     lines += [
         "",
-        "Approve builds it (you get one more tap before it goes live). Revise plans it again with what you typed. "
-        "Discard drops it.",
+        "Approve builds and ships it, with an Undo. Revise plans it again with what you typed. Discard drops it.",
     ]
     return "\n".join(lines)
 
@@ -523,11 +533,8 @@ def classify_worker(work_item: WorkItem) -> dict[str, Any]:
     touches = [str(item) for item in plan.get("touches") or [] if str(item) in TOUCHES]
     questions = _questions(plan.get("questions"))
     origin = str(given.get("origin") or "model")
-    tier, why = policy.classify(origin=origin, kind=kind, touches=touches, questions=len(questions))
-    if tier == policy.AUTO and (paused() or given.get("paused")):
-        tier, why = policy.TAP, "the Workshop is paused, so nothing ships on its own"
-    if tier == policy.AUTO and auto_today() >= policy.AUTO_PER_DAY:
-        tier, why = policy.TAP, f"{policy.AUTO_PER_DAY} changes already shipped on their own today"
+    paused_now = bool(paused() or given.get("paused"))
+    tier, why = policy.classify(origin=origin, kind=kind, touches=touches, questions=len(questions), paused=paused_now)
     produced = {
         "silent": True,
         "ended": False,
@@ -535,11 +542,12 @@ def classify_worker(work_item: WorkItem) -> dict[str, Any]:
         "kind": kind,
         "tier": tier,
         "why": why,
+        "paused": paused_now,
         "touches": touches,
         "files": files_of(plan.get("files")),
         "questions": questions,
         "skip_plan_gate": tier != policy.PLAN,
-        "card": plan_card(title, kind, plan, questions, why, filed=origin == "workshop") if tier == policy.PLAN else "",
+        "card": plan_card(title, plan, questions, why, filed=origin == "workshop") if tier == policy.PLAN else "",
         "profile": "ultra" if kind == "redesign" else "high",
         "needs_code": bool(set(touches) & CODE_TOUCHES),
     }
@@ -607,7 +615,9 @@ def prepare_worker(work_item: WorkItem) -> dict[str, Any]:
     if classify.get("needs_code"):
         holder = code_holder(session)
         if holder and holder != change_id:
-            raise WorkDeferred(utc_now() + WAIT_FOR_CODE, f"waiting for change {holder} to go live first")
+            raise WorkDeferred(
+                utc_now() + WAIT_FOR_CODE, f"waiting for another code change to go live first ({holder})"
+            )
         take_code(change_id, run.id)
     refresh_worktrees(run)
     plan = node_output(session, run.id, "plan")
@@ -616,7 +626,9 @@ def prepare_worker(work_item: WorkItem) -> dict[str, Any]:
         "title": classify.get("title"),
         "kind": classify.get("kind"),
         "tier": classify.get("tier"),
+        "pitch": plan.get("pitch"),
         "plan": plan.get("plan"),
+        "files": classify.get("files") or [],
         "questions": classify.get("questions") or [],
         "answers": notes,
         "evidence": plan.get("evidence") or [],
@@ -642,12 +654,12 @@ def verify_worker(work_item: WorkItem) -> dict[str, Any]:
         cleanup(session, run)
         produced = {"silent": True, "stop": True, "skip_ship_gate": True, "reasons": outcome.get("reasons") or []}
         return {"summary": "Not shipped: " + "; ".join(outcome.get("reasons") or [])[:600], "produces": produced}
-    auto = outcome["tier"] == policy.AUTO and not paused() and auto_today() < policy.AUTO_PER_DAY
-    if not auto:
+    tap = outcome.get("tap")
+    if tap:
         # A card waiting for the owner never holds up the other code changes: the lock is taken again on Ship.
         free_code(session, (run.input or {}).get("change_id"))
-    produced = {"silent": True, "stop": False, **outcome, "auto_ship": auto, "skip_ship_gate": auto}
-    return {"summary": f"Verified ({outcome['tier']}).", "produces": produced}
+    produced = {"silent": True, "stop": False, **outcome, "skip_ship_gate": not tap}
+    return {"summary": f"Verified: {'needs a tap, ' + tap if tap else 'ships on its own'}.", "produces": produced}
 
 
 def move_onto_live(run: WorkflowRun) -> list[str]:
@@ -682,9 +694,11 @@ def _not_released(session: Session, run: WorkflowRun, problems: list[str]) -> di
 
 def release_worker(work_item: WorkItem) -> dict[str, Any]:
     """``function.workshop_release``: config lands now; code is queued for a restart. Never raises, except
-    to wait for the code lock: a code change that waited for its tap takes the lock again, and is moved onto
-    the live code and checked again when the live code moved on meanwhile."""
+    to wait: for the next day when the Workshop's own changes reached their number for today, or for the
+    code lock. A code change that waited (for a tap, or for the next day) takes the lock again, and is
+    moved onto the live code and checked again when the live code moved on meanwhile."""
     from tasque2.daemon.restart import RestartBusy
+    from tasque2.localtime import next_local_midnight
     from tasque2.ops.release import ReleasePlan, preflight, queue_cold, release_hot, save_plan
     from tasque2.ops.worktree import WorktreeError, remove_worktrees
     from tasque2.work.runner import WorkDeferred
@@ -700,11 +714,18 @@ def release_worker(work_item: WorkItem) -> dict[str, Any]:
         produced = {"silent": True, "released": False, "discarded": True, "expired": bool(gate.get("expired"))}
         return {"summary": "Expired." if gate.get("expired") else "Discarded.", "produces": produced}
     plan = ReleasePlan.from_dict(verified["release_plan"])
-    if plan.cold and not verified.get("auto_ship"):
-        change_id = str((run.input or {}).get("change_id"))
-        holder = code_holder(session)
-        if holder and holder != change_id:
-            raise WorkDeferred(utc_now() + WAIT_FOR_CODE, f"waiting for change {holder} to go live first")
+    given = run.input or {}
+    change_id = str(given.get("change_id"))
+    if policy.own(str(given.get("origin") or "")) and auto_today() >= policy.AUTO_PER_DAY:
+        free_code(session, change_id)
+        why = f"{policy.AUTO_PER_DAY} of the Workshop's own changes shipped today; it waits for tomorrow"
+        raise WorkDeferred(next_local_midnight(), why)
+    holder = code_holder(session) if plan.cold else change_id
+    if holder and holder != change_id:
+        raise WorkDeferred(utc_now() + WAIT_FOR_CODE, f"waiting for another code change to go live first ({holder})")
+    if holder != change_id:
+        # The code was freed while the change waited: taken again, and the change is moved onto the live
+        # code and checked again when that moved on meanwhile.
         take_code(change_id, run.id)
         try:
             moved = move_onto_live(run)
@@ -787,18 +808,10 @@ def report_text(session: Session, run: WorkflowRun) -> tuple[str, str | None]:
         problems = release.get("problems") or ["it could not be released"]
         return f"Not shipped: {title}.\n" + "\n".join(_lines(problems, 5)) + "\nSay redo to build it again.", None
     plan = verified.get("release_plan") or {}
-    changes = _lines(str(plan.get("summary") or "").splitlines())
-    how = "Shipped on its own" if verified.get("auto_ship") else "Shipped"
+    changes = _lines(str(plan.get("summary") or "").splitlines(), CHANGE_LINES)
     if release.get("kind") == "hot":
-        lines = [f"**Live now: {title}** ({how.lower()}: {verified.get('why')})", *changes, "Tap Undo to reverse it."]
-        return "\n".join(lines), str(release["release_id"])
-    lines = [
-        f"**Ready: {title}** ({verified.get('why')})",
-        *changes,
-        "It goes live when Tasque restarts at the next idle moment; I'll post here once it's live. "
-        "Say undo to stop it.",
-    ]
-    return "\n".join(lines), None
+        return "\n".join([f"**Live now: {title}**", *changes, "Tap Undo to reverse it."]), str(release["release_id"])
+    return f"Queued: {title} goes live when Tasque restarts at the next idle moment.", None
 
 
 def outcome(session: Session, run: WorkflowRun) -> str:
@@ -811,20 +824,39 @@ def outcome(session: Session, run: WorkflowRun) -> str:
     return ledger.ENDED
 
 
+def heard(session: Session, run: WorkflowRun) -> bool:
+    """Whether the owner hears of a change: they asked for it, or approved its pitch. The Workshop's other
+    changes ship quietly."""
+    if not policy.own(str((run.input or {}).get("origin") or "")):
+        return True
+    gate = node_output(session, run.id, "plan_gate")
+    return bool(gate) and not gate.get("skipped")
+
+
+def _posted(session: Session, run: WorkflowRun, release_id: str | None) -> bool:
+    """Whether the change's last word is posted: to an owner who hears of it, except for a cold release
+    (announced once it is live) and a change of the Workshop's they discarded themselves."""
+    if not heard(session, run):
+        return False
+    if node_output(session, run.id, "release").get("released") and not release_id:
+        return False
+    own = policy.own(str((run.input or {}).get("origin") or ""))
+    return not (own and outcome(session, run) == ledger.DISCARDED)
+
+
 def report_worker(work_item: WorkItem) -> dict[str, Any]:
-    """``function.workshop_report``: the change's final post. A change the Workshop filed posts only its
-    "Live now" (its cards posted on their own), and its ledger rows learn how it ended."""
+    """``function.workshop_report``: the change's final post, for an owner who hears of it. A change the
+    Workshop filed tells its ledger rows how it ended."""
     session, run = _run(work_item)
     text, release_id = report_text(session, run)
     produced: dict[str, Any] = {"workshop_report": True}
     if release_id:
         produced["undo_release"] = release_id
     given = run.input or {}
-    if given.get("origin") == "workshop":
-        if node_output(session, run.id, "prepare").get("why") != "revised":
-            ledger.settle(session, str(given.get("change_id")), outcome(session, run))
-        if not release_id:
-            produced["silent"] = True
+    if given.get("origin") == "workshop" and node_output(session, run.id, "prepare").get("why") != "revised":
+        ledger.settle(session, str(given.get("change_id")), outcome(session, run))
+    if not _posted(session, run, release_id):
+        produced["silent"] = True
     return {"summary": text, "produces": produced}
 
 
@@ -865,8 +897,8 @@ def announce_releases(session: Session) -> int:
             continue
         if plan.undo_of and status == "live":
             mark_undone(plan)
-        if not plan.thread_id or (plan.origin == "workshop" and status != "live"):
-            continue  # a change the Workshop filed says only "Live now"
+        if not plan.thread_id or plan.quiet:
+            continue  # the Workshop's own changes ship quietly: status lists them, and undo still works
         undo = status == "live" and not plan.undo_of
         WorkRepository(session).create_work_item(
             title=f"Workshop: {plan.title}"[:240],
@@ -1046,11 +1078,11 @@ def _refile(session: Session, run: WorkflowRun, again: WorkflowRun) -> None:
 STAGES = (
     ("plan", "planning"),
     ("classify", "planning"),
-    ("plan_gate", "waiting for your OK on the plan"),
-    ("prepare", "waiting for another code change to go live"),
+    ("plan_gate", "waiting for your OK on its pitch"),
+    ("prepare", "preparing the build"),
     ("build", "building"),
     ("verify", "checking"),
-    ("ship_gate", "waiting for your tap to ship"),
+    ("ship_gate", "waiting for your tap"),
     ("release", "releasing"),
     ("report", "reporting"),
 )
@@ -1064,8 +1096,21 @@ def stage(session: Session, run: WorkflowRun) -> str:
     for key, label in STAGES:
         node = nodes.get(key)
         if node is not None and node.status not in ("succeeded", "failed_tolerated"):
-            return label
+            return _waiting(session, node) or label
     return run.status
+
+
+def _waiting(session: Session, node: WorkflowNode) -> str | None:
+    """Why a step waits, in its worker's words, when its work item was deferred."""
+    item = session.get(WorkItem, node.work_item_id) if node.work_item_id else None
+    if item is None or item.status != "ready" or item.not_before is None:
+        return None
+    attempt = session.scalar(
+        select(WorkAttempt)
+        .where(WorkAttempt.work_item_id == item.id, WorkAttempt.status == "deferred")
+        .order_by(WorkAttempt.ended_at.desc())
+    )
+    return attempt.summary if attempt is not None and attempt.summary else None
 
 
 def status_text(session: Session) -> str:
@@ -1085,7 +1130,11 @@ def status_text(session: Session) -> str:
     recent = [plan for plan in history() if state(plan) != "queued"][-5:]
     if recent:
         lines.append("Recent releases:")
-        lines += [f"- {plan.created_at[:10]} {plan.title}: {state(plan)}" for plan in reversed(recent)]
-    lines.append(f"Shipped on their own today: {auto_today()}/{policy.AUTO_PER_DAY}.")
+        for plan in reversed(recent):
+            quiet = " (the Workshop's own, shipped quietly)" if plan.quiet else ""
+            lines.append(f"- {plan.created_at[:10]} {plan.title}: {state(plan)}{quiet}")
+    shipped = auto_today()
+    full = "; the next waits for tomorrow" if shipped >= policy.AUTO_PER_DAY else ""
+    lines.append(f"The Workshop's own changes shipped today: {shipped}/{policy.AUTO_PER_DAY}{full}.")
     lines += ledger.status_lines(session)
     return "\n".join(lines)

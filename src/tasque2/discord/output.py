@@ -73,7 +73,7 @@ RECORD_ATTEMPTS = 8
 RECORD_PAUSE_SECONDS = 1.5
 
 
-def _database_busy(exc: BaseException) -> bool:
+def database_busy(exc: BaseException) -> bool:
     """SQLite refused a write because another connection holds its lock."""
     text = str(exc).lower()
     return "database is locked" in text or "database is busy" in text
@@ -867,7 +867,7 @@ class DiscordOutputService:
                 return
             except OperationalError as exc:
                 self.session.rollback()
-                if not _database_busy(exc) or attempt == RECORD_ATTEMPTS:
+                if not database_busy(exc) or attempt == RECORD_ATTEMPTS:
                     raise
                 logger.warning("The database was busy recording a sent Discord message; trying again (%d)", attempt)
                 time.sleep(RECORD_PAUSE_SECONDS * attempt)

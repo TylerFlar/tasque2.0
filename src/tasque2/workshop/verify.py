@@ -4,8 +4,9 @@ In order, any failure ending the change:
 
 1. the build finished, committed something, and left nothing uncommitted in its worktrees;
 2. the live code checkouts were left alone while it ran;
-3. the tier again, from the files the commits really touch (``policy.final_tier``: it only rises); a
-   fix that would ship on its own needs a test among its files;
+3. a fix that changes code has a test among its files; the tier again, from the files the commits really
+   touch (``policy.final_tier``: it only rises), and whether the build needs one tap after all
+   (``policy.late_tap``: it touches what its plan did not name, or the Workshop was paused meanwhile);
 4. with code: the core suite and each extension's suite, and ruff on every changed Python file;
 5. the core commits carry nothing personal (``tasque2.ops.privacy``, the core repository is public),
    and no commit anywhere carries a secret;
@@ -13,8 +14,8 @@ In order, any failure ending the change:
    release applied twice, undone and applied again, the release check, the context packets the change
    touches, and its probe.
 
-What passes becomes the release plan and the ship card: what changes and why, the diff sizes, doctrine
-against its budget, and the checks.
+What passes becomes the release plan, and, for the rare tap, a card in plain words: what changes, and why
+it waits.
 """
 
 from __future__ import annotations
@@ -31,11 +32,7 @@ from tasque2.workshop import policy
 
 TEST_TIMEOUT_SECONDS = 30 * 60
 PACKET_KINDS = ("thread", "schedule")
-TIER_LABELS = {
-    policy.AUTO: "ships on its own",
-    policy.TAP: "needs your tap",
-    policy.PLAN: "needs your tap",
-}
+CARD_LINES = 4
 
 
 def _run_command(command: list[str], cwd: str) -> tuple[bool, str]:
@@ -67,18 +64,6 @@ def _added_lines(tree: Any) -> list[str]:
     return [line[1:] for line in diff.splitlines() if line.startswith("+") and not line.startswith("+++")]
 
 
-def _shortstat(tree: Any) -> str:
-    from tasque2.ops.worktree import git
-
-    text = git(tree.path, "diff", "--shortstat", f"{tree.base}..HEAD")
-    parts = [part.strip() for part in text.split(",")]
-    files = next((part.split()[0] for part in parts if "file" in part), "0")
-    plus = next((part.split()[0] for part in parts if "insertion" in part), "0")
-    minus = next((part.split()[0] for part in parts if "deletion" in part), "0")
-    name = "config" if tree.name == "data" else tree.name
-    return f"{name} {files} file{'s' if files != '1' else ''} (+{plus} -{minus})"
-
-
 def _packets(value: Any) -> list[tuple[str, str]]:
     found = []
     for item in value if isinstance(value, list) else []:
@@ -89,23 +74,15 @@ def _packets(value: Any) -> list[tuple[str, str]]:
     return found[:6]
 
 
-def doctrine_sizes(tree: Any) -> list[str]:
-    """Each doctrine document the change edits, against the budget it declares."""
-    from tasque2.memory.service import canonical_budget
-    from tasque2.ops.doctrine import held_edits
-
-    lines = []
-    for edit in held_edits(Path(tree.path), tree.base, "HEAD"):
-        name = f"{edit.namespace}/{edit.canonical_key}"
-        if edit.after is None:
-            lines.append(f"{name} retired")
-            continue
-        budget = canonical_budget(edit.after)
-        lines.append(f"{name} {len(edit.after):,}" + (f"/{budget:,}" if budget else " chars"))
-    return lines
-
-
-def release_plan(run: WorkflowRun, changed: list[Any], files: dict[str, list[str]], build: dict[str, Any], tier: str):
+def release_plan(
+    run: WorkflowRun,
+    changed: list[Any],
+    files: dict[str, list[str]],
+    build: dict[str, Any],
+    tier: str,
+    *,
+    quiet: bool = False,
+):
     """The release plan for what the change committed."""
     from tasque2.ops.release import ReleasePlan
 
@@ -139,16 +116,18 @@ def release_plan(run: WorkflowRun, changed: list[Any], files: dict[str, list[str
         summary="\n".join(str(line).strip() for line in build.get("changes") or [] if str(line).strip())[:1500],
         run_id=run.id,
         thread_id=run.discord_thread_id,
+        quiet=quiet,
     )
 
 
 def verify(session: Session, run: WorkflowRun) -> dict[str, Any]:
-    """The checks a built change must pass; ``{ok, reasons}`` or ``{ok, tier, why, release_plan, card, ...}``."""
+    """The checks a built change must pass; ``{ok, reasons}`` or ``{ok, tier, why, tap, release_plan, card, ...}``
+    (``tap``: why it waits for one tap after all, or None)."""
     from tasque2.ops.datarepo import SECRET_PATTERN
     from tasque2.ops.privacy import scan_range
     from tasque2.ops.rehearse import rehearse
     from tasque2.ops.worktree import committed_files, has_commits, live_changes, uncommitted
-    from tasque2.workshop.pipeline import node_output, trees_of
+    from tasque2.workshop.pipeline import heard, node_output, paused, trees_of
 
     given = run.input or {}
     classify = node_output(session, run.id, "classify")
@@ -174,9 +153,13 @@ def verify(session: Session, run: WorkflowRun) -> dict[str, Any]:
 
     files = {tree.name: committed_files(tree) for tree in changed}
     origin, kind = str(given.get("origin") or "model"), str(classify.get("kind") or "feature")
-    tier, why = policy.final_tier(str(classify.get("tier") or policy.TAP), origin=origin, kind=kind, files=files)
-    if tier == policy.AUTO and kind == "fix" and not any(_is_test(name) for names in files.values() for name in names):
-        tier, why = policy.TAP, "a fix without a test that reproduces it"
+    code_changed = any(tree.name != "data" for tree in changed)
+    if kind == "fix" and code_changed and not any(_is_test(name) for names in files.values() for name in names):
+        return {"ok": False, "reasons": ["a fix that changes code needs a test that reproduces it"]}
+    tier, why = policy.final_tier(str(classify.get("tier") or policy.PLAN), origin=origin, kind=kind, files=files)
+    tap = policy.late_tap(
+        classify.get("touches") or [], files, paused_since_plan=bool(paused()) and not classify.get("paused")
+    )
 
     checks: list[str] = []
     python = sys.executable
@@ -217,7 +200,8 @@ def verify(session: Session, run: WorkflowRun) -> dict[str, Any]:
     if reasons:
         return {"ok": False, "reasons": reasons}
 
-    plan = release_plan(run, changed, files, {**build, "title": classify.get("title")}, tier)
+    quiet = not heard(session, run)
+    plan = release_plan(run, changed, files, {**build, "title": classify.get("title")}, tier, quiet=quiet)
     probe = str(build.get("probe") or "") or None
     if probe and probe not in (files.get("data") or []):
         probe = None
@@ -228,27 +212,25 @@ def verify(session: Session, run: WorkflowRun) -> dict[str, Any]:
         failed = next(step for step in rehearsal.steps if not step["ok"])
         return {"ok": False, "reasons": [f"the rehearsal failed at {failed['step']}: {failed['detail'][-300:]}"]}
 
-    sizes = [_shortstat(tree) for tree in changed]
-    data_tree = next((tree for tree in changed if tree.name == "data"), None)
-    doctrine = doctrine_sizes(data_tree) if data_tree is not None else []
-    when = "when Tasque restarts next" if plan.cold else "at once (no code)"
-    lines = [f"**Workshop: {classify.get('title')}** ({kind}; {TIER_LABELS[tier]}: {why})"]
-    if origin == "workshop":
-        found = [str(line) for line in given.get("evidence") or [] if str(line).strip()][:2]
-        lines.append("The Workshop filed this itself" + (f": {'; '.join(found)}" if found else "."))
-    lines += [f"- {line}" for line in plan.summary.splitlines()[:8]]
-    lines.append(f"Changed: {' · '.join(sizes)}")
-    if doctrine:
-        lines.append(f"Doctrine: {' · '.join(doctrine)}")
-    lines.append(f"Checks: {' · '.join(checks)}")
-    lines.append(f"Goes live {when}. Ship applies it; Discard drops it. Anything you type goes with your answer.")
     return {
         "ok": True,
         "tier": tier,
         "why": why,
+        "tap": tap,
         "release_plan": plan.to_dict(),
-        "card": "\n".join(lines),
+        "card": tap_card(str(classify.get("title") or ""), plan, tap, filed=origin == "workshop") if tap else "",
         "checks": checks,
         "rehearsal": rehearsal.steps,
         "files": files,
     }
+
+
+def tap_card(title: str, plan: Any, tap: str, *, filed: bool) -> str:
+    """The card for the rare tap, in plain words: what changes, and why it waits."""
+    lines = [f"**Workshop: {title}** needs your tap: {tap}."]
+    if filed:
+        lines.append("The Workshop filed this itself.")
+    lines += [f"- {line}" for line in plan.summary.splitlines()[:CARD_LINES]]
+    when = "when Tasque restarts next" if plan.cold else "at once"
+    lines.append(f"Ship applies it {when}; Discard drops it. Anything you type goes with your answer.")
+    return "\n".join(lines)

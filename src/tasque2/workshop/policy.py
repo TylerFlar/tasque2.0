@@ -1,16 +1,17 @@
-"""What a change needs before it goes live: a tier, from who started it and what it touches.
+"""What a change needs before it goes live, and whether the user hears of it: decided here, never by a run.
 
-The owner's rules (2026-10-09): one set of rules for everything, as malleable as possible.
+The owner's rules (2026-10-10): the user sees only what is theirs to decide.
 
-- ``auto`` ships on its own (a report with an undo; at most ``AUTO_PER_DAY`` a day): a fix that comes
-  with a reproducing test, and the owner's own ask that touches only private code, templates or
-  doctrine and raises no questions;
-- ``tap`` waits for one tap on a card: what the Workshop proposes on its own that changes behaviour
-  (rather than fixing it), anything in the public core repository (it is pushed), migrations and new
-  dependencies;
-- ``plan`` needs the plan approved, then a tap: redesigns and multi-part changes, a new or retired lane,
-  anything touching the owner's goals or standing rules, any request with open questions, anything a
-  model filed rather than the owner, and the Workshop's own checks and machinery.
+- ``auto`` ships on its own, with an undo: fixes, tweaks, the owner's own asks, core code, doctrine,
+  migrations, internal tools. The Workshop's own changes (filed by it, not asked for) ship at most
+  ``AUTO_PER_DAY`` a day; one more waits for the next day.
+- ``plan`` shows a pitch first (Approve builds and ships it): open questions, a redesign, the owner's goals
+  or standing rules, a lane added or retired, a new dependency, the Workshop's safety net (``SELF``), and
+  something the Workshop thought up itself that would change what the owner sees or does (``routine``; a
+  fix never counts). While the Workshop is paused, every change shows its pitch first.
+
+One tap at the end is rare (``late_tap``): a build that touches what its plan did not name (the safety net,
+a dependency), or a change built while the owner paused the Workshop.
 
 The tier is computed here, never taken from a model, and it is checked again against the real diff after
 the build: it can only go up.
@@ -18,51 +19,69 @@ the build: it can only go up.
 
 from __future__ import annotations
 
-AUTO, TAP, PLAN = "auto", "tap", "plan"
-ORDER = {AUTO: 0, TAP: 1, PLAN: 2}
+AUTO, PLAN = "auto", "plan"
+ORDER = {AUTO: 0, PLAN: 1}
 AUTO_PER_DAY = 3
 ORIGINS = ("user", "fault", "workshop", "model")
+# The Workshop's own changes: what it filed itself, or another run did, rather than the owner asking.
+OWN_ORIGINS = ("workshop", "fault", "model")
 KINDS = ("fix", "tweak", "feature", "redesign")
-# The Workshop's own machinery: a change to any of it is a plan, whoever asks.
+# What is the owner's call, whoever asks and whatever the kind, and how the card names it.
+THEIRS = {
+    "goals": "your goals",
+    "standing_rules": "your standing rules",
+    "lanes": "a lane added or retired",
+    "dependencies": "a new package",
+    "self": "the Workshop's safety net",
+}
+# The Workshop's safety net: what needs the owner's OK, the checks before a release, the guard on its runs,
+# the privacy scan and its denylist, the rehearsal, and its own rule documents. A change to any of these
+# shows its pitch first, whoever asks; a build that touches one unplanned waits for a tap.
 SELF = (
-    "src/tasque2/workshop/",
+    "src/tasque2/workshop/policy.py",
+    "src/tasque2/workshop/verify.py",
+    "src/tasque2/workshop/guard.py",
     "src/tasque2/ops/privacy.py",
-    "src/tasque2/ops/release.py",
     "src/tasque2/ops/rehearse.py",
-    "src/tasque2/ops/worktree.py",
-    "src/tasque2/ops/datarepo.py",
-    "src/tasque2/daemon/respawn.py",
-    "src/tasque2/daemon/restart.py",
+    "privacy-denylist.txt",
     "doctrine/global/tasque_workshop.md",
     "doctrine/global/tasque_design.md",
-    "work-templates/workshop/",
 )
+# What a diff can show that a plan should have named.
+UNPLANNABLE = ("self", "dependencies")
 
 
 def higher(*tiers: str) -> str:
     return max(tiers, key=lambda tier: ORDER.get(tier, ORDER[PLAN]))
 
 
-def classify(*, origin: str, kind: str, touches: list[str] | set[str], questions: int = 0) -> tuple[str, str]:
+def own(origin: str) -> bool:
+    """Whether a change is the Workshop's own rather than the owner's ask: held to ``AUTO_PER_DAY``, and
+    shipped quietly unless its pitch was approved."""
+    return origin in OWN_ORIGINS
+
+
+def classify(
+    *, origin: str, kind: str, touches: list[str] | set[str], questions: int = 0, paused: bool = False
+) -> tuple[str, str]:
     """The tier a planned change needs, and why."""
     touched = set(touches)
-    if origin == "model":
-        return PLAN, "a model filed it, not the owner"
+    if paused:
+        return PLAN, "the Workshop is paused"
     if questions:
         return PLAN, "it has open questions"
     if kind == "redesign":
         return PLAN, "a redesign"
-    if touched & {"goals", "standing_rules", "lanes", "self"}:
-        return PLAN, "it touches " + ", ".join(sorted(touched & {"goals", "standing_rules", "lanes", "self"}))
-    if "core" in touched:
-        return TAP, "it changes the public core repository"
-    if touched & {"migrations", "dependencies"}:
-        return TAP, "it changes " + ", ".join(sorted(touched & {"migrations", "dependencies"}))
-    if kind == "fix" and origin in ("fault", "user", "workshop"):
-        return AUTO, "a fix with a test that reproduces it"
-    if origin == "user" and kind == "tweak":
-        return AUTO, "the owner's own small ask"
-    return TAP, "it changes how Tasque behaves"
+    theirs = [THEIRS[name] for name in THEIRS if name in touched]
+    if theirs:
+        return PLAN, "it touches " + ", ".join(theirs)
+    if own(origin) and kind != "fix" and "routine" in touched:
+        return PLAN, "the Workshop's own idea, and it would change your day"
+    if kind == "fix":
+        return AUTO, "a fix"
+    if origin == "user":
+        return AUTO, "your own ask"
+    return AUTO, "nothing in it is your call"
 
 
 def touches_from_diff(files: dict[str, list[str]]) -> set[str]:
@@ -71,7 +90,6 @@ def touches_from_diff(files: dict[str, list[str]]) -> set[str]:
     for repo, names in files.items():
         for name in names:
             path = name.replace("\\", "/")
-            full = f"{'' if repo in ('core', 'data') else f'extensions/{repo}/'}{path}"
             if repo == "core":
                 touched.add("core")
             elif repo == "data":
@@ -84,7 +102,7 @@ def touches_from_diff(files: dict[str, list[str]]) -> set[str]:
                 touched.add("migrations")
             if path in ("pyproject.toml", "uv.lock"):
                 touched.add("dependencies")
-            if any(full.startswith(entry) or path.startswith(entry) for entry in SELF):
+            if repo in ("core", "data") and path in SELF:
                 touched.add("self")
     return touched
 
@@ -94,3 +112,18 @@ def final_tier(planned: str, *, origin: str, kind: str, files: dict[str, list[st
     actual, why = classify(origin=origin, kind=kind, touches=touches_from_diff(files))
     tier = higher(planned, actual)
     return tier, why if tier == actual else "as planned"
+
+
+def late_tap(
+    planned_touches: list[str] | set[str], files: dict[str, list[str]], *, paused_since_plan: bool
+) -> str | None:
+    """Why a built change needs one tap after all, or None: its diff touches what its plan did not name, or
+    the owner paused the Workshop while it was built."""
+    unnamed = [
+        THEIRS[name] for name in UNPLANNABLE if name in touches_from_diff(files) and name not in set(planned_touches)
+    ]
+    if unnamed:
+        return "its plan did not say it touches " + ", ".join(unnamed)
+    if paused_since_plan:
+        return "you paused the Workshop while it was built"
+    return None

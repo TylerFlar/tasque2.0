@@ -3,9 +3,9 @@
 ``function.workshop_reply`` is the thread's reply processor (its lane file names it). A message is:
 
 - a command: ``pause``, ``resume``, ``undo``, ``redo``, ``status``;
-- a button's label typed out (``approve``, ``revise``, ``discard``, ``ship``, ``build it``, ``not now``,
-  ``never``): that answer, for the card it replies to, or the only card waiting; while several wait, it
-  must reply to its card;
+- a button's label typed out (``approve``, ``revise``, ``discard``, ``build it``, ``not now``, ``never``,
+  and ``ship`` for the rare late tap): that answer, for the card it replies to, or the only card waiting;
+  while several wait, it must reply to its card;
 - a note that goes with a card's answer (the plan gate's notes are the answers to its questions, and a
   Revise plans again with them), unless it starts with ``new:``: on the card it replies to, else on the
   newest card of the owner's own changes. A card the Workshop filed, and an idea card, takes a note only
@@ -147,7 +147,7 @@ def handle(
     command = COMMANDS.get(_command(text))
     if command == "pause":
         pipeline.pause(f"paused by {author or 'the owner'}")
-        return "Paused: no change starts unless you ask for it, and nothing ships without your tap. Say resume."
+        return "Paused: no change starts unless you ask for it, and every change shows you its pitch first. Say resume."
     if command == "resume":
         was = pipeline.resume()
         return "Resumed." if was else "The Workshop was not paused."
@@ -198,7 +198,9 @@ def handle(
         return f"The Workshop is paused ({exc})."
     if IDEAS.search(new):
         return "On it: thinking up ideas."
-    return "On it: planning that now. Small changes ship on their own with an Undo; bigger ones come back here first."
+    return (
+        "On it: planning that now. It ships on its own with an Undo; a pitch comes here first only when it's your call."
+    )
 
 
 def reply_worker(work_item: WorkItem) -> dict[str, Any]:

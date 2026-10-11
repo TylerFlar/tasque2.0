@@ -92,7 +92,7 @@ def workshop_status() -> None:
 
 @app.command("workshop-pause")
 def workshop_pause(reason: Annotated[str, typer.Argument(help="Why, shown in the status.")] = "paused by hand") -> None:
-    """Stop the Workshop starting changes on its own and shipping without a tap."""
+    """Stop the Workshop starting changes on its own; every change shows its pitch first."""
     from tasque2.workshop.pipeline import pause
 
     pause(reason)

@@ -1,7 +1,7 @@
 """The Workshop's eyes, end to end on fixture repositories: triage files its fixes as the Workshop's own changes
-(at most three open, never two on one file), those changes post only their cards and their "Live now" and tell
-the ledger how they ended, a card nobody answers expires, typed words find the card they mean, and idea cards
-build, rest or retire their ideas."""
+(at most three open, never two on one file), those changes ship quietly (a pitch only when it is the owner's
+call) and tell the ledger how they ended, a card nobody answers expires, typed words find the card they mean,
+and idea cards build, rest or retire their ideas."""
 
 from __future__ import annotations
 
@@ -15,6 +15,7 @@ from workshop_shop import THREAD, _gate, _out, _plan, _template_build, drive, op
 
 from tasque2.db import session_scope
 from tasque2.models import DiscordMessage, WorkflowNode, WorkflowRun, WorkItem, utc_now
+from tasque2.ops.release import find_plan, state
 from tasque2.workflows import WorkflowService
 from tasque2.workshop import ideas, ledger, pipeline, reply, triage
 from tasque2.workshop.ledger import Signal
@@ -123,25 +124,35 @@ def _filed(session, title: str = "Shorter cooking replies") -> WorkflowRun:
     return session.get(WorkflowRun, _out(session, run.id, "file")["filed"][0]["run_id"])
 
 
-def test_a_change_the_workshop_filed_waits_for_a_tap_and_posts_its_live_now(shop: dict[str, Any]) -> None:
+def test_a_change_the_workshop_filed_ships_quietly_and_undo_still_works(shop: dict[str, Any]) -> None:
     with session_scope() as session:
         change = _filed(session)
         drive(session, {"plan": _plan("Shorter cooking replies", "tweak", ["templates"]), "build": _template_build})
-        card = _gate(session, change.id).input["card"]
-        assert "The Workshop filed this itself: seen 3x" in card  # its own initiative: one tap
-        reply.handle(session, text="ship", thread_id=THREAD, author="owner", referenced=None)
-        drive(session, {})
+        assert _gate(session, change.id) is None  # nothing in it is the owner's call: no card
         report = _out(session, change.id, "report")
-        assert report["undo_release"] == change.input["change_id"] and not report.get("silent")
-        assert pipeline.report_text(session, session.get(WorkflowRun, change.id))[0].startswith("**Live now:")
+        assert report["silent"] is True and report["undo_release"] == change.input["change_id"]
+        plan = find_plan(change.input["change_id"])
+        assert plan.quiet is True and state(plan) == "live"
+        status = pipeline.status_text(session)
+        assert "Shorter cooking replies: live (the Workshop's own, shipped quietly)" in status
+        assert "The Workshop's own changes shipped today: 1/3" in status
         row = ledger.row(session, "warning:a")
         assert row.status == "done" and row.change_id == change.input["change_id"]
+        assert pipeline.undo_latest(session) == "Undone: Shorter cooking replies is reversed."
 
 
-def test_a_change_the_workshop_filed_ends_quietly_and_rests_its_rows(shop: dict[str, Any]) -> None:
+def test_a_change_the_workshop_filed_pitches_only_what_is_the_owners_call_and_rests_its_rows_when_dropped(
+    shop: dict[str, Any],
+) -> None:
+    question = [{"question": "Which greeting stays?", "default": "none"}]
     with session_scope() as session:
         dropped = _filed(session)
-        drive(session, {"plan": _plan("Shorter cooking replies", "tweak", ["templates"]), "build": _template_build})
+        drive(session, {"plan": _plan("Shorter cooking replies", "tweak", ["templates"], questions=question)})
+        card = _gate(session, dropped.id).input["card"]
+        assert card.startswith(
+            "**Workshop: Shorter cooking replies** (needs your OK: it has open questions; the Workshop filed it)"
+        )
+        assert "Why: you asked" in card  # the plan's own evidence, in its words
         reply.handle(session, text="discard", thread_id=THREAD, author="owner", referenced=None)
         drive(session, {})
         assert _out(session, dropped.id, "report")["silent"] is True
@@ -180,12 +191,14 @@ def test_a_card_nobody_answers_for_two_weeks_expires(shop: dict[str, Any]) -> No
 
 
 def test_typed_words_find_the_card_they_mean(shop: dict[str, Any]) -> None:
+    question = [{"question": "Which greeting stays?", "default": "none"}]
     with session_scope() as session:
         filed = _filed(session)
-        drive(session, {"plan": _plan("Shorter cooking replies", "tweak", ["templates"]), "build": _template_build})
+        drive(session, {"plan": _plan("Shorter cooking replies", "tweak", ["templates"], questions=question)})
         # a card the Workshop filed takes a note only as a reply: anything else is a new change
         assert reply.handle(session, text="make it warmer", thread_id=THREAD, author="owner", referenced=None) == (
-            "On it: planning that now. Small changes ship on their own with an Undo; bigger ones come back here first."
+            "On it: planning that now. It ships on its own with an Undo; a pitch comes here first only when it's "
+            "your call."
         )
         _card_message(session, filed, "card-1")
         assert reply.handle(
@@ -202,7 +215,7 @@ def test_typed_words_find_the_card_they_mean(shop: dict[str, Any]) -> None:
         assert reply.handle(session, text="Discard", thread_id=THREAD, author="owner", referenced="card-1") == (
             "Discard: Shorter cooking replies."
         )
-        notes = _out(session, filed.id, "ship_gate")["notes"]
+        notes = _out(session, filed.id, "plan_gate")["notes"]
         assert [note["text"] for note in notes] == ["keep the greeting"]
 
 

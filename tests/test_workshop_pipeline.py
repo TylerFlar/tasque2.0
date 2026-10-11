@@ -1,6 +1,8 @@
 """The Workshop end to end, on fixture repositories with scripted plan and build runs: a tweak ships on
-its own and undoes, a feature waits for one tap, a plan with questions waits for its OK, ideas end at the
-plan, a code change holds the code until it is live, and a cold release is announced and undone."""
+its own and undoes, a feature ships on its own and waits for a restart, a pitch waits for its OK and Approve
+ships it, a build that strays from its plan waits for a tap, ideas end at the plan, a code change holds the
+code until it is live, the Workshop's own changes ship quietly and three a day, and a cold release is
+announced and undone."""
 
 from __future__ import annotations
 
@@ -22,6 +24,7 @@ from workshop_shop import (
     _other_build,
     _out,
     _plan,
+    _self_build,
     _template_build,
     drive,
     open_shop,
@@ -84,37 +87,30 @@ def test_a_config_change_ships_when_the_live_config_moved_on_while_it_was_built(
     assert _git(shop["data"], "branch", "--list", "workshop/*") == ""
 
 
-def test_a_feature_waits_for_one_tap_and_a_code_change_waits_for_a_restart(shop: dict[str, Any]) -> None:
+def test_a_feature_ships_on_its_own_and_a_code_change_waits_for_a_restart(shop: dict[str, Any]) -> None:
     with session_scope() as session:
         run = pipeline.start_change(session, request="let the tool count to two", thread_id=THREAD)
         change_id = run.input["change_id"]
         drive(session, {"plan": _plan("Count to two", "feature", ["extension"]), "build": _extension_build})
-        gate = _gate(session, run.id)
-        assert gate.node_key == "ship_gate" and _out(session, run.id, "plan_gate")["skipped"]
-        card = gate.input["card"]
-        assert card.startswith("**Workshop: Count to two** (feature; needs your tap")
-        assert "ext1 2 files" in card and "Checks: core suite: 3 passed" in card and "rehearsal 2/2" in card
-        assert pipeline.code_holder(session) is None  # a card waiting for a tap holds up no other code change
-        assert reply.handle(session, text="nice", thread_id=THREAD, author="owner", referenced=None).startswith(
-            "Noted for Count to two"
-        )
-        assert reply.handle(session, text="Ship", thread_id=THREAD, author="owner", referenced=None) == (
-            "Ship: Count to two."
-        )
-        drive(session, {})
         run = session.get(WorkflowRun, run.id)
-        assert run.status == "completed" and _out(session, run.id, "ship_gate")["notes"][0]["text"] == "nice"
+        assert run.status == "completed"  # nothing in it is the owner's call: no card at all
+        assert _out(session, run.id, "plan_gate")["skipped"] and _out(session, run.id, "ship_gate")["skipped"]
+        verified = _out(session, run.id, "verify")
+        assert verified["tap"] is None and verified["checks"][0] == "core suite: 3 passed"
+        report = _out(session, run.id, "report")
+        assert report["silent"] is True and "undo_release" not in report  # announced once it is live, not before
         text, undo = pipeline.report_text(session, run)
-        assert text.startswith("**Ready: Count to two**") and "at the next idle moment" in text and undo is None
+        assert text.startswith("Queued: Count to two goes live when Tasque restarts") and undo is None
         request = read_request()
         assert request["switch"][0]["ref"] == f"workshop/{change_id}"
         assert request["release"].endswith(f"{change_id}.json")
-        assert pipeline.code_holder(session) == change_id  # taken again on Ship, until it is live
+        assert pipeline.code_holder(session) == change_id  # held from its build until it is live
         plan = find_plan(change_id)
-        assert plan.cold and plan.tier == "tap" and plan.thread_id == THREAD and plan.repos[0]["push"] is False
+        assert plan.cold and plan.tier == "auto" and plan.quiet is False and plan.thread_id == THREAD
+        assert plan.repos[0]["push"] is False
 
 
-def test_a_plan_with_questions_waits_for_its_ok_and_the_answers_reach_the_build(shop: dict[str, Any]) -> None:
+def test_a_pitch_waits_for_its_ok_and_approve_builds_and_ships_it(shop: dict[str, Any]) -> None:
     seen: dict[str, Any] = {}
 
     def build(item: WorkItem) -> dict[str, Any]:
@@ -126,27 +122,39 @@ def test_a_plan_with_questions_waits_for_its_ok_and_the_answers_reach_the_build(
         return _template_build(item)
 
     questions = [{"question": "How short?", "default": "two sentences"}]
+    pitch = "Cooking replies get shorter.\nYou decide how short."
+    files = ["data/" + TEMPLATE]
     with session_scope() as session:
         run = pipeline.start_change(session, request="rethink the cooking replies", thread_id=THREAD)
-        drive(session, {"plan": _plan("Cooking replies, rethought", "redesign", ["templates"], questions=questions)})
+        plan = _plan(
+            "Cooking replies, rethought", "redesign", ["templates"], questions=questions, pitch=pitch, files=files
+        )
+        drive(session, {"plan": plan})
         gate = _gate(session, run.id)
         assert gate.node_key == "plan_gate"
-        assert (
-            "**Workshop plan: Cooking replies, rethought** (redesign; needs your OK: it has open questions)"
-            in (gate.input["card"])
+        card = gate.input["card"]
+        assert card.startswith(
+            "**Workshop: Cooking replies, rethought** (needs your OK: it has open questions)\n\n"
+            "Cooking replies get shorter.\nYou decide how short.\n"
         )
-        assert "1. How short? _(default: two sentences)_" in gate.input["card"]
+        assert "1. How short? _(default: two sentences)_" in card and "Why: you asked" in card
+        assert "1. Cooking replies, rethought." not in card  # the plan itself is the build's, not the owner's
+        assert card.endswith(
+            "Approve builds and ships it, with an Undo. Revise plans it again with what you typed. Discard drops it."
+        )
         reply.handle(session, text="one sentence", thread_id=THREAD, author="owner", referenced=None)
         reply.handle(session, text="approve", thread_id=THREAD, author="owner", referenced=None)
         drive(session, {"build": build})
         assert seen["brief"]["answers"] == ["one sentence"] and seen["profile"] == "ultra"
-        assert _gate(session, run.id).node_key == "ship_gate"  # a plan still gets its one tap
-        reply.handle(session, text="discard", thread_id=THREAD, author="owner", referenced=None)
-        drive(session, {})
-        assert pipeline.report_text(session, session.get(WorkflowRun, run.id))[0] == (
-            "Dropped: Cooking replies, rethought. Nothing changed."
+        assert seen["brief"]["pitch"] == pitch and seen["brief"]["files"] == files
+        run = session.get(WorkflowRun, run.id)
+        assert run.status == "completed" and _out(session, run.id, "ship_gate")["skipped"]  # approved: no second tap
+        assert pipeline.report_text(session, run) == (
+            "**Live now: Cooking replies, rethought**\n- The cooking reply asks for shorter replies.\n"
+            "Tap Undo to reverse it.",
+            run.input["change_id"],
         )
-    assert (shop["data"] / TEMPLATE).read_text(encoding="utf-8") == "Reply.\n"
+    assert (shop["data"] / TEMPLATE).read_text(encoding="utf-8") == "Reply, briefly.\n"
     assert _git(shop["data"], "branch", "--list", "workshop/*") == ""
 
 
@@ -227,12 +235,23 @@ def test_a_code_change_waits_while_another_holds_the_code(shop: dict[str, Any]) 
         assert prepare.status == "succeeded" and pipeline.code_holder(session) == second.input["change_id"]
 
 
-def test_a_card_waiting_for_its_tap_holds_up_no_other_code_change(shop: dict[str, Any]) -> None:
+def test_a_build_that_strays_from_its_plan_waits_for_a_tap_and_holds_up_no_other_code_change(
+    shop: dict[str, Any],
+) -> None:
     ext = shop["project"] / "extensions" / "ext1"
     with session_scope() as session:
         first = pipeline.start_change(session, request="count to two", thread_id=THREAD)
-        drive(session, {"plan": _plan("Count to two", "feature", ["extension"]), "build": _extension_build})
-        assert _gate(session, first.id).node_key == "ship_gate" and pipeline.code_holder(session) is None
+        drive(session, {"plan": _plan("Count to two", "feature", ["extension"]), "build": _self_build})
+        gate = _gate(session, first.id)
+        assert gate.node_key == "ship_gate" and pipeline.code_holder(session) is None
+        assert gate.input["card"] == (
+            "**Workshop: Count to two** needs your tap: its plan did not say it touches the Workshop's safety net.\n"
+            "- The tool's value is 2.\n- The Workshop ships four a day.\n"
+            "Ship applies it when Tasque restarts next; Discard drops it. Anything you type goes with your answer."
+        )
+        assert reply.handle(session, text="nice", thread_id=THREAD, author="owner", referenced=None).startswith(
+            "Noted for Count to two"
+        )
         second = pipeline.start_change(session, request="fix the other value", thread_id=THREAD)
         drive(session, {"plan": _plan("The other value", "fix", ["extension"]), "build": _other_build})
         second_id = second.input["change_id"]
@@ -256,9 +275,8 @@ def test_a_card_waiting_for_its_tap_holds_up_no_other_code_change(shop: dict[str
         assert session.get(WorkflowRun, first.id).status == "completed"
         assert len(shop["suites"]) > checks  # checked again on the live code
         assert pipeline.code_holder(session) == first.input["change_id"]
-        assert pipeline.report_text(session, session.get(WorkflowRun, first.id))[0].startswith(
-            "**Ready: Count to two**"
-        )
+        assert _out(session, first.id, "ship_gate")["notes"][0]["text"] == "nice"
+        assert find_plan(first.input["change_id"]).tier == "plan"  # the record says what the diff really touched
     branch = f"workshop/{first.input['change_id']}"
     assert _git(ext, "show", f"{branch}:other.py") == "OTHER = 1"  # moved onto the live code
     assert _git(ext, "show", f"{branch}:tool.py") == "VALUE = 2"
@@ -269,8 +287,8 @@ def test_a_change_that_no_longer_applies_on_the_live_code_is_not_released(shop: 
     ext = shop["project"] / "extensions" / "ext1"
     with session_scope() as session:
         run = pipeline.start_change(session, request="count to two", thread_id=THREAD)
-        drive(session, {"plan": _plan("Count to two", "feature", ["extension"]), "build": _extension_build})
-        _commit(ext, "tool.py", "VALUE = 3\n", "changed live meanwhile")
+        drive(session, {"plan": _plan("Count to two", "feature", ["extension"]), "build": _self_build})
+        _commit(ext, "tool.py", "VALUE = 3\n", "changed live meanwhile")  # while its card waited
         reply.handle(session, text="ship", thread_id=THREAD, author="owner", referenced=None)
         drive(session, {})
         text = pipeline.report_text(session, session.get(WorkflowRun, run.id))[0]
@@ -284,8 +302,9 @@ def test_a_cold_release_is_announced_once_it_is_live_and_undone_by_a_revert_rele
         drive(session, {"plan": _plan("The tool's value", "fix", ["extension"]), "build": _extension_build})
         change_id = run.input["change_id"]
         assert session.get(WorkflowRun, run.id).status == "completed"  # a fix with a test ships on its own
+        assert _out(session, run.id, "report")["silent"] is True  # no "Ready": one "Live now" once it is
         plan = find_plan(change_id)
-        assert plan.tier == "auto"
+        assert plan.tier == "auto" and plan.quiet is False
     # what the respawn does: switch, record the outcome
     ext = shop["project"] / "extensions" / "ext1"
     before = _git(ext, "rev-parse", "HEAD")
@@ -452,3 +471,128 @@ def test_the_workshop_runs_read_their_checkout_and_build_inside_it(shop: dict[st
     assert nodes["plan_gate"]["skip_when"] == "classify.skip_plan_gate"
     assert nodes["ship_gate"]["skip_when"] == "verify.skip_ship_gate"
     assert "mcp__tasque2__memory_save" in nodes["build"]["runtime_contract"]["disallowed_tools"]
+
+
+def test_the_workshops_own_changes_ship_quietly_three_a_day_and_the_fourth_waits_for_tomorrow(
+    shop: dict[str, Any],
+) -> None:
+    from tasque2.localtime import next_local_midnight
+    from tasque2.ops.release import ReleasePlan, plan_path
+
+    for number in range(3):
+        outcome = {"ok": True, "kind": "hot", "at": utc_now().isoformat()}
+        save_plan(
+            ReleasePlan(
+                id=f"own{number}",
+                change_id=f"own{number}",
+                title=f"Own {number}",
+                origin="workshop",
+                quiet=True,
+                outcome=outcome,
+                released_at=outcome["at"],
+            )
+        )
+    with session_scope() as session:
+        assert pipeline.auto_today() == 3
+        run = pipeline.start_change(session, request="fix the other value", origin="workshop", thread_id=THREAD)
+        drive(session, {"plan": _plan("The other value", "fix", ["extension"]), "build": _other_build})
+        release = session.scalar(
+            select(WorkItem).where(WorkItem.workflow_run_id == run.id, WorkItem.worker_kind == pipeline.RELEASE_WORKER)
+        )
+        assert release.status == "ready" and release.not_before == next_local_midnight()
+        assert pipeline.code_holder(session) is None  # the code is free while it waits
+        assert "3 of the Workshop's own changes shipped today; it waits for tomorrow" in pipeline.status_text(session)
+        mine = pipeline.start_change(session, request="count to two", thread_id=THREAD)
+        drive(session, {"plan": _plan("Count to two", "feature", ["extension"]), "build": _extension_build})
+        assert session.get(WorkflowRun, mine.id).status == "completed"  # the owner's own asks never wait
+        assert reply.handle(session, text="undo", thread_id=THREAD, author="owner", referenced=None).startswith(
+            "Withdrawn: Count to two"
+        )
+        for number in range(3):  # the next day
+            plan_path(f"own{number}").unlink()
+        release.not_before = None
+        session.flush()
+        drive(session, {})
+        assert session.get(WorkflowRun, run.id).status == "completed"
+        assert pipeline.code_holder(session) == run.input["change_id"]
+        plan = find_plan(run.input["change_id"])
+        assert plan.quiet is True and state(plan) == "queued"
+        assert _out(session, run.id, "report")["silent"] is True
+
+
+def test_the_workshops_own_cold_releases_are_not_announced(shop: dict[str, Any]) -> None:
+    from tasque2.ops.release import ReleasePlan
+
+    save_plan(
+        ReleasePlan(
+            id="q1",
+            change_id="q1",
+            title="Quietly",
+            repos=[{"name": "ext1", "live": "x", "branch": "b", "base": "c"}],
+            outcome={"ok": True, "at": utc_now().isoformat()},
+            released_at=utc_now().isoformat(),
+            thread_id=THREAD,
+            origin="workshop",
+            quiet=True,
+        )
+    )
+    with session_scope() as session:
+        assert pipeline.announce_releases(session) == 0
+        assert find_plan("q1").announced is True
+        assert session.scalar(select(WorkItem).where(WorkItem.worker_kind == pipeline.ANNOUNCE_WORKER)) is None
+        assert "Quietly: live (the Workshop's own, shipped quietly)" in pipeline.status_text(session)
+
+
+def test_while_paused_every_change_shows_its_pitch_first_and_one_built_meanwhile_waits_for_a_tap(
+    shop: dict[str, Any],
+) -> None:
+    def build_while_paused(item: WorkItem) -> dict[str, Any]:
+        produced = _template_build(item)
+        pipeline.pause("paused by owner")
+        return produced
+
+    with session_scope() as session:
+        built = pipeline.start_change(session, request="make cooking replies shorter", thread_id=THREAD)
+        drive(session, {"plan": _plan("Shorter cooking replies", "tweak", ["templates"]), "build": build_while_paused})
+        gate = _gate(session, built.id)
+        assert gate.node_key == "ship_gate"
+        assert gate.input["card"] == (
+            "**Workshop: Shorter cooking replies** needs your tap: you paused the Workshop while it was built.\n"
+            "- The cooking reply asks for shorter replies.\n"
+            "Ship applies it at once; Discard drops it. Anything you type goes with your answer."
+        )
+        later = pipeline.start_change(session, request="count to two", thread_id=THREAD)
+        assert later.input["paused"] is True
+        drive(session, {"plan": _plan("Count to two", "feature", ["extension"], pitch="The tool counts to two.")})
+        gate = _gate(session, later.id)
+        assert gate.node_key == "plan_gate"
+        assert gate.input["card"].startswith(
+            "**Workshop: Count to two** (needs your OK: the Workshop is paused)\n\nThe tool counts to two.\n"
+        )
+        assert pipeline.resume()
+        WorkflowService(session).answer_gate(workflow_run_id=later.id, node_key="plan_gate", answer="Approve")
+        drive(session, {"build": _extension_build})
+        assert session.get(WorkflowRun, later.id).status == "completed"  # approved: no second tap
+        assert reply.handle(session, text="ship", thread_id=THREAD, author="owner", referenced=None) == (
+            "Ship: Shorter cooking replies."
+        )
+        drive(session, {})
+        text, release_id = pipeline.report_text(session, session.get(WorkflowRun, built.id))
+        assert text.startswith("**Live now: Shorter cooking replies**") and release_id == built.input["change_id"]
+
+
+def test_a_fix_that_changes_code_without_a_test_is_not_shipped(shop: dict[str, Any]) -> None:
+    def untested_fix(item: WorkItem) -> dict[str, Any]:
+        _commit(Path(item.context["cwd"]) / "extensions" / "ext1", "tool.py", "VALUE = 2\n")
+        return {"done": True, "changes": ["The tool's value is 2."]}
+
+    with session_scope() as session:
+        run = pipeline.start_change(session, request="fix the tool's value", thread_id=THREAD)
+        drive(session, {"plan": _plan("The tool's value", "fix", ["extension"]), "build": untested_fix})
+        text = pipeline.report_text(session, session.get(WorkflowRun, run.id))[0]
+        assert text.startswith(
+            "Not shipped: The tool's value.\n- a fix that changes code needs a test that reproduces it"
+        )
+        assert _out(session, run.id, "report").get("silent") is None  # the owner's ask: they hear it
+        assert shop["suites"] == []  # it fails before the suites run
+        assert pipeline.code_holder(session) is None and history() == []
