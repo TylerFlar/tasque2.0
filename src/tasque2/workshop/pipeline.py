@@ -11,11 +11,13 @@ its own worktrees (``tasque2.ops.worktree``: the core, each extension, and the c
    a batch of ideas, evidence that no longer holds) ends here with its answer;
 2. ``classify`` (no model): the tier from ``tasque2.workshop.policy``, never from the model: a pitch to
    approve first, or shipping on its own;
-3. ``plan_gate``: Approve, Revise or Discard, only for a change whose pitch needs approving;
-4. ``prepare`` (no model): Revise starts the change again with the notes typed at the gate, Discard
-   ends it; otherwise the worktrees move to the live heads and a change that edits code takes the code
-   lock (one code change at a time, from its build until it is live, freed while it waits for a tap or
-   for the next day; taken with a commit, so no write stays open through the slow work after it);
+3. ``plan_gate``: Approve, Revise or Discard, only for a change whose pitch needs approving. Revise opens a
+   text box for what should change;
+4. ``prepare`` (no model): Revise sends the same change back to ``plan`` (the workflow's ``rewind_to``)
+   with the notes typed at the gate and the plan just shown, the worktrees moved to the live heads first;
+   Discard ends it; otherwise the worktrees move to the live heads and a change that edits code takes the
+   code lock (one code change at a time, from its build until it is live, freed while it waits for a tap
+   or for the next day; taken with a commit, so no write stays open through the slow work after it);
 5. ``build`` (a model run in the worktrees): a failing test first for a bug, the change, commits;
 6. ``verify`` (no model, ``tasque2.workshop.verify``): the suites, ruff, the privacy and secret scans, a
    rehearsal on a copy of the live database, and whether the build needs one tap after all (it touches
@@ -66,6 +68,7 @@ ANNOUNCE_WORKER = "function.workshop_announce"
 REPLY_WORKER = "function.workshop_reply"
 LANE, PLAN_LANE, BUILD_LANE = "workshop", "workshop-plan", "workshop-build"
 APPROVE, REVISE, DISCARD, SHIP = "Approve", "Revise", "Discard", "Ship"
+REVISE_NOTE = "What should change?"  # the label of the text box Revise opens
 OPEN_RUN_STATUSES = ("pending", "active", "awaiting_input", "paused")
 TOUCHES = (
     "core",
@@ -298,11 +301,12 @@ def definition() -> dict[str, Any]:
                 "kind": "gate",
                 "prompt": "Build this plan?",
                 "choices": [APPROVE, REVISE, DISCARD],
+                "ask_note": {REVISE: REVISE_NOTE},
                 "card_from": "classify.card",
                 "skip_when": "classify.skip_plan_gate",
                 "depends_on": ["classify"],
             },
-            step("prepare", "Workshop: prepare the build", PREPARE_WORKER, "plan_gate"),
+            {**step("prepare", "Workshop: prepare the build", PREPARE_WORKER, "plan_gate"), "rewind_to": "plan"},
             build,
             step("verify", "Workshop: verify the change", VERIFY_WORKER, "build"),
             {
@@ -511,7 +515,7 @@ def plan_card(
         lines += ["", "Why: " + "; ".join(evidence)]
     lines += [
         "",
-        "Approve builds and ships it, with an Undo. Revise plans it again with what you typed. Discard drops it.",
+        "Approve builds and ships it, with an Undo. Revise asks what to change and plans it again. Discard drops it.",
     ]
     return "\n".join(lines)
 
@@ -577,7 +581,9 @@ def refresh_worktrees(run: WorkflowRun) -> list[Any]:
 
 
 def prepare_worker(work_item: WorkItem) -> dict[str, Any]:
-    """``function.workshop_prepare``: carry out the plan gate's answer, and get the worktrees ready."""
+    """``function.workshop_prepare``: carry out the plan gate's answer, and get the worktrees ready. Revise
+    sends the run back to its plan (``rewind_to``): the same change, worktrees and ledger rows, planned again
+    with the gate's notes and the plan just shown."""
     from tasque2.work.runner import WorkDeferred
 
     session, run = _run(work_item)
@@ -598,22 +604,13 @@ def prepare_worker(work_item: WorkItem) -> dict[str, Any]:
         return stop("expired" if gate.get("expired") else "discarded")
     if answer == REVISE:
         plan = node_output(session, run.id, "plan")
-        cleanup(session, run)
-        again = start_change(
-            session,
-            request=str(given.get("request") or ""),
-            origin=str(given.get("origin") or "user"),
-            thread_id=run.discord_thread_id,
-            author=given.get("author"),
-            revision_of=run.id,
-            notes=[*(given.get("notes") or []), *notes],
-            previous_plan=str(plan.get("plan") or ""),
-            evidence=given.get("evidence"),
-            files=given.get("files"),
-            issues=given.get("issues"),
-        )
-        _refile(session, run, again)
-        return stop("revised", revision_run_id=again.id)
+        run.input = {
+            **given,
+            "notes": [*(given.get("notes") or []), *notes],
+            "previous_plan": str(plan.get("plan") or ""),
+        }
+        refresh_worktrees(run)
+        return stop("revised", rewind=True)
     change_id = str(given.get("change_id"))
     if classify.get("needs_code"):
         holder = code_holder(session)
@@ -796,8 +793,6 @@ def report_text(session: Session, run: WorkflowRun) -> tuple[str, str | None]:
         return f"Dropped: {title}. Nothing changed.", None
     if prepare.get("why") == "expired":
         return f"Expired: {title} waited {CARD_EXPIRES.days} days for your OK. Nothing changed; say redo for it.", None
-    if prepare.get("why") == "revised":
-        return f"Planning {title} again with your notes.", None
     verified = node_output(session, run.id, "verify")
     if verified.get("stop"):
         reasons = "\n".join(_lines(verified.get("reasons") or ["it did not pass its checks"], 5))
@@ -856,7 +851,7 @@ def report_worker(work_item: WorkItem) -> dict[str, Any]:
     if release_id:
         produced["undo_release"] = release_id
     given = run.input or {}
-    if given.get("origin") == "workshop" and node_output(session, run.id, "prepare").get("why") != "revised":
+    if given.get("origin") == "workshop":
         ledger.settle(session, str(given.get("change_id")), outcome(session, run))
     if not _posted(session, run, release_id):
         produced["silent"] = True
@@ -1066,16 +1061,6 @@ def redo(session: Session, *, thread_id: str | None, author: str | None = None) 
             evidence=given.get("evidence"),
         )
     return None
-
-
-def _refile(session: Session, run: WorkflowRun, again: WorkflowRun) -> None:
-    """The ledger rows a change the Workshop filed answers go with the change planned again in its place
-    (a Revise)."""
-    given = run.input or {}
-    if given.get("origin") == "workshop" and given.get("issues"):
-        ledger.refile(
-            session, str(given.get("change_id")), new_change_id=str(again.input["change_id"]), run_id=again.id
-        )
 
 
 STAGES = (

@@ -19,8 +19,9 @@ from tasque2.discord import bot as bot_module
 from tasque2.discord.bot import TasqueBot, _referenced_message_id, _waiting_on, discord_configured, output_channels
 from tasque2.discord.output import OutputChannels
 from tasque2.discord.routing import DiscordRouteResult, DiscordService
-from tasque2.models import DiscordMessage, WorkItem
+from tasque2.models import DiscordMessage, WorkflowNode, WorkItem
 from tasque2.work.repository import WorkRepository
+from tasque2.workflows import WorkflowService
 
 CHANNEL_IDS = {
     "discord_intake_channel_id": "100",
@@ -411,6 +412,132 @@ def test_on_message_refuses_an_oversized_attachment_in_the_channel() -> None:
 
     assert seen["routes"] == []
     assert channel.sent == ["Attachment 'scan.pdf' is 20 bytes; the limit is 10 bytes."]
+
+
+# --- gate buttons -------------------------------------------------------------------------------------------
+
+
+class _Response:
+    """How a handler answered an interaction: a box opened, a deferral, or a message."""
+
+    def __init__(self) -> None:
+        self.modal: Any = None
+        self.deferred = False
+        self.sent: list[str] = []
+
+    def is_done(self) -> bool:
+        return self.modal is not None or self.deferred or bool(self.sent)
+
+    async def send_modal(self, modal: Any) -> None:
+        self.modal = modal
+
+    async def defer(self, *, ephemeral: bool = False) -> None:
+        self.deferred = True
+
+    async def send_message(self, content: str, *, ephemeral: bool = False) -> None:
+        self.sent.append(content)
+
+
+class _Card:
+    """A gate card as Discord holds it: its text, and each edit made to it."""
+
+    def __init__(self, content: str) -> None:
+        self.content = content
+        self.edits: list[tuple[str, Any]] = []
+
+    async def edit(self, *, content: str, view: Any) -> None:
+        self.content = content
+        self.edits.append((content, view))
+
+
+def _interaction(custom_id: str, card: _Card | None = None) -> SimpleNamespace:
+    followups: list[tuple[str, bool]] = []
+
+    async def send(*, content: str, ephemeral: bool = False) -> None:
+        followups.append((content, ephemeral))
+
+    return SimpleNamespace(
+        data={"custom_id": custom_id},
+        user=_Author(),
+        message=card,
+        response=_Response(),
+        followup=SimpleNamespace(send=send, sent=followups),
+    )
+
+
+def _plan_gate(name: str) -> str:
+    """A run waiting at a plan gate whose Revise asks for a note; returns its id."""
+    gate = {
+        "key": "plan_gate",
+        "kind": "gate",
+        "prompt": "Build this plan?",
+        "choices": ["Approve", "Revise", "Discard"],
+        "ask_note": {"Revise": "What should change?"},
+    }
+    with session_scope() as session:
+        workflows = WorkflowService(session)
+        definition = workflows.create_definition(name=name, version="1", definition={"nodes": [gate]})
+        run = workflows.start_run(workflow_definition_id=definition.id)
+        workflows.tick_runs()
+        return run.id
+
+
+def _gate(run_id: str) -> dict[str, Any]:
+    with session_scope() as session:
+        node = session.scalar(select(WorkflowNode).where(WorkflowNode.workflow_run_id == run_id))
+        return {"status": node.status, **node.output}
+
+
+def test_a_gate_button_answers_at_once(fresh_db: Path) -> None:
+    run_id = _plan_gate("tapped")
+    card = _Card("**Workshop: A pantry view**")
+    tap = _interaction(f"t2:gate:0:{run_id}", card)
+
+    asyncio.run(TasqueBot(_settings()).on_interaction(tap))
+
+    assert tap.response.modal is None and tap.response.deferred
+    assert card.edits == [("**Workshop: A pantry view**\n\n**Chosen: Approve**", None)]
+    assert tap.followup.sent == [("Chosen: Approve", True)]
+    assert _gate(run_id) == {"status": "succeeded", "answer": "Approve"}
+
+
+def test_revise_opens_a_box_whose_note_goes_with_the_answer(fresh_db: Path) -> None:
+    run_id = _plan_gate("revised")
+    card = _Card("**Workshop: A pantry view**\n" + "A line of the pitch, as long as cards get.\n" * 45)
+    press = _interaction(f"t2:gate:1:{run_id}", card)
+    bot = TasqueBot(_settings())
+    note = "In the Daybook,\nwith a weekly list"
+
+    async def main() -> None:
+        await bot.on_interaction(press)
+        modal = press.response.modal
+        assert isinstance(modal, bot_module._GateNoteModal) and modal.title == "Revise"
+        [row] = modal.to_components()
+        [box] = row["components"]
+        assert {key: box[key] for key in ("style", "label", "required", "placeholder", "max_length")} == {
+            "style": discord.TextStyle.paragraph.value,
+            "label": "What should change?",
+            "required": True,
+            "placeholder": "Anything you typed in the thread goes too",
+            "max_length": 4000,
+        }
+        assert card.edits == [] and _gate(run_id)["status"] == "awaiting_input"  # closing the box changes nothing
+        submit = _interaction(modal.custom_id)
+        await bot.on_interaction(submit)
+        assert not submit.response.is_done()  # the box's own submit is left to it
+        typed = [{"type": 1, "components": [{"type": 4, "custom_id": box["custom_id"], "value": note}]}]
+        await modal._scheduled_task(submit, typed, {})
+        assert submit.response.deferred and submit.followup.sent == [("Chosen: Revise", True)]
+
+    asyncio.run(main())
+
+    [(edited, view)] = card.edits
+    assert view is None and len(edited) == 2000  # the card's own text gives way, never the choice
+    assert edited.startswith("**Workshop: A pantry view**\nA line of the pitch")
+    assert edited.endswith("\n\n**Chosen: Revise**\n> In the Daybook, with a weekly list")
+    answered = _gate(run_id)
+    assert answered["answer"] == "Revise"
+    assert [(item["author"], item["text"]) for item in answered["notes"]] == [("user#0001", note)]
 
 
 def test_referenced_message_id_reads_the_reply_reference() -> None:

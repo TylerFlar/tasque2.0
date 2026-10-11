@@ -18,7 +18,7 @@ from tasque2.models import WorkEvent, WorkflowDefinition, WorkflowNode, Workflow
 from tasque2.templates import read_template_file, resolve_template_path
 from tasque2.work.queue import WorkQueue
 from tasque2.work.runner import WorkRunner
-from tasque2.workflows import WorkflowService, parse_definition_file, validate_definition
+from tasque2.workflows import REWIND_ROUNDS_MAX, WorkflowService, parse_definition_file, validate_definition
 
 
 def _node(session: Session, run_id: str, key: str) -> WorkflowNode:
@@ -793,6 +793,115 @@ def test_a_tolerated_fan_out_failure_does_not_block_the_merge(fresh_db: Path) ->
         assert session.get(WorkflowRun, run.id).status == "completed"
 
 
+def _says(session: Session, run_id: str, key: str, produces: dict[str, Any]) -> None:
+    """What the node's finished work said, in place of its worker's own output."""
+    _node(session, run_id, key).work_item.attempts[-1].produces = produces
+    session.flush()
+
+
+def test_a_rewind_sends_the_run_back_to_an_earlier_node_for_another_round(fresh_db: Path) -> None:
+    nodes = [
+        {"key": "first", "worker_kind": "function.echo"},
+        {"key": "plan", "worker_kind": "function.echo", "depends_on": ["first"]},
+        {"key": "side", "worker_kind": "manual", "depends_on": ["plan"]},
+        {"key": "check", "worker_kind": "function.echo", "depends_on": ["plan"], "rewind_to": "plan", "priority": 1},
+        {"key": "last", "worker_kind": "function.echo", "depends_on": ["check", "side"]},
+    ]
+    with session_scope() as session:
+        service, run = _start(session, "rounds", nodes)
+        for _ in range(3):  # first, plan, then check (ahead of side)
+            service.tick_runs()
+            WorkRunner(session).run_next()
+        first, plan, side = (_node(session, run.id, key).work_item for key in ("first", "plan", "side"))
+        _says(session, run.id, "check", {"rewind": True})
+        service.tick_runs()
+
+        assert run.status == "active" and run.state == {"round": 1}
+        assert _node(session, run.id, "first").work_item_id == first.id  # what came before stays done
+        again = _node(session, run.id, "plan")
+        assert again.status == "enqueued" and again.work_item.idempotency_key == f"workflow:{run.id}:plan:1"
+        assert plan.status == "succeeded" and side.status == "canceled"  # unfinished work after it is canceled
+        for key in ("side", "check", "last"):
+            node = _node(session, run.id, key)
+            assert (node.status, node.work_item, node.input, node.output) == ("pending", None, {}, {})
+        rewound = session.scalar(
+            select(WorkEvent).where(WorkEvent.workflow_run_id == run.id, WorkEvent.event_type == "workflow.run_rewound")
+        )
+        assert rewound.payload == {"node_key": "check", "to": "plan", "round": 1}
+
+        for _ in range(4):  # plan, check (no rewind this time), side, last
+            WorkRunner(session).run_next()
+            service.tick_runs()
+        assert (
+            run.status == "completed"
+            and run.state["round"] == 1
+            and set(run.state["outputs"])
+            == {
+                "first",
+                "plan",
+                "side",
+                "check",
+                "last",
+            }
+        )
+        keys = sorted(work.idempotency_key.removeprefix(f"workflow:{run.id}:") for work in _run_work(session, run.id))
+        assert keys == ["check", "check:1", "first", "last:1", "plan", "plan:1", "side", "side:1"]
+
+
+def test_a_rewind_that_takes_back_a_waiting_gate_leaves_the_run_active(fresh_db: Path) -> None:
+    nodes = [
+        {"key": "plan", "worker_kind": "function.echo"},
+        {"key": "ask", "kind": "gate", "choices": ["Yes", "No"], "depends_on": ["plan"]},
+        {"key": "check", "worker_kind": "function.echo", "depends_on": ["plan"], "rewind_to": "plan"},
+    ]
+    with session_scope() as session:
+        service, run = _start(session, "gated-rounds", nodes)
+        service.tick_runs()
+        WorkRunner(session).run_next()
+        service.tick_runs()  # the gate waits, and check is queued beside it
+        assert (run.status, _node(session, run.id, "ask").status) == ("awaiting_input", "awaiting_input")
+        WorkRunner(session).run_next()
+        _says(session, run.id, "check", {"rewind": True})
+        service.tick_runs()
+
+        assert run.status == "active" and _node(session, run.id, "ask").status == "pending"
+        assert _node(session, run.id, "plan").status == "enqueued"
+
+
+def test_a_rewind_is_refused_past_its_rounds_or_across_a_fan_out(fresh_db: Path) -> None:
+    looping = [
+        {"key": "plan", "worker_kind": "function.echo"},
+        {"key": "check", "worker_kind": "function.echo", "depends_on": ["plan"], "rewind_to": "plan"},
+    ]
+    fanned = [
+        {"key": "plan", "worker_kind": "function.echo"},
+        {"key": "fan", "kind": "fan_out", "items": ["a"], "child_worker_kind": "function.echo", "depends_on": ["plan"]},
+        {"key": "check", "worker_kind": "function.echo", "depends_on": ["fan"], "rewind_to": "plan"},
+    ]
+    with session_scope() as session:
+        service, worn = _start(session, "worn", looping)
+        worn.state = {"round": REWIND_ROUNDS_MAX}
+        for _ in range(2):  # plan, check
+            service.tick_runs()
+            WorkRunner(session).run_next()
+        _says(session, worn.id, "check", {"rewind": True})
+        service.tick_runs()
+        check = _node(session, worn.id, "check")
+        assert (worn.status, check.status) == ("failed", "failed")
+        assert check.failure_reason == "Cannot rewind to plan: the run already went round 20 times."
+
+        _, fan = _start(session, "fanned", fanned)
+        for _ in range(4):  # plan, the fan-out, its child, check
+            service.tick_runs()
+            WorkRunner(session).run_next()
+        _says(session, fan.id, "check", {"rewind": True})
+        service.tick_runs()
+        check = _node(session, fan.id, "check")
+        assert (fan.status, check.status) == ("failed", "failed")
+        assert check.failure_reason == "Cannot rewind to plan: a fan-out's children come after it."
+        assert _node(session, fan.id, "plan").status == "succeeded" and fan.state == {}
+
+
 def test_create_definition_replaces_the_same_name_and_version(fresh_db: Path) -> None:
     with session_scope() as session:
         service = WorkflowService(session)
@@ -821,6 +930,17 @@ def test_create_definition_replaces_the_same_name_and_version(fresh_db: Path) ->
         ({"nodes": [{"key": "a"}, {"key": "a"}]}, "Duplicate workflow node key: a"),
         ({"nodes": [{"key": "a", "kind": "loop"}]}, "Unsupported workflow node kind: loop"),
         ({"nodes": [{"key": "a", "depends_on": ["b"]}]}, "Unknown workflow dependency: b"),
+        ({"nodes": [{"key": "a"}, {"key": "b", "rewind_to": "a"}]}, "b: rewind_to must name a node it depends on"),
+        (
+            {"nodes": [{"key": "a"}, {"key": "b", "kind": "gate", "depends_on": ["a"], "rewind_to": "a"}]},
+            "only a work node rewinds",
+        ),
+        (
+            {"nodes": [{"key": "g", "kind": "gate", "choices": ["Yes", "No"], "ask_note": {"Maybe": "Why?"}}]},
+            "ask_note",
+        ),
+        ({"nodes": [{"key": "g", "kind": "gate", "choices": ["Yes", "No"], "ask_note": {"No": "x" * 46}}]}, "ask_note"),
+        ({"nodes": [{"key": "g", "kind": "gate", "ask_note": {"No": "Why?"}}]}, "ask_note"),
     ],
 )
 def test_validate_definition_rejects_malformed_definitions(definition: dict[str, Any], message: str) -> None:

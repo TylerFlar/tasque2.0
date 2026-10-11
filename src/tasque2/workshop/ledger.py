@@ -230,14 +230,6 @@ def settle(session: Session, change_id: str, outcome: str, *, now: datetime | No
     return settled
 
 
-def refile(session: Session, change_id: str, *, new_change_id: str, run_id: str) -> None:
-    """A change planned again (Revise, redo) answers the same rows under its new id."""
-    statement = select(WorkshopIssue).where(WorkshopIssue.change_id == change_id)
-    for found in session.scalars(statement).all():
-        found.status, found.change_id, found.workflow_run_id = FILED, new_change_id, run_id
-    session.flush()
-
-
 def counts(session: Session) -> dict[str, int]:
     statement = (
         select(WorkshopIssue.status, func.count()).where(WorkshopIssue.kind == ISSUE).group_by(WorkshopIssue.status)

@@ -5,6 +5,11 @@ materializes its nodes and edges; each daemon tick advances runs by enqueuing wo
 nodes whose dependencies are satisfied and folding finished work back into node state.
 Node templates are read from disk when the node is enqueued, so edits to a template take
 effect on the next run without re-registering the definition.
+
+A gate's choice may ask for a note (``ask_note``: the choice and its text box's label); the note goes
+with the answer. A work node that names an earlier node (``rewind_to``) and finishes with
+``rewind: true`` sends its run back there for another round: that node and every node after it
+start over, up to ``REWIND_ROUNDS_MAX`` rounds a run.
 """
 
 from __future__ import annotations
@@ -45,6 +50,8 @@ COMPLETED_NODE_STATUSES = {"succeeded", "failed_tolerated"}
 NODE_KINDS = {"work", "fan_out", "join", "gate"}
 GATE_CHOICES_MAX = 5  # one Discord row of buttons
 GATE_CHOICE_CHARS = 80  # a Discord button label
+NOTE_LABEL_CHARS = 45  # a Discord text box label
+REWIND_ROUNDS_MAX = 20
 _TEMPLATE_KEYS = (
     ("task_template_path", "task_instruction"),
     ("child_task_template_path", "child_task_instruction_template"),
@@ -296,6 +303,9 @@ class WorkflowService:
                     entity=("workflow_node", node.id),
                     summary=f"Workflow node succeeded: {node.node_key}",
                 )
+                if (node.definition or {}).get("rewind_to") and node.output.get("rewind"):
+                    self._rewind(run, node)
+                    return  # the rest of the run is synced on the next tick
             elif work_item.status in {"dead_letter", "canceled"}:
                 if work_item.status == "dead_letter" and (node.definition or {}).get("tolerate_failure"):
                     node.status = "failed_tolerated"
@@ -315,6 +325,65 @@ class WorkflowService:
                     summary=summary,
                     payload={"node_key": node.node_key, "work_item_id": work_item.id},
                 )
+
+    def _rewind(self, run: WorkflowRun, node: WorkflowNode) -> None:
+        """Send the run back to ``node``'s ``rewind_to`` for another round: that node and every node after it
+        go back to pending, their unfinished work canceled. Past ``REWIND_ROUNDS_MAX`` rounds, or across a
+        fan-out's children, ``node`` fails instead."""
+        target_key = str(node.definition["rewind_to"])
+        nodes = {each.id: each for each in self._nodes(run.id)}
+        target = next((each for each in nodes.values() if each.node_key == target_key), None)
+        again = self._from(target) if target is not None else set()
+        round_ = run_round(run) + 1
+        reason = None
+        if node.id not in again:
+            reason = f"Cannot rewind to {target_key}: it is not before {node.node_key}."
+        elif any(nodes[node_id].parent_node_id for node_id in again):
+            reason = f"Cannot rewind to {target_key}: a fan-out's children come after it."
+        elif round_ > REWIND_ROUNDS_MAX:
+            reason = f"Cannot rewind to {target_key}: the run already went round {REWIND_ROUNDS_MAX} times."
+        if reason:
+            node.status, node.failure_reason = "failed", reason
+            self._event(
+                "workflow.node_failed",
+                run,
+                entity=("workflow_node", node.id),
+                summary=reason,
+                payload={"node_key": node.node_key},
+            )
+            return
+        queue = WorkQueue(self.session)
+        for node_id in again:
+            each = nodes[node_id]
+            if each.work_item is not None and each.work_item.status not in TERMINAL_WORK_STATUSES:
+                queue.request_cancel(each.work_item.id)
+            each.status, each.input, each.output, each.failure_reason = "pending", {}, {}, None
+            each.work_item = None
+        run.state = {**(run.state or {}), "round": round_}
+        self.session.flush()  # a gate it took back no longer waits
+        run.status = "awaiting_input" if self._awaiting_gate(run.id) is not None else "active"
+        self._event(
+            "workflow.run_rewound",
+            run,
+            summary=f"Workflow run rewound to {target_key} (round {round_})",
+            payload={"node_key": node.node_key, "to": target_key, "round": round_},
+        )
+
+    def _from(self, start: WorkflowNode) -> set[str]:
+        """The ids of ``start`` and every node after it, by the run's edges."""
+        after: dict[str, list[str]] = {}
+        for edge in self.session.scalars(
+            select(WorkflowEdge).where(WorkflowEdge.workflow_run_id == start.workflow_run_id)
+        ).all():
+            after.setdefault(edge.from_node_id, []).append(edge.to_node_id)
+        found: set[str] = set()
+        waiting = [start.id]
+        while waiting:
+            node_id = waiting.pop()
+            if node_id not in found:
+                found.add(node_id)
+                waiting.extend(after.get(node_id, []))
+        return found
 
     def _start_ready_nodes(self, run: WorkflowRun) -> None:
         pending = self.session.scalars(
@@ -403,6 +472,8 @@ class WorkflowService:
             value = self._output_reference(run, reference)
             if value not in (None, ""):
                 contract[str(key)] = value
+        # Each round of a run that went back (``rewind_to``) queues its own work; the first keeps its old key.
+        round_ = run_round(run)
         work_item = WorkRepository(self.session).create_work_item(
             title=str(node_def.get("title", node.node_key)),
             task_instruction=node_instruction(node_def) or node.node_key,
@@ -413,7 +484,7 @@ class WorkflowService:
             priority=int(node_def.get("priority", 0)),
             max_attempts=int(node_def.get("max_attempts", 1)),
             deadline_at=_node_deadline(node_def),
-            idempotency_key=f"workflow:{run.id}:{node.node_key}",
+            idempotency_key=f"workflow:{run.id}:{node.node_key}" + (f":{round_}" if round_ else ""),
             source_kind="workflow",
             source_id=run.id,
             workflow_run_id=run.id,
@@ -422,7 +493,7 @@ class WorkflowService:
             lane=str(node_def.get("lane") or run.input.get("lane") or run.definition.name),
             traceparent=run.traceparent,
         )
-        node.work_item_id = work_item.id
+        node.work_item = work_item
         node.status = "enqueued"
         self.session.flush()
         self._event(
@@ -547,7 +618,7 @@ class WorkflowService:
             run.status = "failed"
         elif all(node.status in COMPLETED_NODE_STATUSES for node in nodes):
             run.status = "completed"
-            run.state = {"outputs": {node.node_key: node.output for node in nodes}}
+            run.state = {**(run.state or {}), "outputs": {node.node_key: node.output for node in nodes}}
         else:
             return
         run.ended_at = utc_now()
@@ -672,16 +743,55 @@ def validate_definition(definition: dict[str, Any]) -> None:
             raise ValueError(
                 f"Gate {key}: choices must be 2-{GATE_CHOICES_MAX} labels of {GATE_CHOICE_CHARS} characters or fewer."
             )
+        if "ask_note" in node and not _valid_ask_note(kind, node.get("choices"), node["ask_note"]):
+            raise ValueError(
+                f"Gate {key}: ask_note maps some of its choices to a text box label of 1-{NOTE_LABEL_CHARS} characters."
+            )
     for node in nodes:
         for dependency in node.get("depends_on", []):
             if str(dependency) not in keys:
                 raise ValueError(f"Unknown workflow dependency: {dependency}")
+    for node in nodes:
+        if "rewind_to" in node and (
+            str(node.get("kind", "work")) != "work" or str(node["rewind_to"]) not in _before(nodes, str(node["key"]))
+        ):
+            raise ValueError(
+                f"Node {node['key']}: rewind_to must name a node it depends on, directly or not; only a work node "
+                "rewinds."
+            )
 
 
 def _valid_choices(kind: str, choices: Any) -> bool:
     if kind != "gate" or not isinstance(choices, list) or not 2 <= len(choices) <= GATE_CHOICES_MAX:
         return False
     return all(isinstance(choice, str) and 0 < len(choice.strip()) <= GATE_CHOICE_CHARS for choice in choices)
+
+
+def _valid_ask_note(kind: str, choices: Any, ask_note: Any) -> bool:
+    if kind != "gate" or not isinstance(choices, list) or not isinstance(ask_note, dict) or not ask_note:
+        return False
+    return all(
+        choice in choices and isinstance(label, str) and 0 < len(label.strip()) <= NOTE_LABEL_CHARS
+        for choice, label in ask_note.items()
+    )
+
+
+def _before(nodes: list[dict[str, Any]], key: str) -> set[str]:
+    """The keys of every node ``key`` depends on, directly or not."""
+    depends = {str(node["key"]): [str(dependency) for dependency in node.get("depends_on", [])] for node in nodes}
+    found: set[str] = set()
+    waiting = list(depends.get(key, []))
+    while waiting:
+        current = waiting.pop()
+        if current not in found:
+            found.add(current)
+            waiting.extend(depends.get(current, []))
+    return found
+
+
+def run_round(run: WorkflowRun) -> int:
+    """How many times the run went back for another round (``rewind_to``): 0 on its first."""
+    return int((run.state or {}).get("round") or 0)
 
 
 def node_instruction(

@@ -838,6 +838,45 @@ def test_canceled_workflow_with_visible_work_posts_canceled(fresh_db: Path) -> N
         assert gateway.sent_messages[-1][1] == "Canceled."
 
 
+def test_a_gate_the_run_went_back_to_posts_a_fresh_card_once(fresh_db: Path) -> None:
+    nodes = [
+        {"key": "plan", "worker_kind": "function.echo"},
+        {
+            "key": "approve",
+            "kind": "gate",
+            "prompt": "Build it?",
+            "choices": ["Build", "Again"],
+            "depends_on": ["plan"],
+        },
+        {"key": "prepare", "worker_kind": "function.echo", "depends_on": ["approve"], "rewind_to": "plan"},
+    ]
+    gateway = FakeDiscordGateway()
+    with session_scope() as session:
+        workflows = WorkflowService(session)
+        definition = workflows.create_definition(name="rounds", version="1", definition={"nodes": nodes})
+        run = workflows.start_run(workflow_definition_id=definition.id, discord_thread_id="thread-rounds")
+        workflows.tick_runs()
+        _finish_workflow_step(session)  # the plan; the gate waits
+        output = DiscordOutputService(session)
+        assert output.post_gate_cards(gateway=gateway) == 1
+        workflows.answer_gate(workflow_run_id=run.id, node_key="approve", answer="Again")
+        workflows.tick_runs()
+        WorkRunner(session).run_next()
+        prepare = session.scalar(
+            select(WorkItem).where(WorkItem.workflow_run_id == run.id, WorkItem.title == "prepare")
+        )
+        _latest_attempt(session, prepare.id).produces = {"rewind": True}  # it sends the run back to the plan
+        session.flush()
+        workflows.tick_runs()
+        _finish_workflow_step(session)  # the plan again; the gate waits again
+
+        assert output.post_gate_cards(gateway=gateway) == 1
+        assert output.post_gate_cards(gateway=gateway) == 0
+        assert gateway.sent_messages == [("thread-rounds", "Build it?")] * 2
+        posted = session.scalars(select(WorkEvent).where(WorkEvent.event_type == "discord.gate_card_posted")).all()
+        assert sorted(event.payload["status"] for event in posted) == ["awaiting_input", "awaiting_input:1"]
+
+
 def test_split_markdown_keeps_lines_whole_and_hard_splits_overlong_lines() -> None:
     content = "intro\n" + "a" * 25 + "\nshort one\nshort two\n"
 

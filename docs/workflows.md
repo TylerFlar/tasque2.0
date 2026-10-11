@@ -33,6 +33,7 @@ when everything it depends on has succeeded.
 | `max_attempts`, `retry_policy`, `priority` | retries and ordering |
 | `deadline_seconds` / `deadline_at` | dead-letter the work if it has not finished by then |
 | `tolerate_failure` | a dead-lettered node does not fail the run |
+| `rewind_to` | a node it depends on: when this node's output says `rewind: true`, the run goes back there for another round (that node and every node after it start over; at most 20 rounds, never across a fan-out's children) |
 
 **`fan_out`**: one work item per item, run in parallel. Items come from `items` (a literal list),
 `items_from` (a key of the run's input), or `items_from_output` (`"<node>.<path>"` into an upstream
@@ -45,7 +46,10 @@ children; with `tolerate_child_failures` they also run when some children dead-l
 combined view.
 
 **`gate`**: stops the run with a `prompt` until you answer it, from the run's Discord panel or
-`tasque2 workflow-answer <run> <key> <answer>`. Nodes after it see the answer.
+`tasque2 workflow-answer <run> <key> <answer>`. Nodes after it see the answer. With `choices` (2 to 5
+labels) it posts a card into the run's thread with a button per choice, once each round; what you type
+there while it waits goes with the answer as notes. `ask_note` maps some choices to a text box label
+(up to 45 characters): that button opens the box first, and what you write goes with the answer too.
 
 ## What each node sees
 

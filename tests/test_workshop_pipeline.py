@@ -39,11 +39,12 @@ from tasque2.daemon.pool import claim_and_run
 from tasque2.daemon.restart import clear_request, read_request
 from tasque2.daemon.service import Daemon
 from tasque2.db import session_scope
+from tasque2.discord.ui import DiscordUIService, parse_custom_id
 from tasque2.models import WorkflowNode, WorkflowRun, WorkItem, utc_now
 from tasque2.ops import datarepo
 from tasque2.ops.release import find_plan, history, save_plan, state
-from tasque2.workflows import WorkflowService
-from tasque2.workshop import pipeline, reply, verify
+from tasque2.workflows import WorkflowService, validate_definition
+from tasque2.workshop import ledger, pipeline, reply, verify
 
 
 @pytest.fixture()
@@ -146,7 +147,8 @@ def test_a_pitch_waits_for_its_ok_and_approve_builds_and_ships_it(shop: dict[str
         assert "1. How short? _(default: two sentences)_" in card and "Why: you asked" in card
         assert "1. Cooking replies, rethought." not in card  # the plan itself is the build's, not the owner's
         assert card.endswith(
-            "Approve builds and ships it, with an Undo. Revise plans it again with what you typed. Discard drops it."
+            "Approve builds and ships it, with an Undo. Revise asks what to change and plans it again. "
+            "Discard drops it."
         )
         reply.handle(session, text="one sentence", thread_id=THREAD, author="owner", referenced=None)
         reply.handle(session, text="approve", thread_id=THREAD, author="owner", referenced=None)
@@ -164,21 +166,73 @@ def test_a_pitch_waits_for_its_ok_and_approve_builds_and_ships_it(shop: dict[str
     assert _git(shop["data"], "branch", "--list", "workshop/*") == ""
 
 
-def test_revise_plans_again_with_the_notes(shop: dict[str, Any]) -> None:
+def _revise(session, run: WorkflowRun, note: str) -> None:
+    """Revise on the run's card: the button opens a box, and the note it takes goes with the answer."""
+    ui = DiscordUIService(session)
+    assert ui.gate_note_prompt("1", run.id) == ("Revise", "What should change?")
+    assert ui.gate_note_prompt("0", run.id) is None and ui.gate_note_prompt("2", run.id) is None  # one tap
+    assert ui.handle_action(parse_custom_id(f"t2:gate:1:{run.id}"), note=note, author="owner") == "Chosen: Revise"
+
+
+def test_revise_plans_the_same_change_again_with_the_notes_and_approve_ships_it(shop: dict[str, Any]) -> None:
     questions = [{"question": "Which thread?", "default": "Kitchen"}]
+    planned: list[dict[str, Any]] = []
+
+    def plan(title: str) -> Any:
+        def run(item: WorkItem) -> dict[str, Any]:
+            planned.append(dict(item.context))
+            return _plan(title, "feature", ["templates"], questions=questions)(item)
+
+        return run
+
     with session_scope() as session:
-        first = pipeline.start_change(session, request="add a pantry view", thread_id=THREAD)
-        drive(session, {"plan": _plan("A pantry view", "feature", ["extension"], questions=questions)})
+        run = pipeline.start_change(session, request="add a pantry view", thread_id=THREAD)
+        trees = run.input["worktrees"]
+        drive(session, {"plan": plan("A pantry view")})
         reply.handle(session, text="the Daybook instead", thread_id=THREAD, author="owner", referenced=None)
-        reply.handle(session, text="revise", thread_id=THREAD, author="owner", referenced=None)
-        drive(session, {"plan": _plan("A pantry view in the Daybook", "feature", ["extension"], questions=questions)})
-        runs = pipeline.latest_runs(session, thread_id=THREAD)
-        again = next(run for run in runs if run.id != first.id)
-        assert again.input["revision_of"] == first.id and again.input["notes"] == ["the Daybook instead"]
-        assert again.input["previous_plan"] == "1. A pantry view."
-        assert pipeline.report_text(session, session.get(WorkflowRun, first.id))[0] == (
-            "Planning A pantry view again with your notes."
+        _revise(session, run, "and a weekly list")
+        drive(session, {"plan": plan("A pantry view in the Daybook")})
+        assert [each.id for each in pipeline.latest_runs(session, thread_id=THREAD)] == [run.id]  # one chain
+        assert planned[1]["notes"] == ["the Daybook instead", "and a weekly list"]
+        assert planned[1]["previous_plan"] == "1. A pantry view."
+        assert planned[1]["change_id"] == run.input["change_id"] and Path(run.input["cwd"]).is_dir()
+        assert [tree["path"] for tree in run.input["worktrees"]] == [tree["path"] for tree in trees]
+        gate = _gate(session, run.id)
+        assert gate.node_key == "plan_gate" and gate.input["card"].startswith(
+            "**Workshop: A pantry view in the Daybook**"
         )
+        assert "notes" not in gate.input  # a new round's card starts with no notes
+        assert reply.handle(session, text="approve", thread_id=THREAD, author="owner", referenced=None) == (
+            "Approve: A pantry view in the Daybook."
+        )
+        drive(session, {"build": _template_build})
+        run = session.get(WorkflowRun, run.id)
+        assert run.status == "completed" and run.state["round"] == 1
+        text, release_id = pipeline.report_text(session, run)
+        assert text.startswith("**Live now: A pantry view in the Daybook**") and release_id == run.input["change_id"]
+    assert (shop["data"] / TEMPLATE).read_text(encoding="utf-8") == "Reply, briefly.\n"
+
+
+def test_a_change_the_workshop_filed_keeps_its_ledger_rows_through_a_revise(shop: dict[str, Any]) -> None:
+    questions = [{"question": "How quiet?", "default": "silent"}]
+    script = {"plan": _plan("Quiet the warning", "tweak", ["templates"], questions=questions)}
+    with session_scope() as session:
+        ledger.record(session, [ledger.Signal(key="warning:a", source="warning", title="A warning")])
+        run = pipeline.start_change(
+            session, request="quiet the warning", origin="workshop", thread_id=THREAD, issues=["warning:a"]
+        )
+        change_id = run.input["change_id"]
+        ledger.mark_filed(session, ["warning:a"], change_id=change_id, run_id=run.id, now=utc_now())
+        drive(session, script)
+        _revise(session, run, "only at night")
+        drive(session, script)
+        row = ledger.row(session, "warning:a")
+        assert (row.status, row.change_id, row.workflow_run_id) == (ledger.FILED, change_id, run.id)
+        assert _gate(session, run.id).node_key == "plan_gate"
+        reply.handle(session, text="discard", thread_id=THREAD, author="owner", referenced=None)
+        drive(session, {})
+        assert session.get(WorkflowRun, run.id).status == "completed"
+        assert row.status == ledger.RESTING and ledger.aware(row.rest_until) > utc_now() + timedelta(days=59)
 
 
 def test_ideas_and_questions_end_at_the_plan_with_its_answer(shop: dict[str, Any]) -> None:
@@ -565,7 +619,10 @@ def test_the_workshop_runs_read_their_checkout_and_build_inside_it(shop: dict[st
     assert nodes["build"]["contract_from"] == {"model_profile": "classify.profile"}
     assert nodes["plan_gate"]["skip_when"] == "classify.skip_plan_gate"
     assert nodes["ship_gate"]["skip_when"] == "verify.skip_ship_gate"
+    assert nodes["plan_gate"]["ask_note"] == {"Revise": "What should change?"} and "ask_note" not in nodes["ship_gate"]
+    assert nodes["prepare"]["rewind_to"] == "plan"
     assert "mcp__tasque2__memory_save" in nodes["build"]["runtime_contract"]["disallowed_tools"]
+    validate_definition(pipeline.definition())
 
 
 def test_the_workshops_own_changes_ship_quietly_three_a_day_and_the_fourth_waits_for_tomorrow(

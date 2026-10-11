@@ -234,12 +234,13 @@ def build_sticky_embed(view: StickyView) -> dict[str, Any]:
 
 
 class DiscordUIService:
-    """Button and modal actions from the work and workflow controls."""
+    """Button and modal actions from the work and workflow controls, and the gate cards' buttons: a choice
+    that asks for a note (``ask_note``) opens a text box first, and its note goes with the answer."""
 
     def __init__(self, session: Session) -> None:
         self.session = session
 
-    def handle_action(self, action: DiscordUIAction) -> str:
+    def handle_action(self, action: DiscordUIAction, *, note: str | None = None, author: str | None = None) -> str:
         if action.scope == "usage" and action.action == "back":
             return self._usage_back()
         if not action.entity_id:
@@ -249,37 +250,60 @@ class DiscordUIService:
         if action.scope == "workflow":
             return self._workflow_action(action.action, action.entity_id)
         if action.scope == "gate":
-            return self._gate_choice(action.action, action.entity_id)
+            return self._gate_choice(action.action, action.entity_id, note=note, author=author)
         if action.scope == "workshop" and action.action == "undo":
             from tasque2.workshop.pipeline import undo_by_id
 
             return undo_by_id(self.session, action.entity_id)
         return f"Unknown Tasque action: {action.scope}:{action.action}"
 
-    def _gate_choice(self, index: str, workflow_run_id: str) -> str:
-        """A gate card's button: answer the run's open gate with the chosen label."""
-        gates = [
-            node
-            for node in self.session.scalars(
-                select(WorkflowNode).where(
-                    WorkflowNode.workflow_run_id == workflow_run_id,
-                    WorkflowNode.kind == "gate",
-                    WorkflowNode.status == "awaiting_input",
-                )
-            ).all()
-            if (node.definition or {}).get("choices")
-        ]
-        if not gates:
+    def gate_note_prompt(self, index: str, workflow_run_id: str) -> tuple[str, str] | None:
+        """The choice and its text box's label, when the open gate asks a note for that choice (``ask_note``)."""
+        found = self._open_choice(index, workflow_run_id)
+        if found is None:
+            return None
+        gate, choice = found
+        label = ((gate.definition or {}).get("ask_note") or {}).get(choice)
+        return (choice, str(label)) if label else None
+
+    def _gate_choice(
+        self, index: str, workflow_run_id: str, *, note: str | None = None, author: str | None = None
+    ) -> str:
+        """A gate card's button: answer the run's open gate with the chosen label, and the note its box took."""
+        found = self._open_choice(index, workflow_run_id)
+        if found is None:
             return "That choice is no longer open."
-        choices = gates[0].definition["choices"]
+        gate, choice = found
+        service = WorkflowService(self.session)
+        if note and note.strip():
+            service.add_gate_note(
+                workflow_run_id=workflow_run_id, node_key=gate.node_key, text=note.strip(), author=author or "user"
+            )
+        service.answer_gate(workflow_run_id=workflow_run_id, node_key=gate.node_key, answer=choice)
+        return f"Chosen: {choice}"
+
+    def _open_choice(self, index: str, workflow_run_id: str) -> tuple[WorkflowNode, str] | None:
+        """The run's open gate that offers choices, and its choice at ``index``; None when no such gate waits."""
+        gate = next(
+            (
+                node
+                for node in self.session.scalars(
+                    select(WorkflowNode).where(
+                        WorkflowNode.workflow_run_id == workflow_run_id,
+                        WorkflowNode.kind == "gate",
+                        WorkflowNode.status == "awaiting_input",
+                    )
+                ).all()
+                if (node.definition or {}).get("choices")
+            ),
+            None,
+        )
+        if gate is None:
+            return None
         try:
-            choice = str(choices[int(index)])
+            return gate, str(gate.definition["choices"][int(index)])
         except (ValueError, IndexError):
             raise ValueError(f"Unknown choice: {index}") from None
-        WorkflowService(self.session).answer_gate(
-            workflow_run_id=workflow_run_id, node_key=gates[0].node_key, answer=choice
-        )
-        return f"Chosen: {choice}"
 
     def answer_gate(self, *, workflow_run_id: str, answer: str, node_key: str | None = None) -> str:
         key = (node_key or "").strip()

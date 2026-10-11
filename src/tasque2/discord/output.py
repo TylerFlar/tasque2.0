@@ -59,6 +59,7 @@ from tasque2.models import (
 from tasque2.ops.status import get_system_status
 from tasque2.sticky import StickyService
 from tasque2.work.queue import WorkQueue
+from tasque2.workflows import run_round
 
 logger = logging.getLogger(__name__)
 
@@ -109,7 +110,8 @@ class DiscordOutputService:
         return posted
 
     def post_gate_cards(self, *, gateway: DiscordGateway) -> int:
-        """A gate that offers ``choices`` posts one card, with a button per choice, into its run's thread."""
+        """A gate that offers ``choices`` posts one card, with a button per choice, into its run's thread: once
+        each round of its run, so a gate the run went back to (``rewind_to``) posts a fresh card."""
         nodes = self.session.scalars(
             select(WorkflowNode).where(WorkflowNode.kind == "gate", WorkflowNode.status == "awaiting_input")
         ).all()
@@ -119,7 +121,9 @@ class DiscordOutputService:
             run = node.workflow_run
             if not choices or run is None or not run.discord_thread_id:
                 continue
-            if self._already_posted("discord.gate_card_posted", node.id, "awaiting_input"):
+            round_ = run_round(run)
+            status = f"awaiting_input:{round_}" if round_ else "awaiting_input"
+            if self._already_posted("discord.gate_card_posted", node.id, status):
                 continue
             card = (node.input or {}).get("card") or (node.definition or {}).get("prompt")
             chunks = split_markdown(str(card or f"{run.name} is waiting for a choice."), MESSAGE_LIMIT)
@@ -134,12 +138,20 @@ class DiscordOutputService:
                     view=build_gate_card_view(run_id, list(choices)) if last else None,
                 )
                 sent_messages.append((sent, content))
-            self._record_sent(partial(self._record_gate_card, sent_messages, thread_id, run_id, node_id, node_key))
+            self._record_sent(
+                partial(self._record_gate_card, sent_messages, thread_id, run_id, node_id, node_key, status)
+            )
             posted += 1
         return posted
 
     def _record_gate_card(
-        self, sent_messages: list[tuple[DiscordSentMessage, str]], thread_id: str, run_id: str, node_id: str, key: str
+        self,
+        sent_messages: list[tuple[DiscordSentMessage, str]],
+        thread_id: str,
+        run_id: str,
+        node_id: str,
+        key: str,
+        status: str,
     ) -> None:
         for sent, content in sent_messages:
             self._record_outbound(sent, content=content, thread_id=thread_id, workflow_run_id=run_id)
@@ -150,7 +162,7 @@ class DiscordOutputService:
             workflow_run_id=run_id,
             summary=f"Posted the gate card for {key}",
             payload={
-                "status": "awaiting_input",
+                "status": status,
                 "discord_message_id": sent_messages[-1][0].message_id if sent_messages else None,
             },
         )

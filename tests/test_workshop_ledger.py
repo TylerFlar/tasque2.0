@@ -86,9 +86,8 @@ def test_a_filed_change_settles_its_rows_by_how_it_ended(fresh_db: Path) -> None
         ]
         ledger.mark_filed(session, ["warning:a", "warning:b"], change_id="c1", run_id="r1", now=now)
         ledger.mark_filed(session, ["warning:c"], change_id="c2", run_id="r2", now=now)
-        ledger.refile(session, "c2", new_change_id="c3", run_id="r3")  # planned again
         assert ledger.settle(session, "c1", ledger.SHIPPED, now=now) == 2
-        assert ledger.settle(session, "c3", ledger.DISCARDED, now=now) == 1
+        assert ledger.settle(session, "c2", ledger.DISCARDED, now=now) == 1
         a, c = ledger.row(session, "warning:a"), ledger.row(session, "warning:c")
         assert a.status == ledger.DONE and a.rest_until == now + ledger.ONE_TRY and a.tried_at == now
         assert c.status == ledger.RESTING and c.rest_until == now + ledger.SET_ASIDE

@@ -170,6 +170,39 @@ def test_ui_gate_answer_without_a_key_needs_exactly_one_open_gate(fresh_db: Path
         )
 
 
+def test_a_gate_choice_that_asks_for_a_note_takes_it_with_the_answer(fresh_db: Path) -> None:
+    gate = {
+        "key": "plan_gate",
+        "kind": "gate",
+        "prompt": "Build this plan?",
+        "choices": ["Approve", "Revise", "Discard"],
+        "ask_note": {"Revise": "What should change?"},
+    }
+    with session_scope() as session:
+        workflows = WorkflowService(session)
+        definition = workflows.create_definition(name="noted", version="1", definition={"nodes": [gate]})
+        run = workflows.start_run(workflow_definition_id=definition.id)
+        workflows.tick_runs()
+        workflows.add_gate_note(workflow_run_id=run.id, node_key="plan_gate", text="typed first", author="user#0001")
+        service = DiscordUIService(session)
+
+        assert service.gate_note_prompt("1", run.id) == ("Revise", "What should change?")
+        assert service.gate_note_prompt("0", run.id) is None and service.gate_note_prompt("2", run.id) is None
+        with pytest.raises(ValueError, match="Unknown choice"):
+            service.gate_note_prompt("7", run.id)
+
+        chosen = service.handle_action(_action("gate", "1", run.id), note="  In the Daybook.  ", author="user#0001")
+        assert chosen == "Chosen: Revise"
+        node = session.scalar(select(WorkflowNode).where(WorkflowNode.workflow_run_id == run.id))
+        assert node.output["answer"] == "Revise"
+        assert [(note["author"], note["text"]) for note in node.output["notes"]] == [
+            ("user#0001", "typed first"),
+            ("user#0001", "In the Daybook."),
+        ]
+        assert service.gate_note_prompt("1", run.id) is None  # answered: no box opens
+        assert service.handle_action(_action("gate", "1", run.id), note="late") == "That choice is no longer open."
+
+
 def test_ui_pauses_resumes_and_cancels_a_workflow(fresh_db: Path) -> None:
     definition = {
         "nodes": [{"key": "step", "kind": "work", "task_instruction": "Control me.", "worker_kind": "manual"}]

@@ -1,6 +1,10 @@
 """The Discord client: intake and reply routing, button actions, the output loop, and the messages the user
 sent while Tasque was away.
 
+A gate card's button answers its gate, and the card then shows the choice and loses its buttons. A choice
+that asks for a note (``ask_note``) opens a text box first: submitting it answers with the note; closing it
+changes nothing.
+
 A message is routed as it arrives. When the database is busy (another writer holds SQLite's lock past its
 timeout), the message is tried again after a pause, as the records of sent messages are, rather than dropped.
 When the client connects with a new session (at start-up, or after a disconnect Discord could not resume),
@@ -35,6 +39,7 @@ from tasque2.discord.routing import DiscordAttachmentPayload, DiscordRouteResult
 from tasque2.discord.ui import DiscordUIService, is_modal_action, parse_custom_id
 from tasque2.models import DiscordMessage, WorkItem, utc_now
 from tasque2.telemetry import span
+from tasque2.workflows import NOTE_LABEL_CHARS
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +53,12 @@ CATCH_UP_LIMIT = 100
 # and the pause before the n-th retry (n times this many seconds: about a minute in all).
 ROUTE_ATTEMPTS = RECORD_ATTEMPTS
 ROUTE_PAUSE_SECONDS = RECORD_PAUSE_SECONDS
+# Discord's limits: a message, a text box, and a modal's title; and how much of a note an answered card shows.
+MESSAGE_CHARS = 2000
+NOTE_CHARS = 4000
+MODAL_TITLE_CHARS = 45
+NOTE_SHOWN_CHARS = 100
+NOTE_PLACEHOLDER = "Anything you typed in the thread goes too"
 
 
 def output_channels(settings: Settings) -> OutputChannels:
@@ -144,6 +155,18 @@ class TasqueBot(discord.Client):
         if is_modal_action(action) and action.entity_id:
             await interaction.response.send_modal(_GateAnswerModal(workflow_run_id=action.entity_id))
             return
+        if action.scope == "gate" and action.entity_id:
+            try:  # a read (well inside the three seconds Discord gives a reply), so the box opens at once
+                prompt = await asyncio.to_thread(_gate_note_prompt, action)
+            except Exception as exc:  # noqa: BLE001 - report the failure to the clicker
+                await interaction.response.send_message(f"Tasque action failed: {exc}"[:1900], ephemeral=True)
+                return
+            if prompt is not None:
+                choice, label = prompt
+                await interaction.response.send_modal(
+                    _GateNoteModal(action, choice=choice, label=label, card=interaction.message)
+                )
+                return
         try:
             if not interaction.response.is_done():
                 await interaction.response.defer(ephemeral=True)
@@ -153,13 +176,8 @@ class TasqueBot(discord.Client):
             content = await asyncio.to_thread(_run_ui_action, action)
         except Exception as exc:  # noqa: BLE001 - report the failure to the clicker
             content = f"Tasque action failed: {exc}"
-        if action.scope == "gate" and content.startswith("Chosen: ") and interaction.message is not None:
-            try:  # the card keeps its text, shows the choice, and loses its buttons
-                await interaction.message.edit(
-                    content=f"{interaction.message.content}\n\n**{content}**"[:2000], view=None
-                )
-            except discord.HTTPException:
-                pass
+        if action.scope == "gate":
+            await _mark_card(interaction.message, content)
         await interaction.followup.send(content=content[:1900], ephemeral=True)
 
     async def close(self) -> None:
@@ -328,9 +346,30 @@ class TasqueBot(discord.Client):
         return thread_id is not None or bool(referenced) or channel_id == self.intake_channel_id
 
 
-def _run_ui_action(action) -> str:
+def _run_ui_action(action, note: str | None = None, author: str | None = None) -> str:
     with session_scope() as session:
-        return DiscordUIService(session).handle_action(action)
+        return DiscordUIService(session).handle_action(action, note=note, author=author)
+
+
+def _gate_note_prompt(action) -> tuple[str, str] | None:
+    """The choice and its text box's label, when a gate button's choice asks for a note."""
+    with session_scope() as session:
+        return DiscordUIService(session).gate_note_prompt(str(action.action), str(action.entity_id))
+
+
+async def _mark_card(card: discord.Message | None, content: str, note: str = "") -> None:
+    """A gate card once answered: its text kept, the choice and the start of its note added, its buttons
+    gone. When the card is long its own text gives way, never the choice."""
+    if card is None or not content.startswith("Chosen: "):
+        return
+    flat = " ".join(note.split())
+    if len(flat) > NOTE_SHOWN_CHARS:
+        flat = flat[: NOTE_SHOWN_CHARS - 1] + "…"
+    added = f"\n\n**{content}**" + (f"\n> {flat}" if flat else "")
+    try:
+        await card.edit(content=card.content[: MESSAGE_CHARS - len(added)] + added, view=None)
+    except discord.HTTPException:
+        pass
 
 
 def _waiting_on(work_item_id: str) -> bool:
@@ -364,6 +403,36 @@ def _referenced_message_id(message: discord.Message) -> str | None:
         return None
     message_id = getattr(reference, "message_id", None) or getattr(getattr(reference, "resolved", None), "id", None)
     return str(message_id) if message_id is not None else None
+
+
+class _GateNoteModal(discord.ui.Modal):
+    """The text box a gate choice that asks for a note opens: submitting answers the gate with the note and
+    marks the card as a tap does. discord.py names it, so ``on_interaction`` leaves its submit to it."""
+
+    def __init__(self, action, *, choice: str, label: str, card: discord.Message | None) -> None:
+        super().__init__(title=choice[:MODAL_TITLE_CHARS])
+        self.action, self.card = action, card
+        self.note = discord.ui.TextInput(
+            label=label[:NOTE_LABEL_CHARS],
+            style=discord.TextStyle.paragraph,
+            max_length=NOTE_CHARS,
+            placeholder=NOTE_PLACEHOLDER,
+        )
+        self.add_item(self.note)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        note = str(self.note.value or "").strip()
+        author = str(interaction.user) if interaction.user is not None else None
+        try:
+            await interaction.response.defer(ephemeral=True)
+        except discord.HTTPException:
+            pass
+        try:
+            content = await asyncio.to_thread(_run_ui_action, self.action, note, author)
+        except Exception as exc:  # noqa: BLE001 - report the failure to the submitter
+            content = f"Tasque action failed: {exc}"
+        await _mark_card(self.card, content, note)
+        await interaction.followup.send(content=content[:1900], ephemeral=True)
 
 
 class _GateAnswerModal(discord.ui.Modal):
