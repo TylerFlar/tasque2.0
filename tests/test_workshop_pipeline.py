@@ -1,19 +1,23 @@
 """The Workshop end to end, on fixture repositories with scripted plan and build runs: a tweak ships on
 its own and undoes, a feature ships on its own and waits for a restart, a pitch waits for its OK and Approve
 ships it, a build that strays from its plan waits for a tap, ideas end at the plan, a code change holds the
-code until it is live, the Workshop's own changes ship quietly and three a day, and a cold release is
-announced and undone."""
+code until it is live and leaves the database free while it is checked again, the Workshop's own changes
+ship quietly and three a day, and a cold release is announced (on the next pass when the database was busy)
+and undone."""
 
 from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
+import threading
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 import pytest
 from sqlalchemy import select
+from sqlalchemy.exc import OperationalError
 from workshop_shop import (
     TEMPLATE,
     THREAD,
@@ -30,6 +34,8 @@ from workshop_shop import (
     open_shop,
 )
 
+from tasque2.config import get_settings
+from tasque2.daemon.pool import claim_and_run
 from tasque2.daemon.restart import clear_request, read_request
 from tasque2.daemon.service import Daemon
 from tasque2.db import session_scope
@@ -37,7 +43,7 @@ from tasque2.models import WorkflowNode, WorkflowRun, WorkItem, utc_now
 from tasque2.ops import datarepo
 from tasque2.ops.release import find_plan, history, save_plan, state
 from tasque2.workflows import WorkflowService
-from tasque2.workshop import pipeline, reply
+from tasque2.workshop import pipeline, reply, verify
 
 
 @pytest.fixture()
@@ -283,6 +289,52 @@ def test_a_build_that_strays_from_its_plan_waits_for_a_tap_and_holds_up_no_other
     assert _git(ext, "merge-base", "--is-ancestor", "HEAD", branch) == ""
 
 
+def test_a_release_that_frees_a_stale_lock_and_is_checked_again_leaves_the_database_free_meanwhile(
+    shop: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ext = shop["project"] / "extensions" / "ext1"
+    with session_scope() as session:
+        first = pipeline.start_change(session, request="count to two", thread_id=THREAD)
+        drive(session, {"plan": _plan("Count to two", "feature", ["extension"]), "build": _self_build})
+        second = pipeline.start_change(session, request="fix the other value", thread_id=THREAD)
+        drive(session, {"plan": _plan("The other value", "fix", ["extension"]), "build": _other_build})
+        reply.handle(session, text="ship", thread_id=THREAD, author="owner", referenced=None)
+        drive(session, {})  # the first's release waits for the second to go live
+        release_id = session.scalar(
+            select(WorkItem.id).where(
+                WorkItem.workflow_run_id == first.id, WorkItem.worker_kind == pipeline.RELEASE_WORKER
+            )
+        )
+    first_id, second_id = first.input["change_id"], second.input["change_id"]
+    _go_live(ext, second_id)  # no announce pass yet: the lock still names it
+    with session_scope() as session:
+        session.get(WorkItem, release_id).not_before = None
+    tries: list[str] = []
+
+    def check(command: list[str], cwd: str) -> tuple[bool, str]:
+        """Each check, while it runs, tries a write from another connection, as the daemon's ticks do."""
+        other = sqlite3.connect(get_settings().database_path, timeout=0.5, isolation_level=None)
+        try:
+            other.execute("BEGIN IMMEDIATE")
+            other.execute("ROLLBACK")
+            tries.append("free")
+        except sqlite3.OperationalError as exc:
+            tries.append(str(exc))
+        finally:
+            other.close()
+        return True, "3 passed"
+
+    monkeypatch.setattr(verify, "_run_command", check)
+    ran = claim_and_run(claim_lock=threading.Lock(), lease_owner="daemon", lease_seconds=None)
+    assert ran.work_item_id == release_id and ran.summary == "Queued for a restart."
+    assert tries and set(tries) == {"free"}  # checked again, with nobody else's write kept waiting
+    assert read_request()["release"].endswith(f"{first_id}.json")
+    with session_scope() as session:
+        assert pipeline.code_holder(session) == first_id
+        drive(session, {})
+        assert session.get(WorkflowRun, first.id).status == "completed"
+
+
 def test_a_change_that_no_longer_applies_on_the_live_code_is_not_released(shop: dict[str, Any]) -> None:
     ext = shop["project"] / "extensions" / "ext1"
     with session_scope() as session:
@@ -391,6 +443,49 @@ def test_a_release_recorded_after_the_daemon_started_is_announced_by_its_loop(
     with session_scope() as session:
         assert len(posts(session)) == 1
     assert holder() == second_id
+
+
+def test_a_live_now_that_meets_a_busy_database_is_posted_on_the_next_pass(
+    shop: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tasque2.ops.release import ReleasePlan
+    from tasque2.work.repository import WorkRepository
+
+    save_plan(
+        ReleasePlan(
+            id="c1",
+            change_id="c1",
+            title="Count to two",
+            repos=[{"name": "ext1", "live": "x", "branch": "b", "base": "c"}],
+            summary="The tool's value is 2.",
+            outcome={"ok": True, "at": utc_now().isoformat()},
+            released_at=utc_now().isoformat(),
+            thread_id=THREAD,
+        )
+    )
+    create, busy = WorkRepository.create_work_item, [True]
+
+    def create_once_busy(self: WorkRepository, **fields: Any) -> WorkItem:
+        if busy:
+            busy.pop()
+            raise OperationalError("INSERT INTO work_items", {}, Exception("database is locked"))
+        return create(self, **fields)
+
+    def posts(session) -> list[WorkItem]:
+        return list(session.scalars(select(WorkItem).where(WorkItem.worker_kind == pipeline.ANNOUNCE_WORKER)))
+
+    monkeypatch.setattr(WorkRepository, "create_work_item", create_once_busy)
+    with pytest.raises(OperationalError), session_scope() as session:
+        pipeline.announce_releases(session)
+    assert find_plan("c1").announced is False  # left for the next pass
+    with session_scope() as session:
+        assert posts(session) == []
+        assert pipeline.announce_releases(session) == 1
+        assert pipeline.announce_releases(session) == 0  # once
+        [post] = posts(session)
+        assert post.discord_thread_id == THREAD and post.task_instruction.startswith("**Live now: Count to two**")
+        assert pipeline.announce_worker(post)["produces"]["undo_release"] == "c1"
+    assert find_plan("c1").announced is True
 
 
 def test_two_rollbacks_in_a_week_pause_the_workshop(shop: dict[str, Any]) -> None:

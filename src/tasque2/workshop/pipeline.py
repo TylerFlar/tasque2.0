@@ -15,7 +15,7 @@ its own worktrees (``tasque2.ops.worktree``: the core, each extension, and the c
 4. ``prepare`` (no model): Revise starts the change again with the notes typed at the gate, Discard
    ends it; otherwise the worktrees move to the live heads and a change that edits code takes the code
    lock (one code change at a time, from its build until it is live, freed while it waits for a tap or
-   for the next day);
+   for the next day; taken with a commit, so no write stays open through the slow work after it);
 5. ``build`` (a model run in the worktrees): a failing test first for a bug, the change, commits;
 6. ``verify`` (no model, ``tasque2.workshop.verify``): the suites, ruff, the privacy and secret scans, a
    rehearsal on a copy of the live database, and whether the build needs one tap after all (it touches
@@ -26,9 +26,9 @@ its own worktrees (``tasque2.ops.worktree``: the core, each extension, and the c
    A code change that waited takes the lock again, and is moved onto the live code and checked again
    when the live code moved on meanwhile;
 9. ``report`` (no model): the owner hears of a change they asked for or approved: "Live now" with an Undo
-   button (a cold release is announced once it is live), or one line when it could not ship. The
-   Workshop's other changes ship quietly: status lists them, and undo still works. A change the Workshop
-   filed tells its ledger rows how it ended.
+   button (a cold release is announced once it is live, by a pass that tries again until its post is
+   saved), or one line when it could not ship. The Workshop's other changes ship quietly: status lists
+   them, and undo still works. A change the Workshop filed tells its ledger rows how it ended.
 
 A card nobody answers for 14 days expires (``expire_cards``, run by the sweep): a change's card as a
 Discard, an idea card as a Not now. Kill switches: ``pause`` (no change starts unless the owner asks for
@@ -194,10 +194,13 @@ def code_holder(session: Session) -> str | None:
     return None
 
 
-def take_code(change_id: str, run_id: str) -> None:
+def take_code(session: Session, change_id: str, run_id: str) -> None:
+    """Hold the code, then commit: a write made before (a stale lock freed, say) would otherwise stay open
+    through the slow work that follows, such as checking the change again, and lock every other writer out."""
     path = _lock_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps({"change_id": change_id, "run_id": run_id, "at": utc_now().isoformat()}))
+    session.commit()
 
 
 def free_code(session: Session, change_id: str | None = None) -> None:
@@ -618,7 +621,7 @@ def prepare_worker(work_item: WorkItem) -> dict[str, Any]:
             raise WorkDeferred(
                 utc_now() + WAIT_FOR_CODE, f"waiting for another code change to go live first ({holder})"
             )
-        take_code(change_id, run.id)
+        take_code(session, change_id, run.id)
     refresh_worktrees(run)
     plan = node_output(session, run.id, "plan")
     brief = {
@@ -726,7 +729,7 @@ def release_worker(work_item: WorkItem) -> dict[str, Any]:
     if holder != change_id:
         # The code was freed while the change waited: taken again, and the change is moved onto the live
         # code and checked again when that moved on meanwhile.
-        take_code(change_id, run.id)
+        take_code(session, change_id, run.id)
         try:
             moved = move_onto_live(run)
         except WorktreeError as exc:
@@ -880,8 +883,9 @@ def _why(plan: Any) -> str:
 
 def announce_releases(session: Session) -> int:
     """Post how each cold release went (once), record undos, pause after repeated rollbacks, free the code
-    lock and sweep leftover worktrees. The daemon runs it as it starts and then once a minute, so every step
-    is safe to repeat."""
+    lock and sweep leftover worktrees. The daemon runs it as it starts and then once a minute, each pass in
+    its own session, so every step is safe to repeat. A release reads as announced only once its post is
+    committed: a pass that fails leaves it for the next."""
     from tasque2.ops.release import history, mark_undone, save_plan, state
     from tasque2.work.repository import WorkRepository
 
@@ -890,28 +894,27 @@ def announce_releases(session: Session) -> int:
         if plan.announced or plan.outcome is None or not plan.cold:
             continue
         status = state(plan)
-        plan.announced = True
-        save_plan(plan)
         rolled_back_now = rolled_back_now or status == "failed"
-        if status == "canceled":
-            continue
         if plan.undo_of and status == "live":
             mark_undone(plan)
-        if not plan.thread_id or plan.quiet:
-            continue  # the Workshop's own changes ship quietly: status lists them, and undo still works
-        undo = status == "live" and not plan.undo_of
-        WorkRepository(session).create_work_item(
-            title=f"Workshop: {plan.title}"[:240],
-            task_instruction=announce_text(plan, status),
-            worker_kind=ANNOUNCE_WORKER,
-            context={"release_id": plan.id, "undo": undo},
-            idempotency_key=f"workshop:announce:{plan.id}",
-            source_kind="workshop_release",
-            source_id=plan.id,
-            discord_thread_id=plan.thread_id,
-            lane=LANE,
-        )
-        posted += 1
+        # The Workshop's own changes ship quietly: status lists them, and undo still works.
+        if status != "canceled" and plan.thread_id and not plan.quiet:
+            undo = status == "live" and not plan.undo_of
+            WorkRepository(session).create_work_item(
+                title=f"Workshop: {plan.title}"[:240],
+                task_instruction=announce_text(plan, status),
+                worker_kind=ANNOUNCE_WORKER,
+                context={"release_id": plan.id, "undo": undo},
+                idempotency_key=f"workshop:announce:{plan.id}",
+                source_kind="workshop_release",
+                source_id=plan.id,
+                discord_thread_id=plan.thread_id,
+                lane=LANE,
+            )
+            session.commit()
+            posted += 1
+        plan.announced = True
+        save_plan(plan)
     if rolled_back_now:  # counted only then, so the owner's resume holds until the next rollback
         since = utc_now() - ROLLBACK_WINDOW
         rolled_back = [
