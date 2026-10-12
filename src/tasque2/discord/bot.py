@@ -7,6 +7,9 @@ changes nothing.
 
 A message is routed as it arrives. When the database is busy (another writer holds SQLite's lock past its
 timeout), the message is tried again after a pause, as the records of sent messages are, rather than dropped.
+A voice message is heard first, while voice is on (``TASQUE2_VOICE_MODEL``): its clip is transcribed on this
+machine (``tasque2.discord.voice``) and its words go on as typed text, without the clip. One that cannot be
+made out gets a one-line reply and is saved as received; nothing is routed.
 When the client connects with a new session (at start-up, or after a disconnect Discord could not resume),
 it reads back what the user sent meanwhile: the intake channel and the active threads with messages since
 Tasque last listened (the newest saved message at start-up, the disconnect after that), a day back at most,
@@ -16,9 +19,13 @@ oldest first, routing each message it never saved without holding up the start.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
+import threading
 import time
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 import discord
 from opentelemetry.trace import SpanKind
@@ -27,6 +34,7 @@ from sqlalchemy.exc import OperationalError
 
 from tasque2.config import Settings, get_settings
 from tasque2.db import session_scope
+from tasque2.discord import voice
 from tasque2.discord.gateway import DiscordPyGateway
 from tasque2.discord.output import (
     RECORD_ATTEMPTS,
@@ -38,7 +46,7 @@ from tasque2.discord.output import (
 from tasque2.discord.routing import DiscordAttachmentPayload, DiscordRouteResult, DiscordService
 from tasque2.discord.ui import DiscordUIService, is_modal_action, parse_custom_id
 from tasque2.models import DiscordMessage, WorkItem, utc_now
-from tasque2.telemetry import span
+from tasque2.telemetry import record_exception, span
 from tasque2.workflows import NOTE_LABEL_CHARS
 
 logger = logging.getLogger(__name__)
@@ -59,6 +67,9 @@ NOTE_CHARS = 4000
 MODAL_TITLE_CHARS = 45
 NOTE_SHOWN_CHARS = 100
 NOTE_PLACEHOLDER = "Anything you typed in the thread goes too"
+# A voice message that could not be made out: the reply, and the message as it is saved.
+UNHEARD_REPLY = "Couldn't make out that voice message, so nothing was done with it. Please type it instead."
+UNHEARD_PREVIEW = "(a voice message that could not be made out; nothing was done with it)"
 
 
 def output_channels(settings: Settings) -> OutputChannels:
@@ -91,9 +102,17 @@ class TasqueBot(discord.Client):
         self.channels = output_channels(self.settings)
         self.intake_channel_id = (self.settings.discord_intake_channel_id or "").strip()
         self.allowed_users = self.settings.allowed_discord_user_ids
+        self.voice_model = (self.settings.voice_model or "").strip()
+        self.voice_language = (self.settings.voice_language or "").strip() or None
         self._output_task: asyncio.Task | None = None
         self._catch_up_task: asyncio.Task | None = None
         self._away_since: datetime | None = None
+
+    async def setup_hook(self) -> None:
+        """Once per process, before connecting: while voice is on, the speech model downloads in the background.
+        A daemon thread rather than ``asyncio.to_thread``, so a first download never holds up shutdown."""
+        if self.voice_model:
+            threading.Thread(target=voice.fetch, args=(self.voice_model,), name="voice-fetch", daemon=True).start()
 
     async def on_ready(self) -> None:
         """A new session: the first, or one Discord could not resume. What the user sent meanwhile is read
@@ -129,13 +148,30 @@ class TasqueBot(discord.Client):
         except ValueError as exc:
             await message.channel.send(str(exc)[:1900])
             return
+        content = message.content
+        clips = [item for item in attachments if item.voice] if self.voice_model else []
+        if clips:
+            words = await self._hear(message.channel, clips)
+            if not words:
+                await message.channel.send(UNHEARD_REPLY)
+                await asyncio.to_thread(
+                    _save_unheard,
+                    discord_message_id=str(message.id),
+                    channel_id=channel_id,
+                    thread_id=thread_id,
+                    author=str(message.author),
+                    content=content,
+                )
+                return
+            content = "\n\n".join(part for part in (content.strip(), words) if part)
+            attachments = [item for item in attachments if not item.voice]
         result = await asyncio.to_thread(
             self._route,
             discord_message_id=str(message.id),
             channel_id=channel_id,
             thread_id=thread_id,
             author=str(message.author),
-            content=message.content,
+            content=content,
             attachments=attachments,
             referenced=referenced,
         )
@@ -236,15 +272,7 @@ class TasqueBot(discord.Client):
             "attachments": attachments,
             "referenced": referenced,
         }
-        for attempt in range(1, ROUTE_ATTEMPTS + 1):
-            try:
-                return self._route_once(**fields)
-            except OperationalError as exc:
-                if not database_busy(exc) or attempt == ROUTE_ATTEMPTS:
-                    raise
-                logger.warning("The database was busy routing a Discord message; trying again (%d)", attempt)
-                time.sleep(ROUTE_PAUSE_SECONDS * attempt)
-        return None
+        return _when_free(lambda: self._route_once(**fields), "routing a Discord message")
 
     def _route_once(
         self,
@@ -333,10 +361,41 @@ class TasqueBot(discord.Client):
                 )
             payloads.append(
                 DiscordAttachmentPayload(
-                    filename=attachment.filename, content_type=attachment.content_type, data=await attachment.read()
+                    filename=attachment.filename,
+                    content_type=attachment.content_type,
+                    data=await attachment.read(),
+                    voice=bool(getattr(attachment, "is_voice_message", lambda: False)()),
                 )
             )
         return payloads
+
+    async def _hear(self, channel, clips: list[DiscordAttachmentPayload]) -> str:
+        """The words spoken in the voice clips, typing meanwhile: empty when one could not be made out."""
+        heard = []
+        async with contextlib.AsyncExitStack() as typing:
+            try:
+                await typing.enter_async_context(channel.typing())
+            except discord.HTTPException:
+                pass  # typing is a courtesy; the message goes on without it
+            for clip in clips:
+                words = await asyncio.to_thread(self._transcribe, clip)
+                if not words:
+                    return ""
+                heard.append(words)
+        return " ".join(heard)
+
+    def _transcribe(self, clip: DiscordAttachmentPayload) -> str:
+        """One clip's words, in a span saying whether it was heard: empty when nothing was said or it failed
+        (a failure is logged)."""
+        with span("tasque.discord.transcribe") as current:
+            try:
+                words = voice.transcribe(clip.data, model=self.voice_model, language=self.voice_language)
+            except voice.VoiceError as exc:
+                record_exception(current, exc)
+                logger.warning("Could not transcribe a Discord voice message: %s", exc)
+                words = ""
+            current.set_attribute("tasque.discord.heard", bool(words))
+        return words
 
     def _allowed(self, user_id: str) -> bool:
         return not self.allowed_users or user_id in self.allowed_users
@@ -382,6 +441,38 @@ def _saved(discord_message_id: str) -> bool:
     with session_scope() as session:
         found = session.scalar(select(DiscordMessage.id).where(DiscordMessage.discord_message_id == discord_message_id))
         return found is not None
+
+
+def _when_free(action: Callable[[], Any], doing: str) -> Any:
+    """``action()``; when the database is busy, it is tried again after a pause rather than dropped."""
+    for attempt in range(1, ROUTE_ATTEMPTS):
+        try:
+            return action()
+        except OperationalError as exc:
+            if not database_busy(exc):
+                raise
+            logger.warning("The database was busy %s; trying again (%d)", doing, attempt)
+            time.sleep(ROUTE_PAUSE_SECONDS * attempt)
+    return action()
+
+
+def _save_unheard(
+    *, discord_message_id: str, channel_id: str, thread_id: str | None, author: str, content: str
+) -> None:
+    """Save a voice message that could not be made out as received, so the catch-up never routes it again."""
+
+    def save() -> None:
+        with session_scope() as session:
+            DiscordService(session).record_message(
+                discord_message_id=discord_message_id,
+                discord_channel_id=channel_id,
+                discord_thread_id=thread_id,
+                direction="inbound",
+                author=author,
+                content_preview="\n\n".join(part for part in (content.strip(), UNHEARD_PREVIEW) if part),
+            )
+
+    _when_free(save, "saving a Discord message")
 
 
 def _newest_saved_message_at() -> datetime | None:

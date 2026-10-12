@@ -15,7 +15,8 @@ The pieces:
 - **Memory**: canonical documents (a lane's standing rules, "doctrine") plus atomic facts, with
   keyword and vector recall. Workers read and write it through MCP tools.
 - **Discord**: plain messages in the intake channel become work; replies in a result's thread
-  become follow-up runs of the same lane.
+  become follow-up runs of the same lane. Voice messages are transcribed on the machine first
+  and handled as typed text.
 - **Extensions**: your own domains (ledgers, tools, computed digests) as local Python packages.
 
 Everything lives in one SQLite database and a data directory.

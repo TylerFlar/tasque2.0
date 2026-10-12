@@ -8,6 +8,7 @@ dependencies = [
     "alembic>=1.17.0",
     "croniter>=6.0.0",
     "discord.py>=2.6.0",
+    "faster-whisper>=1.2.1",
     "httpx>=0.28.0",
     "mcp>=2.2",
     "numpy>=2.0",
@@ -32,6 +33,10 @@ dev = [
     "pytest>=9.0.0",
     "ruff>=0.14.0",
 ]
+
+[tool.uv]
+# faster-whisper 1.2.1 passes av.open a metadata_errors argument that PyAV 19 removed.
+constraint-dependencies = ["av<19"]
 
 [build-system]
 requires = ["hatchling"]

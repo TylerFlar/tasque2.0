@@ -113,6 +113,7 @@ class DiscordAttachmentPayload:
     filename: str
     content_type: str | None
     data: bytes
+    voice: bool = False  # the clip of a Discord voice message
 
 
 @dataclass(frozen=True)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -16,7 +17,15 @@ from sqlalchemy.exc import OperationalError
 from tasque2.config import Settings, reset_settings
 from tasque2.db import session_scope
 from tasque2.discord import bot as bot_module
-from tasque2.discord.bot import TasqueBot, _referenced_message_id, _waiting_on, discord_configured, output_channels
+from tasque2.discord import voice
+from tasque2.discord.bot import (
+    TasqueBot,
+    _referenced_message_id,
+    _saved,
+    _waiting_on,
+    discord_configured,
+    output_channels,
+)
 from tasque2.discord.output import OutputChannels
 from tasque2.discord.routing import DiscordRouteResult, DiscordService
 from tasque2.models import DiscordMessage, WorkflowNode, WorkItem
@@ -60,6 +69,8 @@ class _Typing:
 
     async def __aenter__(self) -> None:
         self.channel.typing_count += 1
+        if self.channel.typing_error is not None:
+            raise self.channel.typing_error
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
         return None
@@ -69,6 +80,7 @@ class _Channel:
     def __init__(self, channel_id: int = 100) -> None:
         self.id = channel_id
         self.typing_count = 0
+        self.typing_error: Exception | None = None
         self.sent: list[str] = []
 
     def typing(self) -> _Typing:
@@ -101,6 +113,17 @@ class _Attachment:
 
     async def read(self) -> bytes:
         return self._data
+
+
+class _VoiceClip(_Attachment):
+    """A voice message's clip, as discord.py reads it."""
+
+    def __init__(self, data: bytes = b"OggS clip") -> None:
+        super().__init__("voice-message.ogg", data)
+        self.content_type = "audio/ogg"
+
+    def is_voice_message(self) -> bool:
+        return True
 
 
 def _message(**fields: Any) -> SimpleNamespace:
@@ -368,7 +391,9 @@ def test_on_message_routes_the_message_fields() -> None:
     assert route["author"] == "user#0001"
     assert route["content"] == "Book the dentist."
     assert route["referenced"] == "321"
-    assert [(item.filename, item.data) for item in route["attachments"]] == [("notes.txt", b"call before noon")]
+    assert [(item.filename, item.data, item.voice) for item in route["attachments"]] == [
+        ("notes.txt", b"call before noon", False)
+    ]
 
 
 def test_on_message_routes_a_thread_message_with_its_thread_id() -> None:
@@ -412,6 +437,153 @@ def test_on_message_refuses_an_oversized_attachment_in_the_channel() -> None:
 
     assert seen["routes"] == []
     assert channel.sent == ["Attachment 'scan.pdf' is 20 bytes; the limit is 10 bytes."]
+
+
+# --- voice messages -----------------------------------------------------------------------------------------
+
+
+def _hears(monkeypatch: pytest.MonkeyPatch, answer: str | Exception) -> list[tuple[bytes, str, str | None]]:
+    """Fake the speech model's child process: each clip it is given, and its answer (words, or a failure)."""
+    clips: list[tuple[bytes, str, str | None]] = []
+
+    def transcribe(data: bytes, *, model: str, language: str | None = None) -> str:
+        clips.append((data, model, language))
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    monkeypatch.setattr(voice, "transcribe", transcribe)
+    return clips
+
+
+def _transcribe_spans(spans) -> list:
+    return [span for span in spans.get_finished_spans() if span.name == "tasque.discord.transcribe"]
+
+
+@pytest.mark.parametrize(
+    ("typed", "routed"), [("", "Two eggs and toast."), ("Lunch:", "Lunch:\n\nTwo eggs and toast.")]
+)
+def test_a_voice_message_is_routed_as_its_words_without_the_clip(
+    monkeypatch: pytest.MonkeyPatch, spans, typed: str, routed: str
+) -> None:
+    clips = _hears(monkeypatch, "Two eggs and toast.")
+    channel = _Channel()
+    message = _message(channel=channel, content=typed, attachments=[_VoiceClip(), _Attachment("menu.txt", b"soup")])
+
+    seen = _deliver(TasqueBot(_settings(voice_model="tiny")), message, DiscordRouteResult("work_queued", "w1"))
+
+    [route] = seen["routes"]
+    assert route["content"] == routed
+    assert [item.filename for item in route["attachments"]] == ["menu.txt"]
+    assert clips == [(b"OggS clip", "tiny", "en")]
+    assert channel.typing_count == 1 and channel.sent == []
+    assert seen["typing"] == ["w1"]
+    [transcribed] = _transcribe_spans(spans)
+    assert transcribed.attributes["tasque.discord.heard"] is True
+
+
+def test_typing_that_fails_never_stops_a_voice_message(monkeypatch: pytest.MonkeyPatch) -> None:
+    clips = _hears(monkeypatch, "Two eggs and toast.")
+    channel = _Channel()
+    channel.typing_error = discord.HTTPException(SimpleNamespace(status=429, reason="Too Many Requests"), "slow down")
+    message = _message(channel=channel, content="", attachments=[_VoiceClip()])
+
+    seen = _deliver(TasqueBot(_settings(voice_model="tiny", voice_language=" ")), message)
+
+    assert [route["content"] for route in seen["routes"]] == ["Two eggs and toast."]
+    assert clips == [(b"OggS clip", "tiny", None)]  # a blank language lets the model detect it
+
+
+@pytest.mark.parametrize("answer", [voice.VoiceError("RuntimeError: Invalid data found"), ""])
+def test_a_voice_message_that_cannot_be_made_out_is_answered_saved_and_never_routed(
+    fresh_db: Path, monkeypatch: pytest.MonkeyPatch, caplog, spans, answer: str | Exception
+) -> None:
+    _hears(monkeypatch, answer)
+    channel = _Channel()
+    message = _message(id=902, channel=channel, content="", attachments=[_VoiceClip()])
+
+    with caplog.at_level(logging.WARNING, logger="tasque2.discord.bot"):
+        seen = _deliver(TasqueBot(_settings(voice_model="tiny")), message)
+
+    assert seen["routes"] == [] and seen["typing"] == []
+    assert channel.sent == [
+        "Couldn't make out that voice message, so nothing was done with it. Please type it instead."
+    ]
+    with session_scope() as session:
+        [saved] = session.scalars(select(DiscordMessage)).all()
+        assert (saved.discord_message_id, saved.direction, saved.work_item_id) == ("902", "inbound", None)
+        assert saved.content_preview == "(a voice message that could not be made out; nothing was done with it)"
+    assert _saved("902")  # so the catch-up never routes it again
+    failed = isinstance(answer, Exception)
+    assert [record.getMessage() for record in caplog.records if record.name == "tasque2.discord.bot"] == (
+        ["Could not transcribe a Discord voice message: RuntimeError: Invalid data found"] if failed else []
+    )
+    [transcribed] = _transcribe_spans(spans)
+    assert transcribed.attributes["tasque.discord.heard"] is False
+    assert transcribed.attributes.get("error.type") == ("VoiceError" if failed else None)
+
+
+def test_an_unheard_voice_message_is_saved_after_a_pause_when_the_database_is_busy(
+    fresh_db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pauses: list[float] = []
+    monkeypatch.setattr(bot_module.time, "sleep", pauses.append)
+    original = DiscordService.record_message
+    failures = {"busy": 1}
+
+    def busy_once(self, **fields: Any):
+        if failures["busy"]:
+            failures["busy"] -= 1
+            raise OperationalError("INSERT", {}, Exception("database is locked"))
+        return original(self, **fields)
+
+    monkeypatch.setattr(DiscordService, "record_message", busy_once)
+    _hears(monkeypatch, "")
+
+    _deliver(TasqueBot(_settings(voice_model="tiny")), _message(id=903, content="Dinner", attachments=[_VoiceClip()]))
+
+    assert pauses == [bot_module.ROUTE_PAUSE_SECONDS]
+    with session_scope() as session:
+        [saved] = session.scalars(select(DiscordMessage)).all()
+        assert saved.content_preview == "Dinner\n\n" + bot_module.UNHEARD_PREVIEW
+
+
+def test_with_voice_off_a_voice_message_is_routed_with_its_clip_as_before(monkeypatch: pytest.MonkeyPatch) -> None:
+    clips = _hears(monkeypatch, "Two eggs and toast.")
+    channel = _Channel()
+
+    seen = _deliver(TasqueBot(_settings()), _message(channel=channel, content="", attachments=[_VoiceClip()]))
+
+    [route] = seen["routes"]
+    assert route["content"] == ""
+    assert [(item.filename, item.data, item.voice) for item in route["attachments"]] == [
+        ("voice-message.ogg", b"OggS clip", True)
+    ]
+    assert clips == [] and channel.typing_count == 0
+
+
+def test_setup_hook_downloads_the_speech_model_once_without_waiting(monkeypatch: pytest.MonkeyPatch) -> None:
+    downloads: list[str] = []
+    finish = threading.Event()
+
+    def fetch(model: str) -> None:
+        downloads.append(model)
+        finish.wait(5)
+
+    monkeypatch.setattr(voice, "fetch", fetch)
+
+    def fetching() -> list[threading.Thread]:
+        return [thread for thread in threading.enumerate() if thread.name == "voice-fetch"]
+
+    asyncio.run(TasqueBot(_settings()).setup_hook())
+    assert fetching() == []  # voice is off
+
+    asyncio.run(TasqueBot(_settings(voice_model="large-v3-turbo")).setup_hook())  # returns while it downloads
+    [thread] = fetching()
+    assert thread.daemon  # a first download never holds up shutdown
+    finish.set()
+    thread.join(5)
+    assert downloads == ["large-v3-turbo"]
 
 
 # --- gate buttons -------------------------------------------------------------------------------------------

@@ -72,6 +72,10 @@ class Settings(BaseSettings):
     discord_output_poll_seconds: float = Field(default=5.0)
     discord_allowed_user_ids: str | None = Field(default=None)
     discord_max_attachment_bytes: int = Field(default=25 * 1024 * 1024)
+    # Speech to text for Discord voice messages, on this machine (a faster-whisper model): blank turns it off.
+    voice_model: str = Field(default="large-v3-turbo")
+    # The language spoken in them; blank lets the model detect it.
+    voice_language: str = Field(default="en")
 
     daemon_concurrency: int = Field(default=1)
     daemon_lease_seconds: int = Field(default=600)
