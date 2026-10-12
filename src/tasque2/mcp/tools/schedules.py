@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from sqlalchemy import select
+from sqlalchemy.orm import Session
 
 from tasque2.db import session_scope
 from tasque2.mcp.tools._shared import (
@@ -66,7 +67,7 @@ def schedule_list(enabled: bool | None = None, limit: int = 20, intent: str = ""
 
 
 def schedule_get(schedule_id: str, intent: str = "") -> str:
-    """Fetch one schedule with its payload and contract."""
+    """Fetch one schedule with its payload and contract, by its id or its exact name."""
     return run_json(lambda: _get(schedule_id), intent=intent)
 
 
@@ -155,11 +156,23 @@ def _list(enabled: bool | None, limit: int) -> dict[str, Any]:
 
 
 def _get(schedule_id: str) -> dict[str, Any]:
+    value = required(schedule_id, "schedule_id")
     with session_scope() as session:
-        schedule = session.get(Schedule, required(schedule_id, "schedule_id"))
+        schedule = session.get(Schedule, value)
         if schedule is None:
-            raise KeyError(f"Unknown schedule: {schedule_id}")
+            schedule = _named(session, value)
         return {"ok": True, "schedule": schedule_data(schedule, full=True)}
+
+
+def _named(session: Session, name: str) -> Schedule:
+    """The one schedule with this exact name."""
+    matches = session.scalars(select(Schedule).where(Schedule.name == name).order_by(Schedule.created_at)).all()
+    if not matches:
+        raise KeyError(f"Unknown schedule: {name}")
+    if len(matches) > 1:
+        ids = ", ".join(match.id for match in matches)
+        raise ValueError(f"{name!r} names {len(matches)} schedules; use an id: {ids}")
+    return matches[0]
 
 
 def _update(**fields: Any) -> dict[str, Any]:

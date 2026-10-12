@@ -770,6 +770,42 @@ def test_schedule_tools_create_get_update_toggle_fire_and_delete(fresh_db: Path)
     assert _error(tools.schedule_get(schedule_id=schedule_id))["error_type"] == "KeyError"
 
 
+def test_schedule_get_finds_a_schedule_by_its_exact_name(fresh_db: Path) -> None:
+    created = _ok(
+        tools.schedule_create_work(
+            name="Nightly digest",
+            schedule_type="cron",
+            expression="0 22 * * *",
+            task_instruction="Write the digest.",
+            context={"memory_namespace": "digest"},
+            runtime_contract={"model_profile": "low"},
+        )
+    )
+    schedule_id = created["schedule"]["id"]
+
+    by_name = _ok(tools.schedule_get(schedule_id="Nightly digest"))
+
+    assert by_name["schedule"]["id"] == schedule_id
+    assert by_name["schedule"]["payload"]["context"] == {"memory_namespace": "digest"}
+    assert by_name["schedule"]["runtime_contract"] == {"model_profile": "low"}
+    assert by_name == _ok(tools.schedule_get(schedule_id=schedule_id))
+
+
+def test_schedule_get_by_name_rejects_a_shared_name_and_an_unknown_one(fresh_db: Path) -> None:
+    twins = [
+        tools.schedule_create_work(name="Twin", schedule_type="interval", expression="hours=6", task_instruction="Go.")
+        for _ in range(2)
+    ]
+    twin_ids = [_ok(created)["schedule"]["id"] for created in twins]
+
+    shared = _error(tools.schedule_get(schedule_id="Twin"))
+    unknown = _error(tools.schedule_get(schedule_id="No such schedule"))
+
+    assert shared["error_type"] == "ValueError"
+    assert all(twin_id in shared["error"] for twin_id in twin_ids)
+    assert unknown["error_type"] == "KeyError"
+
+
 def test_schedule_update_can_clear_the_thread(fresh_db: Path) -> None:
     created = _ok(
         tools.schedule_create_work(
