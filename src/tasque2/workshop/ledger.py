@@ -1,10 +1,12 @@
-"""The Workshop's ledger (``WorkshopIssue``): one row per distinct issue its sweep saw, or idea a card offered.
+"""The Workshop's ledger (``WorkshopIssue``): one row per distinct issue its sweep saw, idea a card offered, or
+goal due a review.
 
 The sweep (``tasque2.workshop.sweep``) hands ``record`` what it sees as ``Signal``s, each keyed for good
 (``fault:<signature>``). A signal is either a run of events (``occurrences``: each time it happened, so a
 row counts each one once however often the sweep looks) or a condition that stands now (``count``: its
 size, when it has one). A row is worth a look once it happened ``min_count`` times and has stood
-``min_age``.
+``min_age``. A goal's review row (kind ``review``, ``goal_review:<goal>``: its own count or the monthly look
+names it) is never triage's: ``tasque2.workshop.reviews`` starts its review.
 
 Where a row stands (``status``):
 
@@ -40,9 +42,13 @@ WATCHING, NEW, WAITING, FILED, RESTING, DONE, RETIRED = (
     "done",
     "retired",
 )
-ISSUE, IDEA = "issue", "idea"
+ISSUE, IDEA, REVIEW = "issue", "idea", "review"
 SET_ASIDE = timedelta(days=60)
 ONE_TRY = timedelta(days=30)
+# A goal's review row stands while it is seen: within a day of the sweep whose count last saw it (a goal back on
+# plan is left alone), or within 35 days of the monthly look that named it (``LOOK_ON``, in its ``detail``).
+COUNT_SEEN, LOOK_SEEN = timedelta(days=1), timedelta(days=35)
+LOOK_ON = "look_on"
 EVIDENCE_LINES = 5
 EVIDENCE_CHARS = 300
 TITLE_CHARS = 240
@@ -62,6 +68,7 @@ class Signal:
     min_count: int = 1
     min_age: timedelta = timedelta(0)
     since: datetime | None = None
+    kind: str = ISSUE
 
 
 def aware(value: datetime) -> datetime:
@@ -107,7 +114,7 @@ def record(session: Session, signals: list[Signal], *, now: datetime | None = No
         if found is None:
             found = WorkshopIssue(
                 key=signal.key[:240],
-                kind=ISSUE,
+                kind=signal.kind,
                 source=signal.source,
                 title=clip(signal.title, TITLE_CHARS),
                 evidence=_evidence(signal.evidence),
@@ -237,19 +244,74 @@ def counts(session: Session) -> dict[str, int]:
     return {status: number for status, number in session.execute(statement).all()}
 
 
-def status_lines(session: Session) -> list[str]:
-    """The ledger in a few lines, for ``status``."""
+def status_lines(session: Session, *, now: datetime | None = None) -> list[str]:
+    """The ledger in a few lines, for ``status``: the issues, the fixes waiting for a slot, and the goal reviews
+    open or waiting their turn."""
+    now = aware(now or utc_now())
     numbers = counts(session)
-    if not numbers:
-        return ["Ledger: empty."]
     order = (NEW, WAITING, FILED, WATCHING, RESTING, DONE)
     parts = [f"{numbers[status]} {status}" for status in order if numbers.get(status)]
-    lines = [f"Ledger: {', '.join(parts)}."]
+    lines = [f"Ledger: {', '.join(parts)}." if parts else "Ledger: empty."]
     groups = waiting_groups(session)
     if groups:
         lines.append("Waiting for a free slot:")
         lines += [f"- {clip(proposal.get('title') or found[0].title, 70)}" for proposal, found in groups[:5]]
+    reviews = [found for found in review_rows(session, FILED, NEW) if found.status == FILED or review_due(found, now)]
+    if reviews:
+        lines.append("Goal reviews:")
+        lines += [
+            f"- {clip(found.title, 70)}: {'under review' if found.status == FILED else 'waiting its turn'}"
+            for found in reviews[:5]
+        ]
     return lines
+
+
+# --- goal reviews ----------------------------------------------------------------------------------
+
+
+def goal_name(value: Any) -> str:
+    """A goal as its review row names it: its goal document's key without ``_goal``, in plain characters."""
+    name = re.sub(r"[^a-z0-9]+", "_", str(value or "").strip().lower()).strip("_")
+    return name.removesuffix("_goal")[:60]
+
+
+def review_key(goal: str) -> str:
+    return f"goal_review:{goal}"
+
+
+def review_rows(session: Session, *statuses: str) -> list[WorkshopIssue]:
+    """The goals' review rows (those in ``statuses``, when given), in the order they joined the ledger: rows
+    that joined in one sweep keep the order their source gave them, else go by key."""
+    statement = select(WorkshopIssue).where(WorkshopIssue.kind == REVIEW)
+    if statuses:
+        statement = statement.where(WorkshopIssue.status.in_(statuses))
+    return list(session.scalars(statement.order_by(WorkshopIssue.created_at, WorkshopIssue.key)).all())
+
+
+def looked_on(found: WorkshopIssue) -> datetime | None:
+    """When the monthly look last named this goal for a review, if it did."""
+    try:
+        return aware(datetime.fromisoformat(str((found.detail or {}).get(LOOK_ON))))
+    except (TypeError, ValueError):
+        return None
+
+
+def review_due(found: WorkshopIssue, now: datetime) -> bool:
+    """Whether a goal's review row still stands: its count saw it within a day, or the look named it within 35
+    days."""
+    if aware(now) - aware(found.last_seen_at) <= COUNT_SEEN:
+        return True
+    named = looked_on(found)
+    return named is not None and aware(now) - named <= LOOK_SEEN
+
+
+def mark_looked(session: Session, key: str, *, evidence: list[str], now: datetime) -> None:
+    """The monthly look named this goal for a review: its row stands 35 days, and the look's reasons go with the
+    review even after its count refreshes the row."""
+    found = row(session, key)
+    if found is not None:
+        found.detail = {**(found.detail or {}), LOOK_ON: aware(now).isoformat(), "look_evidence": _evidence(evidence)}
+        session.flush()
 
 
 # --- ideas ---------------------------------------------------------------------------------------

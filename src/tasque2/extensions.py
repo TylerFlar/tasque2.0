@@ -13,7 +13,8 @@ directory (``TASQUE2_EXTENSIONS_DIR``, default ``extensions/``), each exposing
 - attempt ingestors that run after every successfully completed attempt;
 - schedule gates: code that decides, before a scheduled run is launched, whether it is needed;
 - sticky sections: fields a thread's sticky note shows below its notes, kept current in place;
-- signal sources: issues the Workshop's sweep should know about (a decision that took its default).
+- signal sources: issues the Workshop's sweep should know about (a decision that took its default), or a
+  goal off plan by its own count.
 
 Extensions load once per process on first use. A broken extension raises: a daemon that
 silently lost its domain tools would corrupt runs far worse than a loud startup failure.
@@ -117,7 +118,9 @@ class ExtensionRegistry:
 
         ``source(session, now)`` returns one ``{"key", "title", "evidence"}`` per distinct issue that stands
         now (``key`` stable for as long as it stands, ``evidence`` a few short lines; ``since`` when it began,
-        when known). It reads the ledgers and never calls out. One that raises is left out of that sweep.
+        when known). An item that names a ``goal`` (its goal document's key without ``_goal``) says that goal
+        is off plan by its own count: it is the goal's review row (``tasque2.workshop.reviews``), never an
+        issue for triage. It reads the ledgers and never calls out. One that raises is left out of that sweep.
         """
         self.signal_sources.append((name, source))
 

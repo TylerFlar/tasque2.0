@@ -599,6 +599,29 @@ def test_workflow_node_context_merges_run_input_under_node_context(fresh_db: Pat
         assert (work.source_kind, work.source_id) == ("workflow", run.id)
 
 
+def test_a_reference_to_input_reads_the_run_input(fresh_db: Path) -> None:
+    nodes = [
+        {
+            "key": "plan",
+            "worker_kind": "function.echo",
+            "runtime_contract": {"model_profile": "high"},
+            "contract_from": {"model_profile": "input.plan_profile"},
+        },
+        {"key": "gate", "kind": "gate", "card_from": "input.card", "depends_on": ["plan"]},
+    ]
+    with session_scope() as session:
+        service, chosen = _start(session, "input-refs", nodes, input={"plan_profile": "ultra", "card": "Pick one."})
+        plain = service.start_run(workflow_definition_id=chosen.workflow_definition_id, input={})
+        service.tick_runs()
+        assert _run_work(session, chosen.id)[0].runtime_contract["model_profile"] == "ultra"
+        assert _run_work(session, plain.id)[0].runtime_contract["model_profile"] == "high"  # nothing there: as stored
+        WorkRunner(session).run_next()
+        WorkRunner(session).run_next()
+        service.tick_runs()
+        assert _node(session, chosen.id, "gate").input["card"] == "Pick one."
+        assert "card" not in _node(session, plain.id, "gate").input
+
+
 def test_workflow_runs_record_their_outcome(fresh_db: Path, metric_points) -> None:
     with session_scope() as session:
         service, completed = _start(session, "outcome-probe-completed", [{"key": "gate", "kind": "gate"}])

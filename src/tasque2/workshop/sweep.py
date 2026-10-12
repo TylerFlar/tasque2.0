@@ -16,10 +16,13 @@
   for a reply);
 - decisions never answered: ``Open for the user's decision: ... (asked)`` lines a week old, and what
   extensions report (``add_signal_source``: a board decision that took its default, say);
-- the journal's weekly notes when they changed (the sweep reads only the file's date; triage reads them).
+- the journal's weekly notes when they changed (the sweep reads only the file's date; triage reads them);
+- goals off plan by their own count: an extension's item that names a ``goal`` is that goal's review row
+  (``goal_review:<goal>``), which triage never sees.
 
 Then it expires the Workshop's cards left unanswered for 14 days, files proposed fixes into free slots,
-and starts a triage when the ledger holds new rows (``tasque2.workshop.triage``).
+starts the next goal review that is due (``tasque2.workshop.reviews``), and starts a triage when the ledger
+holds new rows (``tasque2.workshop.triage``).
 """
 
 from __future__ import annotations
@@ -671,7 +674,8 @@ def open_decisions(session: Session) -> list[Signal]:
 
 
 def extension_signals(session: Session, now: datetime, *, strict: bool = False) -> list[Signal]:
-    """What extensions report (``add_signal_source``); a source that fails is left out of this sweep."""
+    """What extensions report (``add_signal_source``); a source that fails is left out of this sweep. An item
+    that names a ``goal`` (off plan by its own count) is that goal's review row, shared with the monthly look."""
     from tasque2.extensions import registry
 
     found = []
@@ -686,13 +690,15 @@ def extension_signals(session: Session, now: datetime, *, strict: bool = False) 
         for item in items:
             if not isinstance(item, dict) or not item.get("key") or not item.get("title"):
                 continue
+            goal = ledger.goal_name(item.get("goal"))
             found.append(
                 Signal(
-                    key=f"{name}:{item['key']}",
+                    key=ledger.review_key(goal) if goal else f"{name}:{item['key']}",
                     source=str(item.get("source") or name),
                     title=str(item["title"]),
                     evidence=[str(line) for line in item.get("evidence") or []],
                     since=_moment(item.get("since")),
+                    kind=ledger.REVIEW if goal else ledger.ISSUE,
                 )
             )
     return found
@@ -738,9 +744,9 @@ def gather(
 
 
 def sweep_worker(work_item: WorkItem) -> dict[str, Any]:
-    """``function.workshop_sweep``: gather into the ledger, expire old cards, file fixes into free slots, and
-    start a triage when there is something new. Posts nothing."""
-    from tasque2.workshop import pipeline, triage
+    """``function.workshop_sweep``: gather into the ledger, expire old cards, file fixes into free slots, start
+    the next goal review that is due, and start a triage when there is something new. Posts nothing."""
+    from tasque2.workshop import pipeline, reviews, triage
 
     session = pipeline._session(work_item)
     now = utc_now()
@@ -750,10 +756,13 @@ def sweep_worker(work_item: WorkItem) -> dict[str, Any]:
     tally = ledger.record(session, signals, now=now)
     expired = pipeline.expire_cards(session, now=now)
     filed = triage.file_waiting(session, thread_id=thread, now=now)
+    review = reviews.file_next(session, thread_id=thread, now=now)
     run = triage.start(session, thread_id=thread, context=context)
     summary = (
         f"Swept {len(signals)} signal(s): {tally['new']} new, {tally['created']} first seen; "
-        f"{len(filed)} fix(es) filed, {expired} card(s) expired" + ("; triage started." if run is not None else ".")
+        f"{len(filed)} fix(es) filed, {expired} card(s) expired"
+        + (f"; goal review started: {review['title']}" if review else "")
+        + ("; triage started." if run is not None else ".")
     )
     produced = {
         "silent": True,
@@ -761,6 +770,7 @@ def sweep_worker(work_item: WorkItem) -> dict[str, Any]:
         **dict(tally),
         "expired": expired,
         "filed": filed,
+        "review": review,
         "triage_run_id": run.id if run is not None else None,
     }
     return {"summary": summary, "produces": produced}

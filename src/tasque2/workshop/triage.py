@@ -9,9 +9,10 @@ triage is open:
    60 days, a row triage left out rests 30, and the fixes go into free slots.
 
 ``file_waiting`` fills the slots (the sweep calls it too): each fix becomes a change of the Workshop's own
-(``origin: workshop``), so the usual tiers decide what ships on its own. At most ``MAX_OPEN`` of the
-Workshop's own changes are open, cards included, and none shares a file with any open change; the user's
-own asks never wait for it. A paused Workshop files nothing.
+(``origin: workshop``), so the usual tiers decide what ships on its own. The ``MAX_OPEN`` slots are the
+fixes': at most that many of the Workshop's own changes are open, cards included, a goal's review not
+counted (``tasque2.workshop.reviews`` holds those to one at a time), and none shares a file with any open
+change; the user's own asks never wait for it. A paused Workshop files nothing.
 """
 
 from __future__ import annotations
@@ -185,13 +186,15 @@ def file_worker(work_item: WorkItem) -> dict[str, Any]:
 
 
 def file_waiting(session: Session, *, thread_id: str | None, now: datetime | None = None) -> list[dict[str, Any]]:
-    """File each waiting fix that fits: a slot free among the Workshop's own open changes, no file shared
-    with any open change, and no row of it tried within 30 days."""
+    """File each waiting fix that fits: a slot free among the Workshop's own open fixes (a goal's review takes
+    none), no file shared with any open change, and no row of it tried within 30 days."""
     now = aware(now or utc_now())
     if not thread_id or pipeline.paused():
         return []
     open_runs = pipeline.open_changes(session)
-    slots = MAX_OPEN - sum(1 for run in open_runs if (run.input or {}).get("origin") == "workshop")
+    slots = MAX_OPEN - sum(
+        1 for run in open_runs if (run.input or {}).get("origin") == "workshop" and not (run.input or {}).get("review")
+    )
     busy: set[str] = set()
     for run in open_runs:
         busy |= pipeline.change_files(session, run)

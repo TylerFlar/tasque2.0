@@ -10,6 +10,9 @@ A gate's choice may ask for a note (``ask_note``: the choice and its text box's 
 with the answer. A work node that names an earlier node (``rewind_to``) and finishes with
 ``rewind: true`` sends its run back there for another round: that node and every node after it
 start over, up to ``REWIND_ROUNDS_MAX`` rounds a run.
+
+A reference to an upstream output (``"<node>.<path>"``: ``skip_when``, ``card_from``, ``contract_from``,
+``items_from_output``) may name ``input`` instead of a node: the run's own input.
 """
 
 from __future__ import annotations
@@ -52,6 +55,7 @@ GATE_CHOICES_MAX = 5  # one Discord row of buttons
 GATE_CHOICE_CHARS = 80  # a Discord button label
 NOTE_LABEL_CHARS = 45  # a Discord text box label
 REWIND_ROUNDS_MAX = 20
+RUN_INPUT = "input"  # a reference to this node reads the run's own input
 _TEMPLATE_KEYS = (
     ("task_template_path", "task_instruction"),
     ("child_task_template_path", "child_task_instruction_template"),
@@ -467,7 +471,8 @@ class WorkflowService:
         context = {**dict(run.input), **dict(node_def.get("context") or {})}
         contract = dict(node_def.get("runtime_contract") or {})
         # ``contract_from`` fills contract keys from upstream outputs ("<node>.<path>"), e.g. a model tier
-        # chosen by an earlier step; an unresolved reference leaves the stored value.
+        # chosen by an earlier step, or from the run's input ("input.<path>"); an unresolved reference leaves
+        # the stored value.
         for key, reference in dict(node_def.get("contract_from") or {}).items():
             value = self._output_reference(run, reference)
             if value not in (None, ""):
@@ -584,7 +589,8 @@ class WorkflowService:
         return [] if items is None else items
 
     def _output_reference(self, run: WorkflowRun, reference: Any) -> Any:
-        """Resolve ``"<node>.<path>"`` (or ``{"node", "path"}``) against an upstream node's output."""
+        """Resolve ``"<node>.<path>"`` (or ``{"node", "path"}``) against an upstream node's output, or the
+        node ``input`` against the run's own input."""
         if isinstance(reference, str):
             node_key, _, path = reference.partition(".")
         elif isinstance(reference, dict):
@@ -593,6 +599,8 @@ class WorkflowService:
             return None
         if not node_key:
             return None
+        if node_key == RUN_INPUT:
+            return _output_path(run.input or {}, path)
         node = self.session.scalar(
             select(WorkflowNode).where(WorkflowNode.workflow_run_id == run.id, WorkflowNode.node_key == node_key)
         )

@@ -63,13 +63,44 @@ def test_effort_report_counts_posts_asks_and_pushback_per_thread(fresh_db: Path)
     assert report["totals"]["posts_per_week"] == 4.0
 
 
+def test_an_ask_is_answered_when_the_user_writes_before_the_next_post(fresh_db: Path) -> None:
+    start = utc_now().replace(microsecond=0) - timedelta(days=2)
+    with session_scope() as session:
+        _thread(session, "t-money", "money")
+        _message(session, thread="t-money", direction="outbound", text="Pay the card in full?", at=start)
+        _message(session, thread="t-money", direction="inbound", text="yes", at=start + timedelta(minutes=5))
+        _message(session, thread="t-money", direction="inbound", text="and thanks", at=start + timedelta(minutes=6))
+        _message(session, thread="t-money", direction="outbound", text="Which account?", at=start + timedelta(hours=1))
+        _message(session, thread="t-money", direction="outbound", text="Paid.", at=start + timedelta(hours=2))
+        _message(session, thread="t-money", direction="inbound", text="ok", at=start + timedelta(hours=3))
+        _message(
+            session, thread="t-money", direction="outbound", text="Confirm the move?", at=start + timedelta(hours=4)
+        )
+
+    with session_scope() as session:
+        report = effort_report(session, days=7)
+        earlier = effort_report(session, days=1, now=start + timedelta(minutes=30))
+
+    row = report["threads"][0]
+    # the first ask was answered; the second met Tasque's next post first; the last still waits
+    assert (row["asks"], row["answered"]) == (3, 1)
+    assert (report["totals"]["asks"], report["totals"]["answered"]) == (3, 1)
+    # a window ends at its own now: what came after it is not counted
+    assert (earlier["threads"][0]["posts"], earlier["threads"][0]["inbound"]) == (1, 2)
+    assert earlier["threads"][0]["answered"] == 1
+
+
 def test_effort_command_prints_the_totals_and_a_table(fresh_db: Path) -> None:
     with session_scope() as session:
         _thread(session, "t-1", "daybook")
         _message(session, thread="t-1", direction="outbound", text="Morning page", at=utc_now())
+        _thread(session, "t-2", "money")
+        _message(session, thread="t-2", direction="outbound", text="Pay it now?", at=utc_now() - timedelta(hours=2))
+        _message(session, thread="t-2", direction="inbound", text="yes", at=utc_now() - timedelta(hours=1))
 
     result = CliRunner().invoke(app, ["effort", "--days", "7"])
 
     assert result.exit_code == 0, result.output
-    assert "1 posts" in result.output
+    assert "2 posts" in result.output and "1 of 1 asks answered" in result.output
     assert "daybook" in result.output
+    assert "Answered" in result.output and "1/1" in result.output

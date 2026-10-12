@@ -1,8 +1,9 @@
 """How much Tasque asks of its user, per Discord thread: the numbers behind "low effort".
 
 ``effort_report`` reads the recorded Discord messages over a window and counts, per thread,
-the posts Tasque sent (how many a week, how long, how many ask the user for something) and
-the messages the user sent back (how many pushed back). A review compares two windows to see
+the posts Tasque sent (how many a week, how long, how many ask the user for something, and how
+many of those asks were answered: the user wrote in the thread before Tasque's next post there)
+and the messages the user sent back (how many pushed back). A review compares two windows to see
 whether a change made Tasque quieter without making it miss what the user needs.
 """
 
@@ -43,14 +44,19 @@ def thread_label(session: Session, thread_id: str | None) -> str:
 
 
 def effort_report(session: Session, *, days: int = 30, now: datetime | None = None) -> dict[str, Any]:
-    """Per-thread posts, asks, replies and pushback over the last ``days`` days."""
+    """Per-thread posts, asks (and how many were answered), replies and pushback over the ``days`` days to
+    ``now``."""
     now = now or utc_now()
     days = max(1, int(days))
     since = now - timedelta(days=days)
     weeks = days / 7
-    rows = session.scalars(select(DiscordMessage).where(DiscordMessage.created_at >= since)).all()
+    rows = session.scalars(
+        select(DiscordMessage)
+        .where(DiscordMessage.created_at >= since, DiscordMessage.created_at <= now)
+        .order_by(DiscordMessage.created_at)
+    ).all()
     threads: dict[str, dict[str, Any]] = defaultdict(
-        lambda: {"posts": 0, "lengths": [], "asks": 0, "inbound": 0, "pushback": 0}
+        lambda: {"posts": 0, "lengths": [], "asks": 0, "answered": 0, "inbound": 0, "pushback": 0, "open_ask": False}
     )
     for message in rows:
         key = message.discord_thread_id or message.discord_channel_id
@@ -58,12 +64,17 @@ def effort_report(session: Session, *, days: int = 30, now: datetime | None = No
         entry["thread_id"] = message.discord_thread_id
         text = message.content_preview or ""
         if message.direction == "outbound":
+            asked = bool(ASK.search(text))
             entry["posts"] += 1
             entry["lengths"].append(len(text))
-            entry["asks"] += bool(ASK.search(text))
+            entry["asks"] += asked
+            entry["open_ask"] = asked  # Tasque's next post ends the wait for an answer
         elif message.direction == "inbound":
             entry["inbound"] += 1
             entry["pushback"] += bool(PUSHBACK.search(text))
+            if entry["open_ask"]:
+                entry["answered"] += 1
+                entry["open_ask"] = False
 
     out: list[dict[str, Any]] = []
     for entry in threads.values():
@@ -75,15 +86,16 @@ def effort_report(session: Session, *, days: int = 30, now: datetime | None = No
             "posts_per_week": round(posts / weeks, 1),
             "median_chars": int(median(entry["lengths"])) if entry["lengths"] else 0,
             "ask_share": round(entry["asks"] / posts, 2) if posts else 0.0,
+            "asks": entry["asks"],
+            "answered": entry["answered"],
             "inbound": entry["inbound"],
             "pushback": entry["pushback"],
-            "_asks": entry["asks"],
         }
         out.append(row)
     out.sort(key=lambda row: (row["posts"], row["inbound"]), reverse=True)
 
     posts = sum(row["posts"] for row in out)
-    asks = sum(row.pop("_asks") for row in out)
+    asks = sum(row["asks"] for row in out)
     inbound = sum(row["inbound"] for row in out)
     return {
         "window": {"days": days, "since": since.isoformat(), "now": now.isoformat()},
@@ -91,6 +103,8 @@ def effort_report(session: Session, *, days: int = 30, now: datetime | None = No
             "posts": posts,
             "posts_per_week": round(posts / weeks, 1),
             "ask_share": round(asks / posts, 2) if posts else 0.0,
+            "asks": asks,
+            "answered": sum(row["answered"] for row in out),
             "inbound": inbound,
             "pushback": sum(row["pushback"] for row in out),
         },

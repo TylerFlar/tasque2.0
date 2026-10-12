@@ -1,16 +1,18 @@
 """The Workshop's change pipeline: one change to Tasque, from a request to a release, with an undo.
 
-A change starts from a request (the owner's words in the Workshop thread, an idea card's Build it, or a
-fix the Workshop's triage filed: ``tasque2.workshop.triage``) and runs the ``tasque-change`` workflow in
-its own worktrees (``tasque2.ops.worktree``: the core, each extension, and the config repository at
-``data``), next to the live checkout:
+A change starts from a request (the owner's words in the Workshop thread, an idea card's Build it, a fix
+the Workshop's triage filed: ``tasque2.workshop.triage``, or a goal's review: ``tasque2.workshop.reviews``)
+and runs the ``tasque-change`` workflow in its own worktrees (``tasque2.ops.worktree``: the core, each
+extension, and the config repository at ``data``), next to the live checkout:
 
 1. ``plan`` (a model run that reads the change's own checkout; the guard refuses writes outside it):
    what to change, where and why in at most 25 lines, a pitch of a few plain lines for the owner, up to 4
    questions with defaults, what it touches and which files. A request that needs no change (a question,
-   a batch of ideas, evidence that no longer holds) ends here with its answer;
+   a batch of ideas, evidence that no longer holds) ends here with its answer. A goal's review plans at
+   ultra (its input's ``plan_profile``);
 2. ``classify`` (no model): the tier from ``tasque2.workshop.policy``, never from the model: a pitch to
-   approve first, or shipping on its own;
+   approve first, or shipping on its own. A goal's review is a redesign whatever its plan says, so it always
+   comes as a pitch and builds at ultra;
 3. ``plan_gate``: Approve, Revise or Discard, only for a change whose pitch needs approving. Revise opens a
    text box for what should change;
 4. ``prepare`` (no model): Revise sends the same change back to ``plan`` (the workflow's ``rewind_to``)
@@ -85,6 +87,7 @@ TOUCHES = (
     "routine",
 )
 CODE_TOUCHES = {"core", "extension", "migrations", "dependencies"}
+REVIEW_PROFILE = "ultra"  # a goal's review is planned (and, as a redesign, built) at this tier
 WAIT_FOR_CODE = timedelta(hours=2)
 ROLLBACKS_TO_PAUSE, ROLLBACK_WINDOW = 2, timedelta(days=7)
 CARD_EXPIRES = timedelta(days=14)
@@ -288,13 +291,15 @@ def definition() -> dict[str, Any]:
             "depends_on": [after],
         }
 
+    plan = model_run("plan", "Workshop: plan the change", PLAN_LANE, PLAN_TEMPLATE, PLAN_FALLBACK, "plan")
+    plan["contract_from"] = {"model_profile": "input.plan_profile"}
     build = model_run("build", "Workshop: build the change", BUILD_LANE, BUILD_TEMPLATE, BUILD_FALLBACK, "build")
     build.update(
         {"depends_on": ["prepare"], "skip_when": "prepare.stop", "contract_from": {"model_profile": "classify.profile"}}
     )
     return {
         "nodes": [
-            model_run("plan", "Workshop: plan the change", PLAN_LANE, PLAN_TEMPLATE, PLAN_FALLBACK, "plan"),
+            plan,
             step("classify", "Workshop: what the change needs", CLASSIFY_WORKER, "plan"),
             {
                 "key": "plan_gate",
@@ -375,10 +380,11 @@ def start_change(
     evidence: list[str] | None = None,
     files: list[str] | None = None,
     issues: list[str] | None = None,
+    review: dict[str, Any] | None = None,
 ) -> WorkflowRun:
     """Make the change's worktrees (the live config committed first, doctrine exported) and start its run.
     A fix the Workshop filed names the ``files`` triage expects it to touch and the ledger rows (``issues``)
-    it answers."""
+    it answers; a goal's review names the goal it rethinks (``review``) and is planned at ultra."""
     from tasque2.ops import datarepo
     from tasque2.ops.worktree import create_worktrees
     from tasque2.workflows import WorkflowService
@@ -404,6 +410,7 @@ def start_change(
             "evidence": list(evidence or []),
             "files": list(files or []),
             "issues": list(issues or []),
+            **({"review": dict(review), "plan_profile": REVIEW_PROFILE} if review else {}),
             "paused": bool(reason),
             "live_data": str(get_settings().resolved_data_dir),
             "cwd": root,
@@ -537,6 +544,8 @@ def classify_worker(work_item: WorkItem) -> dict[str, Any]:
         return end("nothing to change", answer=str(plan.get("answer") or "").strip() or "Nothing needs to change.")
     kind = str(plan.get("kind") or "")
     kind = kind if kind in policy.KINDS else "feature"
+    if given.get("review"):
+        kind = "redesign"  # a goal's review rethinks how it is served: always a pitch, built at ultra
     touches = [str(item) for item in plan.get("touches") or [] if str(item) in TOUCHES]
     questions = _questions(plan.get("questions"))
     origin = str(given.get("origin") or "model")
@@ -582,8 +591,8 @@ def refresh_worktrees(run: WorkflowRun) -> list[Any]:
 
 def prepare_worker(work_item: WorkItem) -> dict[str, Any]:
     """``function.workshop_prepare``: carry out the plan gate's answer, and get the worktrees ready. Revise
-    sends the run back to its plan (``rewind_to``): the same change, worktrees and ledger rows, planned again
-    with the gate's notes and the plan just shown."""
+    sends the run back to its plan (``rewind_to``): the same change, worktrees and ledger rows (a goal's review
+    stays one), planned again with the gate's notes and the plan just shown."""
     from tasque2.work.runner import WorkDeferred
 
     session, run = _run(work_item)
