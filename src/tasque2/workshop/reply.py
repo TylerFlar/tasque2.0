@@ -7,9 +7,10 @@
   and ``ship`` for the rare late tap): that answer, for the card it replies to, or the only card waiting;
   while several wait, it must reply to its card;
 - a note that goes with a card's answer (the plan gate's notes are the answers to its questions, and a
-  Revise sends the change back to its plan with them, and with what the Revise button's box took), unless
-  it starts with ``new:``: on the card it replies to, else on the newest card of the owner's own changes. A
-  card the Workshop filed, and an idea card, takes a note only as a reply;
+  Revise sends the change back to its plan with them, and with what the Revise button's box took; on an
+  idea card, Revise reworks the idea with them), unless it starts with ``new:``: on the card it replies to,
+  else on the newest card of the owner's own changes. A card the Workshop filed, and an idea card, takes a
+  note only as a reply;
 - a message right after the one that started a change, before its plan began: added to that request;
 - anything else, and anything relayed from another thread: a new change, planned at once. Asking for
   ideas is a change too: its plan answers with them instead of changing anything.

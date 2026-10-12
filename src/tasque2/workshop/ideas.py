@@ -1,4 +1,5 @@
-"""Idea cards: every Monday, up to five ideas for Tasque, each on a card with Build it, Not now and Never.
+"""Idea cards: every Monday, up to five ideas for Tasque, each on a card with Build it, Revise, Not now and
+Never.
 
 ``function.workshop_ideas`` (its schedule: Mondays at 07:30) starts ``workshop-ideas`` while card slots
 are free:
@@ -8,9 +9,20 @@ are free:
 2. ``cards`` (no model, ``function.workshop_idea_cards``): each idea not declined, resting or already on
    a card gets a ledger row and its own ``workshop-idea`` run: a card in the Workshop thread.
 
-A card's answer (``function.workshop_idea_apply``): Build it starts a change as the user's own ask, with
-any note typed in reply to the card; Not now rests the idea 60 days; Never retires it. A card left
-unanswered for 14 days expires, and the idea rests.
+A card's run:
+
+1. ``rethink`` (a model run that reads, like ``ideas``): after a Revise, the same idea reworked with the
+   user's notes. The first round runs no model;
+2. ``card`` (no model, ``function.workshop_idea_card``): a reworked idea replaces the run's, and its ledger
+   row's title and detail (the row keeps its key); a rework that did not finish keeps the idea, and the card
+   says so. Then the card's text;
+3. ``choice``: Build it, Revise, Not now or Never. Revise opens a text box for what should change;
+4. ``apply`` (no model, ``function.workshop_idea_apply``): Build it starts a change as the user's own ask,
+   with every note (those Revise took, and any typed in reply to the card); Revise sends the run back to
+   ``rethink`` (the workflow's ``rewind_to``) with the notes; Not now rests the idea 60 days; Never retires
+   it.
+
+A card left unanswered for 14 days expires, and the idea rests.
 """
 
 from __future__ import annotations
@@ -21,7 +33,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from tasque2.config import get_settings
-from tasque2.models import WorkflowDefinition, WorkflowNode, WorkflowRun, WorkItem, utc_now
+from tasque2.models import WorkflowDefinition, WorkflowRun, WorkItem, utc_now
 from tasque2.workshop import ledger, pipeline
 from tasque2.workshop.ledger import clip
 
@@ -29,42 +41,58 @@ WORKFLOW_NAME = "workshop-ideas"
 CARD_WORKFLOW = "workshop-idea"
 LAUNCH_WORKER = "function.workshop_ideas"
 CARDS_WORKER = "function.workshop_idea_cards"
+CARD_WORKER = "function.workshop_idea_card"
 APPLY_WORKER = "function.workshop_idea_apply"
 LANE = "workshop-ideas"
 TEMPLATE = "work-templates/workshop/ideas.template.md"
-BUILD_IT, NOT_NOW, NEVER = "Build it", "Not now", "Never"
+REWORK_TEMPLATE = "work-templates/workshop/idea.template.md"
+BUILD_IT, REVISE, NOT_NOW, NEVER = "Build it", pipeline.REVISE, "Not now", "Never"
 MAX_CARDS = 5
 MIN_EXPLORATORY = 2
+DETAIL = ("idea", "why", "takes", "area", "exploratory")
+# What a card's run carries from the ideas run, so its rework reads the same doctrine.
+PACKET_KEYS = ("live_data", "memory_namespace", "memory_canonical_keys", "context_limits")
+KEPT = "The rework didn't finish, so this is the idea as it was; Revise tries again."
 FALLBACK = """\
 # Workshop: this week's ideas
 Offer up to `slots` ideas for Tasque, at least `exploratory` of them exploratory, steered by `history`,
 following the pinned `tasque_workshop` document. Read, never write. `produces`: {ideas: [{title, idea, why,
 takes, area, exploratory}], silent: true}.
 """
+REWORK_FALLBACK = """\
+# Workshop: rework one idea
+Rework the idea in the task context (`title`, `idea`, `why`, `takes`, `area`, `exploratory`) with the user's
+`notes`, keeping what they did not object to, following the pinned `tasque_workshop` document. Read, never
+write. `produces`: {idea: {title, idea, why, takes, area, exploratory}, silent: true}.
+"""
+
+
+def _read_only_run(key: str, title: str, template: str, fallback: str) -> dict[str, Any]:
+    """A model run that reads Tasque and the web and writes nothing but its result."""
+    from tasque2.workshop.triage import READ_ONLY
+
+    return {
+        "key": key,
+        "kind": "work",
+        "title": title,
+        "worker_kind": "provider.default",
+        "lane": LANE,
+        "task_template_path": str(get_settings().resolved_data_dir / template),
+        "task_instruction": fallback,
+        "runtime_contract": {
+            "model_profile": "high",
+            "mcp_servers": [],
+            "disallowed_tools": [*pipeline.denied_tools(), *READ_ONLY],
+        },
+        "max_attempts": 1,
+        "tolerate_failure": True,
+    }
 
 
 def definition() -> dict[str, Any]:
-    from tasque2.workshop.triage import READ_ONLY
-
-    data = get_settings().resolved_data_dir
     return {
         "nodes": [
-            {
-                "key": "ideas",
-                "kind": "work",
-                "title": "Workshop: this week's ideas",
-                "worker_kind": "provider.default",
-                "lane": LANE,
-                "task_template_path": str(data / TEMPLATE),
-                "task_instruction": FALLBACK,
-                "runtime_contract": {
-                    "model_profile": "high",
-                    "mcp_servers": [],
-                    "disallowed_tools": [*pipeline.denied_tools(), *READ_ONLY],
-                },
-                "max_attempts": 1,
-                "tolerate_failure": True,
-            },
+            _read_only_run("ideas", "Workshop: this week's ideas", TEMPLATE, FALLBACK),
             {
                 "key": "cards",
                 "kind": "work",
@@ -80,7 +108,27 @@ def definition() -> dict[str, Any]:
 def card_definition() -> dict[str, Any]:
     return {
         "nodes": [
-            {"key": "choice", "kind": "gate", "prompt": "Build this idea?", "choices": [BUILD_IT, NOT_NOW, NEVER]},
+            {
+                **_read_only_run("rethink", "Workshop: rework the idea", REWORK_TEMPLATE, REWORK_FALLBACK),
+                "skip_when": "input.fresh",
+            },
+            {
+                "key": "card",
+                "kind": "work",
+                "title": "Workshop: the idea's card",
+                "worker_kind": CARD_WORKER,
+                "task_instruction": "Write the idea's card (no model).",
+                "depends_on": ["rethink"],
+            },
+            {
+                "key": "choice",
+                "kind": "gate",
+                "prompt": "Build this idea?",
+                "choices": [BUILD_IT, REVISE, NOT_NOW, NEVER],
+                "ask_note": {REVISE: pipeline.REVISE_NOTE},
+                "card_from": "card.card",
+                "depends_on": ["card"],
+            },
             {
                 "key": "apply",
                 "kind": "work",
@@ -88,6 +136,7 @@ def card_definition() -> dict[str, Any]:
                 "worker_kind": APPLY_WORKER,
                 "task_instruction": "Carry out the card's answer (no model).",
                 "depends_on": ["choice"],
+                "rewind_to": "rethink",
             },
         ]
     }
@@ -158,13 +207,32 @@ def ideas_of(value: Any) -> list[dict[str, Any]]:
     return found
 
 
-def card_text(idea: dict[str, Any]) -> str:
-    lines = [f"**Idea: {idea['title']}**" + (" (exploratory)" if idea.get("exploratory") else ""), idea["idea"]]
+def rework_of(idea: dict[str, Any], produced: dict[str, Any]) -> dict[str, Any] | None:
+    """The idea a rework gave back (``produces.idea``), any field it left out kept from ``idea``; None when it
+    gave none."""
+    given = produced.get("idea")
+    if not isinstance(given, dict) or not given:
+        return None
+    found = ideas_of([{**idea, **{name: value for name, value in given.items() if value not in (None, "")}}])
+    return found[0] if found else None
+
+
+def card_text(idea: dict[str, Any], *, reworked: bool = False, kept: bool = False) -> str:
+    """The card: the idea, reworked when a Revise changed it, or kept as it was when the rework did not
+    finish."""
+    head = "Idea, reworked" if reworked else "Idea"
+    lines = [f"**{head}: {idea['title']}**" + (" (exploratory)" if idea.get("exploratory") else "")]
+    if kept:
+        lines.append(KEPT)
+    lines.append(idea["idea"])
     if idea.get("why"):
         lines.append(f"Why it fits: {idea['why']}")
     if idea.get("takes"):
         lines.append(f"What it takes: {idea['takes']}")
-    lines.append("Build it starts it as your own ask. Not now rests it for 60 days; Never retires it.")
+    lines.append(
+        "Build it starts it as your own ask. Revise reworks it with your note. Not now rests it for 60 days; "
+        "Never retires it."
+    )
     return "\n".join(lines)
 
 
@@ -176,7 +244,9 @@ def cards_worker(work_item: WorkItem) -> dict[str, Any]:
     produced = pipeline.node_output(session, run.id, "ideas")
     if not produced or produced.get("tolerated_failure"):
         return {"summary": "No ideas this week: the run did not finish.", "produces": {"silent": True}}
-    slots = int((run.input or {}).get("slots") or MAX_CARDS)
+    given = run.input or {}
+    slots = int(given.get("slots") or MAX_CARDS)
+    packet = {name: given[name] for name in PACKET_KEYS if name in given}
     now = utc_now()
     offered: list[str] = []
     for idea in ideas_of(produced.get("ideas")):
@@ -187,14 +257,10 @@ def cards_worker(work_item: WorkItem) -> dict[str, Any]:
             continue
         card = WorkflowService(session).start_run(
             workflow_definition_id=ensure_card_definition(session).id,
-            input={"lane": pipeline.LANE, "key": key, **idea},
+            input={"lane": pipeline.LANE, "key": key, **idea, "fresh": True, "notes": [], **packet},
             discord_thread_id=run.discord_thread_id,
         )
-        gate = session.scalar(
-            select(WorkflowNode).where(WorkflowNode.workflow_run_id == card.id, WorkflowNode.node_key == "choice")
-        )
-        gate.input = {"card": card_text(idea)}
-        detail = {name: idea[name] for name in ("idea", "why", "takes", "area", "exploratory")}
+        detail = {name: idea[name] for name in DETAIL}
         ledger.offer_idea(session, key=key, title=idea["title"], detail=detail, run_id=card.id, now=now)
         offered.append(idea["title"])
     session.flush()
@@ -202,17 +268,43 @@ def cards_worker(work_item: WorkItem) -> dict[str, Any]:
     return {"summary": summary, "produces": {"silent": True, "offered": offered}}
 
 
+def card_worker(work_item: WorkItem) -> dict[str, Any]:
+    """``function.workshop_idea_card``: the card's text. After a Revise, the reworked idea replaces the run's
+    and its ledger row's title and detail (the row keeps its key); a rework that did not finish keeps the idea,
+    and the card says so in one line."""
+    session, run = pipeline._run(work_item)
+    given = run.input or {}
+    idea = ideas_of([given])[0]
+    if given.get("fresh"):
+        return {"summary": f"The card for {idea['title']}.", "produces": {"silent": True, "card": card_text(idea)}}
+    reworked = rework_of(idea, pipeline.node_output(session, run.id, "rethink"))
+    if reworked is None:
+        text = card_text(idea, kept=True)
+        return {"summary": f"{idea['title']}: not reworked, kept.", "produces": {"silent": True, "card": text}}
+    run.input = {**given, **reworked}
+    ledger.rework_idea(
+        session, str(given.get("key") or ""), title=reworked["title"], detail={name: reworked[name] for name in DETAIL}
+    )
+    text = card_text(reworked, reworked=True)
+    return {"summary": f"Reworked: {reworked['title']}.", "produces": {"silent": True, "card": text}}
+
+
 def apply_worker(work_item: WorkItem) -> dict[str, Any]:
-    """``function.workshop_idea_apply``: Build it starts a change, Not now (or no answer) rests the idea,
-    Never retires it."""
+    """``function.workshop_idea_apply``: Build it starts a change with the idea and every note, Revise sends
+    the card back to its rework with the notes, Not now (or no answer) rests the idea, Never retires it."""
     session, run = pipeline._run(work_item)
     given = run.input or {}
     choice = pipeline.node_output(session, run.id, "choice")
     answer = str(choice.get("answer") or NOT_NOW)
     key = str(given.get("key") or "")
-    notes = [str(note.get("text") or "").strip() for note in choice.get("notes") or [] if isinstance(note, dict)]
+    typed = [str(note.get("text") or "").strip() for note in choice.get("notes") or [] if isinstance(note, dict)]
+    notes = [*[str(note) for note in given.get("notes") or []], *[note for note in typed if note]]
+    if answer == REVISE:
+        run.input = {**given, "notes": notes, "fresh": False}
+        summary = f"Reworking {given.get('title')} with your note."
+        return {"summary": summary, "produces": {"silent": True, "rewind": True}}
     if answer == BUILD_IT and not choice.get("expired"):
-        request = "\n".join([f"{given.get('title')}: {given.get('idea')}", *[note for note in notes if note]])
+        request = "\n".join([f"{given.get('title')}: {given.get('idea')}", *notes])
         change = pipeline.start_change(
             session, request=request, origin="user", thread_id=run.discord_thread_id, author="an idea card"
         )

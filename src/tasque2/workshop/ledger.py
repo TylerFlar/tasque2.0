@@ -345,6 +345,15 @@ def offer_idea(
     return found
 
 
+def rework_idea(session: Session, key: str, *, title: str, detail: dict[str, Any]) -> None:
+    """An idea its card reworked after a Revise: the row keeps its key and where it stands."""
+    found = row(session, key)
+    if found is None:
+        return
+    found.title, found.detail = clip(title, TITLE_CHARS), dict(detail)
+    session.flush()
+
+
 def answer_idea(
     session: Session, key: str, status: str, *, until: datetime | None = None, change_id: str | None = None
 ) -> None:

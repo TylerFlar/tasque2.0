@@ -119,6 +119,7 @@ def core_function_workers() -> dict[str, WorkerFunction]:
         triage.FILE_WORKER: triage.file_worker,
         ideas.LAUNCH_WORKER: ideas.launch_worker,
         ideas.CARDS_WORKER: ideas.cards_worker,
+        ideas.CARD_WORKER: ideas.card_worker,
         ideas.APPLY_WORKER: ideas.apply_worker,
         look.LAUNCH_WORKER: look.launch_worker,
         look.FILE_WORKER: look.file_worker,

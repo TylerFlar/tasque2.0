@@ -1,7 +1,7 @@
 """The Workshop's eyes, end to end on fixture repositories: triage files its fixes as the Workshop's own changes
 (at most three open, never two on one file), those changes ship quietly (a pitch only when it is the owner's
 call) and tell the ledger how they ended, a card nobody answers expires, typed words find the card they mean,
-and idea cards build, rest or retire their ideas."""
+and idea cards build, rework, rest or retire their ideas."""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ from workshop_shop import THREAD, _gate, _out, _plan, _template_build, drive, op
 from tasque2.db import session_scope
 from tasque2.models import DiscordMessage, WorkflowNode, WorkflowRun, WorkItem, utc_now
 from tasque2.ops.release import find_plan, state
-from tasque2.workflows import WorkflowService
+from tasque2.workflows import WorkflowService, run_round
 from tasque2.workshop import ideas, ledger, pipeline, reply, triage
 from tasque2.workshop.ledger import Signal
 
@@ -300,4 +300,105 @@ def test_a_reply_to_an_idea_card_goes_with_its_build(shop: dict[str, Any]) -> No
                 select(WorkflowNode).where(WorkflowNode.workflow_run_id == card.id, WorkflowNode.node_key == "choice")
             ).output["answer"]
             == "Build it"
+        )
+
+
+def _one_card(session, title: str = "Birthday nudges") -> WorkflowRun:
+    _launch(session)
+    drive(session, {"ideas": lambda item: {"ideas": [_idea(title, exploratory=True)], "silent": True}})
+    return _cards(session)[0]
+
+
+def _card_text(session, run: WorkflowRun) -> str:
+    return _gate(session, run.id).input["card"]
+
+
+def test_revise_reworks_an_idea_card_with_its_note_and_build_it_carries_every_note(shop: dict[str, Any]) -> None:
+    with session_scope() as session:
+        card = _one_card(session)
+        key = card.input["key"]
+        nodes = {node["key"]: node for node in card.definition.definition["nodes"]}
+        assert nodes["choice"]["choices"] == ["Build it", "Revise", "Not now", "Never"]
+        assert nodes["choice"]["ask_note"] == {"Revise": "What should change?"}
+        assert "Write" in nodes["rethink"]["runtime_contract"]["disallowed_tools"]
+        assert _out(session, card.id, "rethink") == {"skipped": True}  # the first round runs no model
+        last_line = _card_text(session, card).splitlines()[-1]
+        assert last_line == (
+            "Build it starts it as your own ask. Revise reworks it with your note. Not now rests it for 60 days; "
+            "Never retires it."
+        )
+        # the Revise button's text box: its note goes with the answer
+        service = WorkflowService(session)
+        service.add_gate_note(workflow_run_id=card.id, node_key="choice", text="Make it monthly", author="owner")
+        service.answer_gate(workflow_run_id=card.id, node_key="choice", answer="Revise")
+        seen: list[dict[str, Any]] = []
+
+        def rework(item: WorkItem) -> dict[str, Any]:
+            seen.append(item.context)
+            idea = {"title": "Birthday nudges, monthly", "idea": "Once a month, the birthdays ahead.", "why": "fewer"}
+            return {"idea": idea, "silent": True}
+
+        drive(session, {"rethink": rework})
+        assert seen[0]["notes"] == ["Make it monthly"] and seen[0]["fresh"] is False
+        assert seen[0]["title"] == "Birthday nudges" and seen[0]["memory_canonical_keys"] == pipeline.DOCTRINE_KEYS
+        card = session.get(WorkflowRun, card.id)
+        assert run_round(card) == 1 and card.input["title"] == "Birthday nudges, monthly"
+        # what the rework left out stays as it was
+        assert _card_text(session, card).startswith(
+            "**Idea, reworked: Birthday nudges, monthly** (exploratory)\nOnce a month, the birthdays ahead.\n"
+            "Why it fits: fewer\nWhat it takes: a template"
+        )
+        row = ledger.row(session, key)  # the row keeps its key
+        assert row.title == "Birthday nudges, monthly" and row.status == "filed" and row.detail["area"] == "money"
+        # Build it, with one more note typed in reply to the new card
+        _card_message(session, card, "card-2")
+        reply.handle(session, text="only close friends", thread_id=THREAD, author="owner", referenced="card-2")
+        assert reply.handle(session, text="build it", thread_id=THREAD, author="owner", referenced="card-2") == (
+            "Build it: Birthday nudges, monthly."
+        )
+        drive(session, {"plan": _plan("Birthday nudges", "feature", ["templates"], questions=[{"question": "When?"}])})
+        built = pipeline.latest_runs(session, thread_id=THREAD)[0]
+        assert built.input["request"] == (
+            "Birthday nudges, monthly: Once a month, the birthdays ahead.\nMake it monthly\nonly close friends"
+        )
+        row = ledger.row(session, key)
+        assert row.status == "done" and row.change_id == built.input["change_id"]
+
+
+def test_a_typed_revise_reworks_an_idea_card_and_a_rework_that_does_not_finish_keeps_the_idea(
+    shop: dict[str, Any],
+) -> None:
+    with session_scope() as session:
+        card = _one_card(session)
+        _card_message(session, card, "card-1")
+        noted = reply.handle(session, text="any class, not one", thread_id=THREAD, author="owner", referenced="card-1")
+        assert noted.startswith("Noted for Birthday nudges")
+        assert reply.handle(session, text="revise", thread_id=THREAD, author="owner", referenced="card-1") == (
+            "Revise: Birthday nudges."
+        )
+        seen: list[list[str]] = []
+
+        def crashed(item: WorkItem) -> None:
+            seen.append(item.context["notes"])
+
+        drive(session, {"rethink": crashed})
+        assert seen == [["any class, not one"]]
+        card = session.get(WorkflowRun, card.id)
+        assert card.input["title"] == ledger.row(session, card.input["key"]).title == "Birthday nudges"
+        assert _card_text(session, card).startswith(
+            f"**Idea: Birthday nudges** (exploratory)\n{ideas.KEPT}\nBirthday nudges, every week."
+        )
+        service = WorkflowService(session)
+        service.add_gate_note(workflow_run_id=card.id, node_key="choice", text="weekly is fine", author="owner")
+        service.answer_gate(workflow_run_id=card.id, node_key="choice", answer="Revise")
+
+        def reworked(item: WorkItem) -> dict[str, Any]:
+            seen.append(item.context["notes"])
+            return {"idea": {"idea": "Each week, for any class."}, "silent": True}
+
+        drive(session, {"rethink": reworked})
+        assert seen[1] == ["any class, not one", "weekly is fine"]  # every note so far
+        assert run_round(session.get(WorkflowRun, card.id)) == 2
+        assert _card_text(session, card).startswith(
+            "**Idea, reworked: Birthday nudges** (exploratory)\nEach week, for any class.\nWhy it fits: it fits"
         )
