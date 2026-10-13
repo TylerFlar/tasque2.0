@@ -235,6 +235,7 @@ the latest runs with their traces.
 - `alembic/`: the core schema migrations
 - `extensions/`: local extension packages ([extensions/README.md](extensions/README.md))
 - `data/`: the database, artifacts, templates and workflow files (not tracked)
-- `docs/`: [observability](docs/observability.md), [workflows](docs/workflows.md)
+- `docs/`: [architecture](docs/architecture.md) (what the core holds, and where the code is going),
+  [observability](docs/observability.md), [workflows](docs/workflows.md)
 
 Tests: `uv run pytest` (core) and `uv run pytest extensions/<name>/tests` (an extension).

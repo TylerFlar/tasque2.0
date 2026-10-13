@@ -8,7 +8,8 @@ triage is open:
 2. ``file`` (no model, ``function.workshop_file``): each group waits in the ledger with its fix, noise rests
    60 days, a row triage left out rests 30, and the fixes go into free slots.
 
-``file_waiting`` fills the slots (the sweep calls it too): each fix becomes a change of the Workshop's own
+``file_waiting`` fills the slots (the sweep calls it too, and a step of the weekly refactor pass waits for a
+slot like a fix: ``tasque2.workshop.refactor``): each fix becomes a change of the Workshop's own
 (``origin: workshop``), so the usual tiers decide what ships on its own. The ``MAX_OPEN`` slots are the
 fixes': at most that many of the Workshop's own changes are open, cards included, a goal's review not
 counted (``tasque2.workshop.reviews`` holds those to one at a time), and none shares a file with any open
@@ -106,7 +107,7 @@ def start(session: Session, *, thread_id: str | None, context: dict[str, Any] | 
         input={
             "lane": pipeline.LANE,
             "items": [ledger.item_data(found) for found in items],
-            "open_changes": [_change_data(session, run) for run in pipeline.open_changes(session)],
+            "open_changes": [change_data(session, run) for run in pipeline.open_changes(session)],
             "waiting": [clip(proposal.get("title"), 80) for proposal, _rows in ledger.waiting_groups(session)],
             "journal_digest": str(journal) if journal is not None else None,
             "live_data": str(get_settings().resolved_data_dir),
@@ -118,7 +119,8 @@ def start(session: Session, *, thread_id: str | None, context: dict[str, Any] | 
     )
 
 
-def _change_data(session: Session, run: WorkflowRun) -> dict[str, Any]:
+def change_data(session: Session, run: WorkflowRun) -> dict[str, Any]:
+    """A change in flight as a read-only run reads it: its title, origin, files and stage."""
     given = run.input or {}
     title = pipeline.node_output(session, run.id, "classify").get("title") or given.get("request")
     return {

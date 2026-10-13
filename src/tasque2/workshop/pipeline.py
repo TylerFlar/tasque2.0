@@ -1,9 +1,10 @@
 """The Workshop's change pipeline: one change to Tasque, from a request to a release, with an undo.
 
 A change starts from a request (the owner's words in the Workshop thread, an idea card's Build it, a fix
-the Workshop's triage filed: ``tasque2.workshop.triage``, or a goal's review: ``tasque2.workshop.reviews``)
-and runs the ``tasque-change`` workflow in its own worktrees (``tasque2.ops.worktree``: the core, each
-extension, and the config repository at ``data``), next to the live checkout:
+the Workshop's triage filed: ``tasque2.workshop.triage``, a goal's review: ``tasque2.workshop.reviews``, or
+a step of the weekly refactor pass: ``tasque2.workshop.refactor``) and runs the ``tasque-change`` workflow
+in its own worktrees (``tasque2.ops.worktree``: the core, each extension, and the config repository at
+``data``), next to the live checkout:
 
 1. ``plan`` (a model run that reads the change's own checkout; the guard refuses writes outside it):
    what to change, where and why in at most 25 lines, a pitch of a few plain lines for the owner, up to 4
