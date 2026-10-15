@@ -183,12 +183,18 @@ def _extensions() -> HealthCheck:
     try:
         loaded = registry()
     except Exception as exc:  # noqa: BLE001
-        return HealthCheck("extensions", "fail", f"An extension failed to load: {exc}")
+        return HealthCheck("extensions", "fail", f"A part or an extension failed to load: {exc}")
+    parts = f"parts on: {', '.join(loaded.part_names)}" if loaded.part_names else "no parts on"
     return HealthCheck(
         "extensions",
         "ok",
-        f"{len(loaded.extension_names)} extension(s) loaded.",
-        {"names": loaded.extension_names, "tools": len(loaded.mcp_tools), "digests": len(loaded.context_digests)},
+        f"{len(loaded.extension_names)} extension(s) loaded; {parts}.",
+        {
+            "parts": loaded.part_names,
+            "names": loaded.extension_names,
+            "tools": len(loaded.mcp_tools),
+            "digests": len(loaded.context_digests),
+        },
     )
 
 

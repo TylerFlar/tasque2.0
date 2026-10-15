@@ -7,7 +7,6 @@ from tasque2.db import session_scope
 from tasque2.mcp.tools._shared import optional_string, required, run_json
 from tasque2.ops.health import build_system_health
 from tasque2.ops.status import get_system_status
-from tasque2.weather import fetch_local_weather
 from tasque2.worker import results
 
 
@@ -22,12 +21,6 @@ def submit_worker_result(
     """Submit this run's result. Call exactly once, as the last action, with the result_token
     from the prompt. ``status``: succeeded, blocked, awaiting_user, or failed (with ``error``)."""
     return run_json(lambda: _submit(result_token, summary, report, produces, status, error))
-
-
-def weather_now(days: int = 3, intent: str = "") -> str:
-    """Current conditions and a daily forecast (high/low, feels-like, rain chance, sunset)
-    for the configured home location; ``days`` is 1-7."""
-    return run_json(lambda: {"ok": True, "weather": fetch_local_weather(days=days)}, intent=intent)
 
 
 def system_status(intent: str = "") -> str:

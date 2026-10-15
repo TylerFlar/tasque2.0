@@ -29,6 +29,11 @@ Copy-Item .env.example .env   # then fill in Discord ids and any overrides
 uv run tasque2 doctor
 ```
 
+Optional parts run when `TASQUE2_PARTS` names them; it names `weather` unless you change it. Set the
+weather location in `.env` (`TASQUE2_WEATHER_LATITUDE`, `TASQUE2_WEATHER_LONGITUDE` and a
+`TASQUE2_WEATHER_LOCATION_LABEL`), or take `weather` out of `TASQUE2_PARTS` (blank runs no parts).
+`tasque2 doctor` lists the parts that are on.
+
 Workers are started with the `claude` CLI, logged in with your subscription or API key. Run
 `uv run tasque2 provider-smoke claude` once to see a real run end to end.
 
@@ -232,6 +237,8 @@ the latest runs with their traces.
 
 - `src/tasque2/`: the application (`work/`, `daemon/`, `worker/`, `providers/`, `discord/`,
   `memory/`, `mcp/`, `telemetry/`, `ops/`, `cli/`)
+- `src/tasque2/parts/`: the built-in optional parts, each on when `TASQUE2_PARTS` names it (weather is
+  the first)
 - `alembic/`: the core schema migrations
 - `extensions/`: local extension packages ([extensions/README.md](extensions/README.md))
 - `data/`: the database, artifacts, templates and workflow files (not tracked)

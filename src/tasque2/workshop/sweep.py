@@ -585,7 +585,7 @@ def _skip_reason(session: Session, schedule: Schedule) -> str | None:
 
 def unused_tools(session: Session, now: datetime) -> list[Signal]:
     """Tasque tools no run called in 30 days, once the runs record their tool calls for that long: one row
-    for the core's and one for each extension's."""
+    for the core's, one for each part's and one for each extension's."""
     from tasque2.extensions import registry
     from tasque2.mcp.tools import CORE_TOOLS
 
@@ -608,8 +608,7 @@ def unused_tools(session: Session, now: datetime) -> list[Signal]:
     for tool in (*CORE_TOOLS, *registry().mcp_tools):
         if tool.__name__ in used or tool.__name__ == "submit_worker_result":
             continue
-        owner = "core" if tool.__module__.startswith("tasque2.") else tool.__module__.split(".")[0]
-        idle.setdefault(owner, []).append(tool.__name__)
+        idle.setdefault(_tool_owner(tool), []).append(tool.__name__)
     found = []
     for owner, names in sorted(idle.items()):
         names.sort()
@@ -624,6 +623,15 @@ def unused_tools(session: Session, now: datetime) -> list[Signal]:
             )
         )
     return found
+
+
+def _tool_owner(tool: Callable[..., Any]) -> str:
+    """Who serves a tool: a part (``tasque2.parts.<name>``) by its name, the rest of Tasque as the core, an
+    extension by its package."""
+    module = tool.__module__.split(".")
+    if module[:2] == ["tasque2", "parts"] and len(module) > 2:
+        return module[2]
+    return "core" if module[0] == "tasque2" else module[0]
 
 
 def _documents(session: Session) -> list[Memory]:

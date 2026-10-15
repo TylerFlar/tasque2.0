@@ -3,7 +3,8 @@
 Tests never read the repository's ``.env``, data directory or extensions. Spans and metrics
 go to in-memory exporters installed once per session; ``spans`` and ``metric_points``
 read them. Voice messages are not transcribed (``TASQUE2_VOICE_MODEL`` is blank), so no test
-runs a speech model; a voice test turns it on and fakes the child process.
+runs a speech model; a voice test turns it on and fakes the child process. No built-in part is
+on (``TASQUE2_PARTS`` is blank), so tests of the core see only the core; a part's test turns it on.
 """
 
 from __future__ import annotations
@@ -52,6 +53,7 @@ def isolated(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
     monkeypatch.setenv("TASQUE2_EXTENSIONS_DIR", str(tmp_path / "extensions"))
     monkeypatch.setenv("TASQUE2_ALLOW_TEST_PROVIDERS", "true")
     monkeypatch.setenv("TASQUE2_VOICE_MODEL", "")
+    monkeypatch.setenv("TASQUE2_PARTS", "")
     _reset_process_state()
     _SPAN_EXPORTER.clear()
     yield tmp_path

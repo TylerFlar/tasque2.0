@@ -12,6 +12,8 @@ MODEL_PROVIDERS = ("claude", "codex")
 TEST_PROVIDERS = ("fake", "subprocess")
 MODEL_PROFILES = ("low", "medium", "high", "ultra")
 EFFORT_LEVELS = ("minimal", "low", "medium", "high", "xhigh", "max")
+# The optional settings file, in the directory Tasque starts in; a part's own settings read it too.
+ENV_FILE = ".env"
 
 DEFAULT_CLAUDE_MODELS = {
     "low": "claude-haiku-4-5",
@@ -49,19 +51,17 @@ class ModelChoice:
 class Settings(BaseSettings):
     """Runtime settings read from TASQUE2_* environment variables and an optional .env file."""
 
-    model_config = SettingsConfigDict(env_prefix="TASQUE2_", env_file=".env", extra="ignore")
+    model_config = SettingsConfigDict(env_prefix="TASQUE2_", env_file=ENV_FILE, extra="ignore")
 
     data_dir: Path = Field(default=Path("data"))
     db_path: Path | None = Field(default=None)
     memory_vault_dir: Path | None = Field(default=None)
     extensions_dir: Path = Field(default=Path("extensions"))
+    # The built-in optional parts to run (``tasque2.parts``), comma-separated: blank runs none.
+    parts: str = Field(default="weather")
     project_dir: Path | None = Field(default=None)
     timezone: str = Field(default="America/Los_Angeles")
     reminder_default_time: str = Field(default="11:00")
-
-    weather_latitude: float = Field(default=32.7157)
-    weather_longitude: float = Field(default=-117.1611)
-    weather_location_label: str = Field(default="San Diego, CA")
 
     discord_token: str | None = Field(default=None)
     discord_intake_channel_id: str | None = Field(default=None)
@@ -152,6 +152,10 @@ class Settings(BaseSettings):
     @property
     def resolved_extensions_dir(self) -> Path:
         return self.extensions_dir.expanduser().resolve()
+
+    @property
+    def part_list(self) -> list[str]:
+        return list(dict.fromkeys(_csv(self.parts)))
 
     @property
     def resolved_project_dir(self) -> Path:

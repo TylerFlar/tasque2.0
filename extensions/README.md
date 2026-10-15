@@ -64,6 +64,10 @@ def register(registry) -> None:
     registry.add_function_worker("function.shelf_sync", sync_shelf)
 ```
 
+Tasque's own optional parts (`src/tasque2/parts/`, on when `TASQUE2_PARTS` names them) use the same
+`register(registry)` hook and register before the extensions; `parts/weather.py`, which serves one
+tool, is a short example.
+
 Patterns that work well:
 
 - **Append-only ledgers.** Tables in `models.py` (use `Base`, `TimestampMixin`, `new_id` from

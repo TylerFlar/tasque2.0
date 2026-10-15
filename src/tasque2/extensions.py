@@ -16,8 +16,12 @@ directory (``TASQUE2_EXTENSIONS_DIR``, default ``extensions/``), each exposing
 - signal sources: issues the Workshop's sweep should know about (a decision that took its default), or a
   goal off plan by its own count.
 
-Extensions load once per process on first use. A broken extension raises: a daemon that
-silently lost its domain tools would corrupt runs far worse than a loud startup failure.
+Tasque's own optional parts (``tasque2.parts``) register through the same hook: the ones
+``TASQUE2_PARTS`` names, in order, before the extensions directory.
+
+Parts and extensions load once per process on first use. A broken one raises, and so does a part
+name that is not a part: a daemon that silently lost its domain tools would corrupt runs far worse
+than a loud startup failure.
 """
 
 from __future__ import annotations
@@ -44,12 +48,12 @@ FunctionWorker = Callable[[Any], Any]
 
 
 class ExtensionError(RuntimeError):
-    """An extension package failed to import or register."""
+    """A part or an extension package failed to import or register, or a part name is unknown."""
 
 
 @dataclass
 class ExtensionRegistry:
-    """Everything the loaded extension packages contributed to the core."""
+    """Everything the parts that are on and the loaded extension packages contributed to the core."""
 
     context_digests: list[tuple[str, DigestWants, DigestBuild]] = field(default_factory=list)
     canonical_key_resolvers: list[tuple[DigestWants, CanonicalKeyResolver]] = field(default_factory=list)
@@ -60,6 +64,7 @@ class ExtensionRegistry:
     function_workers: dict[str, FunctionWorker] = field(default_factory=dict)
     sticky_sections: list[tuple[str, StickySection]] = field(default_factory=list)
     signal_sources: list[tuple[str, SignalSource]] = field(default_factory=list)
+    part_names: list[str] = field(default_factory=list)
     extension_names: list[str] = field(default_factory=list)
 
     def add_context_digest(self, key: str, wants: DigestWants, build: DigestBuild) -> None:
@@ -140,7 +145,7 @@ def extensions_dir() -> Path:
 
 
 def registry() -> ExtensionRegistry:
-    """The process-wide registry; loads every extension on first use."""
+    """The process-wide registry; loads the parts that are on and every extension on first use."""
     global _registry
     if _registry is None:
         with _lock:
@@ -150,7 +155,7 @@ def registry() -> ExtensionRegistry:
 
 
 def reset_registry() -> None:
-    """Forget loaded extensions (modules stay imported)."""
+    """Forget loaded parts and extensions (modules stay imported)."""
     global _registry
     with _lock:
         _registry = None
@@ -158,6 +163,7 @@ def reset_registry() -> None:
 
 def _load() -> ExtensionRegistry:
     reg = ExtensionRegistry()
+    _load_parts(reg)
     directory = extensions_dir()
     if not directory.is_dir():
         return reg
@@ -184,3 +190,30 @@ def _load() -> ExtensionRegistry:
         reg.extension_names.append(child.name)
         logger.info("Loaded extension: %s", child.name)
     return reg
+
+
+def _load_parts(reg: ExtensionRegistry) -> None:
+    """Register each built-in part ``TASQUE2_PARTS`` names, in order."""
+    from tasque2 import parts
+    from tasque2.config import get_settings
+
+    available = parts.available()
+    for name in get_settings().part_list:
+        if name not in available:
+            raise ExtensionError(
+                f"Part '{name}' in TASQUE2_PARTS is not one of Tasque's parts; "
+                f"they are: {', '.join(available) or 'none'}."
+            )
+        try:
+            module = importlib.import_module(f"{parts.__name__}.{name}")
+        except Exception as exc:
+            raise ExtensionError(f"Part '{name}' failed to import: {exc}") from exc
+        register = getattr(module, "register", None)
+        if not callable(register):
+            raise ExtensionError(f"Part '{name}' has no register(registry) function.")
+        try:
+            register(reg)
+        except Exception as exc:
+            raise ExtensionError(f"Part '{name}' failed to register: {exc}") from exc
+        reg.part_names.append(name)
+        logger.info("Loaded part: %s", name)

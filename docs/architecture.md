@@ -10,7 +10,8 @@ that moves something updates it.
 
 ## The core
 
-Everything under `src/tasque2` is the public core: the part every use needs. By package:
+Everything under `src/tasque2` is public. Apart from the optional parts in `parts/` ([below](#parts)),
+it is the core: the part every use needs. By package:
 
 | Package | What it holds |
 |---|---|
@@ -29,7 +30,7 @@ Everything under `src/tasque2` is the public core: the part every use needs. By 
 | `ops/` | operator tooling: status, doctor, reports, usage, lanes, backups, releases, the config repository, the privacy scan, the rehearsal |
 | `telemetry/` | OpenTelemetry setup, tracing and instruments |
 | `workshop/` | the Workshop: how Tasque changes itself (the sweep, the ledger, triage, idea cards, the monthly look, goal reviews, the weekly refactor pass, the change pipeline and its checks) |
-| the rest at the top | extension discovery (`extensions.py`), lane files (`lane_context.py`), local dates (`localtime.py`), sticky notes (`sticky.py`), weather (`weather.py`), and small helpers for templates, text, events and logs |
+| the rest at the top | part and extension loading (`extensions.py`), lane files (`lane_context.py`), local dates (`localtime.py`), sticky notes (`sticky.py`), and small helpers for templates, text, events and logs |
 
 ## The interfaces
 
@@ -44,6 +45,20 @@ Two ways in and out today:
 
 Discord is configured by settings; without them the daemon runs its schedules, workflows and workers
 and posts nothing.
+
+## Parts
+
+A part is a domain Tasque ships that not every deployment needs. It is a module in
+`src/tasque2/parts/` exposing `register(registry)`, the hook extensions use, and adds its tools,
+digests, gates or function workers through it. `TASQUE2_PARTS` names the parts a deployment runs
+(comma-separated, default `weather`; blank runs none). They register in that order, before the
+extensions; a name that is not a part stops startup, as a broken extension does, and `tasque2 doctor`
+lists the parts that are on. A part owns its settings (`TASQUE2_<PART>_*`): the core settings hold
+none of them.
+
+Weather is the first part: the `weather_now` tool, with the home location as its own setting
+(`TASQUE2_WEATHER_LATITUDE`, `TASQUE2_WEATHER_LONGITUDE`, `TASQUE2_WEATHER_LOCATION_LABEL`) and no
+default. Until the location is set, the tool answers with what to set.
 
 ## Extensions and the data directory
 
@@ -62,14 +77,13 @@ rely on.
 
 Tasque grew as one person's assistant, and the core still carries pieces of that first deployment:
 
-- **Weather** (`weather.py`, the `weather_now` tool), with a home location as its default setting.
 - **Goal reviews and the monthly look** in the Workshop, which assume a person with goals, weekly
   reviews and a journal; and the Workshop itself is something a deployment may not want to run.
 - **Discord-only pieces** such as sticky notes and voice transcription, and the assumption in routing
   and posting that a result has a Discord thread to go to.
 - **The intake prompt**, which handles a message as a general assistant's errands (reminders,
   calendar entries, drafts, trips) and names a doctrine document only an assistant deployment has.
-- **Defaults** that are one person's: the timezone, the reminder time, the home location.
+- **Defaults** that are one person's: the timezone, the reminder time.
 
 None of this breaks another use. It is in the way of someone reading the core for the first time,
 and it is where the refactoring starts.
@@ -80,8 +94,8 @@ In order, one part at a time, each step a change of its own that ships with the 
 still working (the same tools, settings, schedules, threads and commands; a rename keeps the old
 name working):
 
-1. **Weather out of the core**, as the first optional part. This sets the pattern a deployment uses
-   to turn a part on or off, and every later part follows it.
+1. **Weather out of the core** (done), as the first optional part ([Parts](#parts)). It set the
+   pattern a deployment uses to turn a part on or off, and every later part follows it.
 2. **Assistant defaults into config**: the intake prompt's errands and the document it names, the
    timezone, the reminder time and the rest read from the deployment's own config, not the code.
 3. **Goal reviews, then the Workshop, as parts**: the sweep, triage, ideas and the change pipeline
