@@ -1,5 +1,8 @@
 # Tasque
 
+> **Archived (October 2026).** Tasque is no longer maintained or running. Its work moved to the Claude
+> apps' own projects, scheduled tasks and connectors. The code stays here as it was last run.
+
 Tasque runs your recurring and on-demand AI work on your own machine. Each piece of work is a
 headless Claude Code (or Codex) run with a task, a model tier, the MCP tools it may use, and a
 compact packet of what it needs to know. Results come back as Discord threads you can reply to,
